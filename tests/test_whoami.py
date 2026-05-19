@@ -1,4 +1,13 @@
-"""End-to-end tests for /api/v0/auth/whoami across all three credential classes."""
+"""End-to-end tests for /api/v0/auth/whoami across all three credential classes.
+
+M3 added field-exposure filtering. The behavioral consequence:
+
+  - Anonymous sees only `credential_class` (public). `tenant_id` and `pubkey_hex`
+    drop from the response (response_model_exclude_none=True).
+  - Maintainer sees everything (operator union view).
+  - Researcher sees `credential_class` + their own `tenant_id` + their own
+    `pubkey_hex` (tenant-scoped against `resource_tenant_id = credential.tenant_id`).
+"""
 
 from __future__ import annotations
 
@@ -8,16 +17,21 @@ from fastapi.testclient import TestClient
 from auspexai_platform.auth.signature import sign_request
 
 
-def test_whoami_anonymous(client: TestClient) -> None:
+def test_whoami_anonymous_returns_only_credential_class(client: TestClient) -> None:
     response = client.get("/api/v0/auth/whoami")
     assert response.status_code == 200
     body = response.json()
     assert body["credential_class"] == "anonymous"
-    assert body["tenant_id"] is None
-    assert body["pubkey_hex"] is None
+    # tenant_id + pubkey_hex are tenant-scoped → filtered out for anonymous.
+    assert "tenant_id" not in body
+    assert "pubkey_hex" not in body
 
 
-def test_whoami_maintainer(client: TestClient, maintainer_token: str) -> None:
+def test_whoami_maintainer_sees_only_class_when_token_unbound(
+    client: TestClient, maintainer_token: str
+) -> None:
+    """Maintainer credential has no tenant_id of its own — the response model
+    has nothing to populate those fields with, so they're naturally absent."""
     response = client.get(
         "/api/v0/auth/whoami",
         headers={"Authorization": f"Bearer {maintainer_token}"},
@@ -25,11 +39,14 @@ def test_whoami_maintainer(client: TestClient, maintainer_token: str) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["credential_class"] == "maintainer"
-    assert body["tenant_id"] is None
-    assert body["pubkey_hex"] is None
+    # Maintainer COULD see tenant_id / pubkey_hex if they had values; in this
+    # case the credential itself has None for those fields, so they drop via
+    # exclude_none.
+    assert "tenant_id" not in body
+    assert "pubkey_hex" not in body
 
 
-def test_whoami_researcher(
+def test_whoami_researcher_sees_own_binding(
     client: TestClient,
     registered_tenant: tuple[Ed25519PrivateKey, object],
 ) -> None:
@@ -71,7 +88,6 @@ def test_malformed_authorization_returns_401(client: TestClient) -> None:
 
 
 def test_unknown_researcher_pubkey_returns_401(client: TestClient) -> None:
-    # Sign with a key that isn't registered.
     unregistered_priv = Ed25519PrivateKey.generate()
     unregistered_hex = unregistered_priv.public_key().public_bytes_raw().hex()
     headers = sign_request(
@@ -88,13 +104,11 @@ def test_unknown_researcher_pubkey_returns_401(client: TestClient) -> None:
     assert detail["error"]["code"] == "invalid_signature"
 
 
-def test_signature_without_signature_input_returns_401(client: TestClient) -> None:
+def test_signature_without_signature_input_falls_through_to_anonymous(client: TestClient) -> None:
     response = client.get(
         "/api/v0/auth/whoami",
         headers={"Signature": "sig1=:abc:"},
     )
-    # No Signature-Input → falls through to anonymous (200), not 401.
-    # This is by design: presence of just `Signature` alone is treated as no auth.
     assert response.status_code == 200
     assert response.json()["credential_class"] == "anonymous"
 
@@ -114,7 +128,6 @@ def test_bearer_takes_precedence_over_signature(
     maintainer_token: str,
     registered_tenant: tuple[Ed25519PrivateKey, object],
 ) -> None:
-    """A request carrying both Bearer and Signature-Input is treated as maintainer."""
     privkey, binding = registered_tenant
     sig_headers = sign_request(
         privkey=privkey,

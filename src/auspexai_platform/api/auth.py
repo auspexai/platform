@@ -1,60 +1,76 @@
 """`/api/v0/auth/whoami` endpoint.
 
-A single endpoint that echoes back the resolved Credential. Useful for:
+Echoes the resolved Credential back to the caller. With M3's exposure filter:
 
+  - `credential_class` is `public` — every caller sees their own class.
+  - `tenant_id` and `pubkey_hex` are `tenant-scoped` against
+    `resource_tenant_id = credential.tenant_id` — researchers see their own
+    binding, operator sees all (per the operator-sees-all rule), anonymous
+    callers see neither.
+
+Useful for:
   - The operator console at startup ("am I correctly configured with a
     maintainer token?")
   - The researcher dashboard at startup ("does the coordinator recognize my
     Ed25519 keypair?")
   - Tests covering all three credential paths.
-
-Field-exposure filtering (M3) will hide `tenant_id` and `pubkey_hex` from
-anonymous callers; v1 design retains operator and researcher visibility into
-their own context.
 """
 
 from __future__ import annotations
+
+from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
-
-router = APIRouter()
+from auspexai_platform.exposure import ExposureTag, filter_for_credential
 
 
 class WhoamiResponse(BaseModel):
-    """The shape returned by `/auth/whoami`."""
+    """The shape returned by `/auth/whoami`.
 
-    credential_class: CredentialClass = Field(
-        description="One of: maintainer | researcher | anonymous"
+    `credential_class` is always present (public). `tenant_id` and
+    `pubkey_hex` are present only for the researcher viewing their own
+    credential, or for an operator viewing anyone's credential.
+    """
+
+    credential_class: Annotated[CredentialClass | None, ExposureTag.PUBLIC] = Field(
+        default=None,
+        description="One of: maintainer | researcher | anonymous",
     )
-    tenant_id: str | None = Field(
+    tenant_id: Annotated[str | None, ExposureTag.TENANT_SCOPED] = Field(
         default=None,
         description="Researcher only: the tenant the signing pubkey is bound to.",
     )
-    pubkey_hex: str | None = Field(
+    pubkey_hex: Annotated[str | None, ExposureTag.TENANT_SCOPED] = Field(
         default=None,
         description="Researcher only: the signing Ed25519 pubkey (hex).",
     )
 
 
 def build_router(credential_dep) -> APIRouter:
-    """Build the /auth router bound to a credential dependency.
-
-    Returns a fresh APIRouter so `create_app()` can wire its own dependency
-    closure without module-global state."""
+    """Build the /auth router bound to a credential dependency."""
 
     router = APIRouter()
 
-    @router.get("/auth/whoami", response_model=WhoamiResponse)
+    @router.get(
+        "/auth/whoami",
+        response_model=WhoamiResponse,
+        response_model_exclude_none=True,
+    )
     async def whoami(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> WhoamiResponse:
-        return WhoamiResponse(
+        payload = WhoamiResponse(
             credential_class=credential.kind,
             tenant_id=credential.tenant_id,
             pubkey_hex=credential.pubkey_hex,
+        )
+        return filter_for_credential(
+            payload,
+            credential,
+            resource_tenant_id=credential.tenant_id,
         )
 
     return router
