@@ -116,11 +116,13 @@ def test_malformed_filename_rejected(tmp_path: Path) -> None:
 
 
 def test_bundled_initial_migration_creates_tenants_and_audit(tmp_path: Path) -> None:
-    """The shipped 0001_init.sql creates the tables the rest of the system expects."""
+    """The bundled migrations create the tables the rest of the system expects."""
     db = Database(tmp_path / "test.db")
     runner = MigrationRunner(db)  # use default migrations_sql/ dir
     applied = runner.apply_all()
-    assert applied == [1]
+    # 0001 (init: tenants + audit_log) plus any subsequent bundled migrations.
+    assert applied[0] == 1, f"first bundled migration must be 0001; got {applied}"
+    assert sorted(applied) == applied, "bundled migrations must apply in version order"
     # Tables exist + accept the expected columns.
     db.execute(
         """

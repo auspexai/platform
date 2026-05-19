@@ -13,11 +13,27 @@ format. Keep them separate.
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from auspexai_platform.auth.credential import CredentialClass
+
+
+class ExperimentStatus(StrEnum):
+    """Experiment lifecycle states.
+
+    Transitions:
+      submitted → approved → (paused ⇄ approved) → completed | aborted → archived
+    """
+
+    SUBMITTED = "submitted"
+    APPROVED = "approved"
+    PAUSED = "paused"
+    ABORTED = "aborted"
+    COMPLETED = "completed"
+    ARCHIVED = "archived"
 
 
 class Tenant(BaseModel):
@@ -33,6 +49,42 @@ class Tenant(BaseModel):
     description: str | None = None
     registered_at: datetime
     revision: int = 1
+
+
+class Manifest(BaseModel):
+    """A row in the `manifests` table — a tenant-uploaded, signed manifest body.
+
+    The manifest_json and signature_json are stored opaquely in M5 v0 — the
+    coordinator extracts only the identifying fields needed to scope the
+    experiment to a tenant. Full manifest-schema validation moves into the
+    worker (M6) where it can apply per-experiment policy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    manifest_hash: str  # 64 lowercase hex chars (SHA-256 of canonical manifest JSON)
+    tenant_id: str
+    manifest_json: dict[str, Any]
+    signature_json: dict[str, Any]
+    uploaded_at: datetime
+
+
+class Experiment(BaseModel):
+    """A row in the `experiments` table — a tenant's submitted experiment with
+    lifecycle state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    experiment_id: str  # coordinator-generated: 'exp-<random>'
+    tenant_id: str
+    tenant_experiment_label: str  # the `experiment_id` from the tenant's manifest
+    manifest_hash: str
+    status: ExperimentStatus
+    submitted_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    revision: int = 1
+    error_summary: str | None = None
 
 
 class AuditEntry(BaseModel):

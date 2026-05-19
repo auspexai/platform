@@ -52,7 +52,6 @@ def create_app(
     """
     config = config or Config.from_env()
     token_store = token_store or TokenStore(config.maintainer_token_path)
-    tenant_registry = tenant_registry or TenantRegistry()
     db = db or Database(config.control_db_path)
 
     # Apply pending migrations on every startup. Idempotent: no-op if
@@ -61,6 +60,9 @@ def create_app(
 
     tenant_repository = TenantRepository(db)
     audit_repository = AuditRepository(db)
+    # Registry is a façade over the repository. Constructed here so the auth
+    # path reads from the DB on every request.
+    tenant_registry = tenant_registry or TenantRegistry(tenant_repository)
 
     app = FastAPI(
         title="AuspexAI Coordinator",

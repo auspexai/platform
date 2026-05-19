@@ -45,11 +45,6 @@ def maintainer_token(token_store: TokenStore) -> str:
 
 
 @pytest.fixture
-def tenant_registry() -> TenantRegistry:
-    return TenantRegistry()
-
-
-@pytest.fixture
 def tenant_keypair() -> tuple[Ed25519PrivateKey, str]:
     """(privkey, pubkey_hex) — fresh Ed25519 keypair per test."""
     priv = Ed25519PrivateKey.generate()
@@ -91,13 +86,20 @@ def audit_repository(db: Database) -> AuditRepository:
 
 
 @pytest.fixture
+def tenant_registry(tenant_repository: TenantRepository) -> TenantRegistry:
+    """DB-backed registry (M5+). Same surface as the M2 in-memory version
+    so existing tests keep working."""
+    return TenantRegistry(tenant_repository)
+
+
+@pytest.fixture
 def client(
     config: Config,
     token_store: TokenStore,
     tenant_registry: TenantRegistry,
     db: Database,
 ) -> Generator[TestClient, None, None]:
-    """TestClient with all M2-M4 layers wired up."""
+    """TestClient with all M2-M5 layers wired up."""
     app = create_app(
         config=config,
         token_store=token_store,
