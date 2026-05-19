@@ -7,7 +7,6 @@ from fastapi.testclient import TestClient
 
 from auspexai_platform.auth.signature import sign_request
 
-
 # ---- POST /tenants — operator only -----------------------------------------
 
 

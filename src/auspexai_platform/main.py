@@ -21,6 +21,7 @@ from fastapi import FastAPI
 
 from auspexai_platform import __version__
 from auspexai_platform.api import auth as auth_routes
+from auspexai_platform.api import experiments as experiment_routes
 from auspexai_platform.api import health
 from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.auth.bearer import TokenStore
@@ -28,7 +29,12 @@ from auspexai_platform.auth.dependency import make_credential_dependency
 from auspexai_platform.auth.tenant_registry import TenantRegistry
 from auspexai_platform.config import Config
 from auspexai_platform.db import Database, MigrationRunner
-from auspexai_platform.db.repositories import AuditRepository, TenantRepository
+from auspexai_platform.db.repositories import (
+    AuditRepository,
+    ExperimentRepository,
+    ManifestRepository,
+    TenantRepository,
+)
 
 
 def create_app(
@@ -60,6 +66,8 @@ def create_app(
     MigrationRunner(db).apply_all()
 
     tenant_repository = TenantRepository(db)
+    manifest_repository = ManifestRepository(db)
+    experiment_repository = ExperimentRepository(db)
     audit_repository = AuditRepository(db)
     # Registry is a façade over the repository. Constructed here so the auth
     # path reads from the DB on every request.
@@ -83,6 +91,8 @@ def create_app(
     app.state.tenant_registry = tenant_registry
     app.state.db = db
     app.state.tenant_repository = tenant_repository
+    app.state.manifest_repository = manifest_repository
+    app.state.experiment_repository = experiment_repository
     app.state.audit_repository = audit_repository
 
     credential_dep = make_credential_dependency(token_store, tenant_registry)
@@ -93,6 +103,16 @@ def create_app(
         tenant_routes.build_router(credential_dep, tenant_repository, audit_repository),
         prefix="/api/v0",
         tags=["tenants"],
+    )
+    app.include_router(
+        experiment_routes.build_router(
+            credential_dep,
+            manifest_repository,
+            experiment_repository,
+            audit_repository,
+        ),
+        prefix="/api/v0",
+        tags=["experiments"],
     )
 
     return app

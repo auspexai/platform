@@ -26,7 +26,6 @@ from auspexai_platform.db.repositories import AuditRepository, TenantRepository
 from auspexai_platform.db.repositories.tenants import DuplicateTenantError
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 
-
 # ---- response models -------------------------------------------------------
 
 
