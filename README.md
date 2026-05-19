@@ -4,7 +4,20 @@ The coordinator daemon and platform infrastructure for [AuspexAI](https://github
 
 ## Status
 
-**Phase 1 — Coordinator daemon in active development.** M1 (project skeleton + FastAPI app + health endpoints + CLI scaffold) is in place. Subsequent milestones land auth middleware (three credential classes per §5.18 of the [Principles & Scope](https://github.com/auspexai/.github)), field-exposure filtering, the SQLite control DB + per-job DB pattern, resource routes (tenants, experiments, workers, receipts, accounts, alerts), the Device Flow handler, scheduler, reducer dispatch, the `retired_keys` registry, and the SSE event bus.
+**Phase 1 — Coordinator daemon in active development.** M1–M5 shipped (~3,000 LOC, 155 tests, CI green on Python 3.11 + 3.12). What's live:
+
+- **System + auth:** `GET /api/v0/health` + `GET /api/v0/health/public`, `GET /api/v0/auth/whoami`
+- **Tenants:** `POST/GET /api/v0/tenants`, `GET /api/v0/tenants/{id}`
+- **Experiments:** `POST/GET /api/v0/experiments`, `GET /api/v0/experiments/{id}`, `POST /api/v0/experiments/{id}/actions/{approve,abort,archive}`
+- **Three credential classes (per §5.18):** maintainer bearer token, researcher RFC 9421 HTTP Message Signature, anonymous-public
+- **Four field-exposure tags** filter responses field-by-field per credential class
+- **SQLite control DB** with sequential migration framework
+- **CLI:** `auspexai-coordinator {serve, token init/rotate/show}`
+
+Subsequent milestones:
+- **M6** — Workers + work units + scheduler + Device Flow + per-job DB pattern + experiment pause/resume actions
+- **M7** — Receipts + per-account trust-tier promotion (§6.8.2) + retired_keys registry + reducer dispatch + public receipt-verify endpoint
+- **M8** — Audit log list endpoint + alerts + SSE event bus
 
 ## Scope
 
@@ -32,7 +45,9 @@ ruff check src tests                    # lint
 ruff format --check src tests           # format check
 ```
 
-`GET /api/v0/health` returns liveness; `GET /api/v0/health/public` is the anonymous-public variant (will gain field-exposure filtering in M3).
+`GET /api/v0/health` returns liveness; `GET /api/v0/health/public` is the anonymous-public variant. Both pass through the M3 field-exposure filter (all health fields are `public`-tagged so the responses are equivalent today; later milestones add operator-only fields).
+
+`auspexai-coordinator token init` writes a maintainer bearer token at `<state-dir>/maintainer.token`; pass it as `Authorization: Bearer <token>` on operator console requests.
 
 ## License
 
