@@ -23,6 +23,7 @@ import secrets
 import sqlite3
 from datetime import UTC, datetime
 
+from auspexai_platform.auth.credential import CredentialClass
 from auspexai_platform.db.database import Database
 from auspexai_platform.db.models import Experiment, ExperimentStatus
 
@@ -107,9 +108,15 @@ class ExperimentRepository:
         *,
         expected_revision: int | None = None,
         error_summary: str | None = None,
+        actor_class: CredentialClass | None = None,
     ) -> Experiment:
         """Transition an experiment's status. Enforces the allowed-transition
-        graph + optional optimistic-concurrency check via `expected_revision`."""
+        graph + optional optimistic-concurrency check via `expected_revision`.
+
+        `actor_class` (M6e) is recorded on the row as `last_action_by_class`
+        for cross-role visibility. Existing callers may omit it; the column
+        stays unchanged when not supplied.
+        """
         current = self.get_by_id(experiment_id)
         if current is None:
             raise ExperimentNotFoundError(experiment_id)
@@ -145,7 +152,9 @@ class ExperimentRepository:
                 started_at = ?,
                 completed_at = ?,
                 revision = revision + 1,
-                error_summary = COALESCE(?, error_summary)
+                error_summary = COALESCE(?, error_summary),
+                last_action_at = ?,
+                last_action_by_class = COALESCE(?, last_action_by_class)
             WHERE experiment_id = ?
             """,
             (
@@ -153,8 +162,45 @@ class ExperimentRepository:
                 set_started_at.isoformat() if set_started_at else None,
                 set_completed_at.isoformat() if set_completed_at else None,
                 error_summary,
+                now,
+                actor_class.value if actor_class is not None else None,
                 experiment_id,
             ),
+        )
+        got = self.get_by_id(experiment_id)
+        assert got is not None
+        return got
+
+    def finalize_submissions(
+        self,
+        experiment_id: str,
+        *,
+        actor_class: CredentialClass,
+    ) -> Experiment:
+        """Set `submissions_finalized=true` on the experiment.
+
+        Idempotent: re-finalizing is a no-op (the flag stays true; last_action
+        fields still update so audit trail shows the second attempt).
+
+        Only the flag changes — status is unaffected. Auto-complete can then
+        fire when all units complete; the work-units POST route rejects new
+        submissions with 409. Raises ExperimentNotFoundError if the id is
+        unknown.
+        """
+        current = self.get_by_id(experiment_id)
+        if current is None:
+            raise ExperimentNotFoundError(experiment_id)
+        now = datetime.now(UTC).isoformat()
+        self.db.execute(
+            """
+            UPDATE experiments
+            SET submissions_finalized = 1,
+                revision = revision + 1,
+                last_action_at = ?,
+                last_action_by_class = ?
+            WHERE experiment_id = ?
+            """,
+            (now, actor_class.value, experiment_id),
         )
         got = self.get_by_id(experiment_id)
         assert got is not None
@@ -207,4 +253,13 @@ class ExperimentRepository:
             ),
             revision=row["revision"],
             error_summary=row["error_summary"],
+            submissions_finalized=bool(row["submissions_finalized"]),
+            last_action_at=(
+                datetime.fromisoformat(row["last_action_at"]) if row["last_action_at"] else None
+            ),
+            last_action_by_class=(
+                CredentialClass(row["last_action_by_class"])
+                if row["last_action_by_class"]
+                else None
+            ),
         )

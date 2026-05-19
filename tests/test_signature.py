@@ -17,6 +17,7 @@ from auspexai_platform.auth.errors import (
     SignatureExpiredError,
     UnsupportedAlgorithmError,
 )
+from auspexai_platform.auth.resolver import CredentialResolver
 from auspexai_platform.auth.signature import (
     RequestSummary,
     compute_content_digest,
@@ -60,17 +61,17 @@ def _make_summary(
     )
 
 
-def test_round_trip_verifies(registered_tenant, tenant_registry: TenantRegistry) -> None:
+def test_round_trip_verifies(registered_tenant, credential_resolver: CredentialResolver) -> None:
     privkey, binding = registered_tenant
     summary = _make_summary(privkey=privkey, pubkey_hex=binding.pubkey_hex)
-    credential = verify_request(summary, tenant_registry)
+    credential = verify_request(summary, credential_resolver)
     assert credential.is_researcher()
     assert credential.tenant_id == binding.tenant_id
     assert credential.pubkey_hex == binding.pubkey_hex
 
 
 def test_tampered_body_fails_verification(
-    registered_tenant, tenant_registry: TenantRegistry
+    registered_tenant, credential_resolver: CredentialResolver
 ) -> None:
     privkey, binding = registered_tenant
     summary = _make_summary(privkey=privkey, pubkey_hex=binding.pubkey_hex)
@@ -86,11 +87,11 @@ def test_tampered_body_fails_verification(
         content_digest_header=summary.content_digest_header,
     )
     with pytest.raises(InvalidSignatureError, match="Content-Digest"):
-        verify_request(tampered, tenant_registry)
+        verify_request(tampered, credential_resolver)
 
 
 def test_tampered_path_fails_verification(
-    registered_tenant, tenant_registry: TenantRegistry
+    registered_tenant, credential_resolver: CredentialResolver
 ) -> None:
     privkey, binding = registered_tenant
     summary = _make_summary(privkey=privkey, pubkey_hex=binding.pubkey_hex)
@@ -104,30 +105,32 @@ def test_tampered_path_fails_verification(
         content_digest_header=summary.content_digest_header,
     )
     with pytest.raises(InvalidSignatureError, match="verification failed"):
-        verify_request(tampered, tenant_registry)
+        verify_request(tampered, credential_resolver)
 
 
 def test_unknown_keyid_rejected(
     tenant_keypair: tuple[Ed25519PrivateKey, str],
-    tenant_registry: TenantRegistry,
+    credential_resolver: CredentialResolver,
 ) -> None:
     """A fresh keypair, NOT registered with the registry."""
     privkey, pubkey_hex = tenant_keypair
     summary = _make_summary(privkey=privkey, pubkey_hex=pubkey_hex)
     with pytest.raises(InvalidSignatureError, match="unknown keyid"):
-        verify_request(summary, tenant_registry)
+        verify_request(summary, credential_resolver)
 
 
-def test_expired_signature_rejected(registered_tenant, tenant_registry: TenantRegistry) -> None:
+def test_expired_signature_rejected(
+    registered_tenant, credential_resolver: CredentialResolver
+) -> None:
     privkey, binding = registered_tenant
     long_ago = int((datetime.now(UTC) - timedelta(hours=1)).timestamp())
     summary = _make_summary(privkey=privkey, pubkey_hex=binding.pubkey_hex, created=long_ago)
     with pytest.raises(SignatureExpiredError):
-        verify_request(summary, tenant_registry)
+        verify_request(summary, credential_resolver)
 
 
 def test_clock_skew_within_window_accepted(
-    registered_tenant, tenant_registry: TenantRegistry
+    registered_tenant, credential_resolver: CredentialResolver
 ) -> None:
     privkey, binding = registered_tenant
     # 4 minutes in the past — within the 5-minute window.
@@ -136,11 +139,13 @@ def test_clock_skew_within_window_accepted(
         pubkey_hex=binding.pubkey_hex,
         created=int((datetime.now(UTC) - timedelta(minutes=4)).timestamp()),
     )
-    credential = verify_request(summary, tenant_registry)
+    credential = verify_request(summary, credential_resolver)
     assert credential.is_researcher()
 
 
-def test_unsupported_algorithm_rejected(registered_tenant, tenant_registry: TenantRegistry) -> None:
+def test_unsupported_algorithm_rejected(
+    registered_tenant, credential_resolver: CredentialResolver
+) -> None:
     privkey, binding = registered_tenant
     summary = _make_summary(privkey=privkey, pubkey_hex=binding.pubkey_hex)
     # Swap alg in the Signature-Input header.
@@ -155,11 +160,11 @@ def test_unsupported_algorithm_rejected(registered_tenant, tenant_registry: Tena
         content_digest_header=summary.content_digest_header,
     )
     with pytest.raises(UnsupportedAlgorithmError):
-        verify_request(tampered, tenant_registry)
+        verify_request(tampered, credential_resolver)
 
 
 def test_missing_required_covered_component_rejected(
-    registered_tenant, tenant_registry: TenantRegistry
+    registered_tenant, credential_resolver: CredentialResolver
 ) -> None:
     privkey, binding = registered_tenant
     body = b""
@@ -182,15 +187,15 @@ def test_missing_required_covered_component_rejected(
         content_digest_header=None,
     )
     with pytest.raises(InvalidSignatureError, match="must cover"):
-        verify_request(summary, tenant_registry)
+        verify_request(summary, credential_resolver)
 
 
 def test_empty_body_does_not_require_content_digest(
-    registered_tenant, tenant_registry: TenantRegistry
+    registered_tenant, credential_resolver: CredentialResolver
 ) -> None:
     privkey, binding = registered_tenant
     summary = _make_summary(privkey=privkey, pubkey_hex=binding.pubkey_hex, method="GET", body=b"")
-    credential = verify_request(summary, tenant_registry)
+    credential = verify_request(summary, credential_resolver)
     assert credential.is_researcher()
 
 

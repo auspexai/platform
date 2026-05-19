@@ -40,6 +40,14 @@ class Config:
         """SQLite control DB path. Used from M4 onwards."""
         return self.state_dir / "coordinator.db"
 
+    @property
+    def jobs_dir(self) -> Path:
+        """Directory holding per-experiment SQLite DBs (M6c+). Each
+        experiment's work_units + assignments + results live in their own
+        `<jobs_dir>/<experiment_id>.db` file — control DB stays small and
+        per-job DBs are independent units (per §5.7)."""
+        return self.state_dir / "jobs"
+
     @classmethod
     def from_env(cls, *, state_dir: Path | None = None) -> Config:
         """Build a config. Explicit `state_dir` wins over env wins over default."""

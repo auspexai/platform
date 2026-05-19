@@ -8,7 +8,8 @@ The coordinator accepts a deliberately narrow subset of RFC 9421:
   - `created` (Unix timestamp) is REQUIRED. Coordinator rejects signatures
     older than `CREATED_WINDOW` seconds.
   - `keyid` is the lowercase hex Ed25519 public key (64 chars). The coordinator
-    looks it up in the tenant registry; unknown keys → InvalidSignatureError.
+    looks it up via the `CredentialResolver` (tenant registry then worker
+    registry); unknown keys → InvalidSignatureError.
   - One signature per request (label `sig1`). Multi-signature is not supported.
   - No `nonce`. The `created` window is the only replay defense for v0.
 
@@ -49,7 +50,7 @@ from auspexai_platform.auth.errors import (
     SignatureExpiredError,
     UnsupportedAlgorithmError,
 )
-from auspexai_platform.auth.tenant_registry import TenantRegistry
+from auspexai_platform.auth.resolver import CredentialResolver
 
 CREATED_WINDOW = timedelta(minutes=5)
 SUPPORTED_ALG = "ed25519"
@@ -239,7 +240,7 @@ class RequestSummary:
 
 def verify_request(
     request: RequestSummary,
-    registry: TenantRegistry,
+    resolver: CredentialResolver,
     *,
     now: datetime | None = None,
     created_window: timedelta = CREATED_WINDOW,
@@ -290,11 +291,12 @@ def verify_request(
             details={"created": parsed.created, "server_time": int(now.timestamp())},
         )
 
-    # Resolve pubkey → tenant.
-    binding = registry.get_tenant_for_pubkey(parsed.keyid)
-    if binding is None:
+    # Resolve pubkey → credential (researcher or worker).
+    credential = resolver.resolve(parsed.keyid)
+    if credential is None:
         raise InvalidSignatureError(
-            f"unknown keyid {parsed.keyid!r}; tenant must register the pubkey before signing requests"
+            f"unknown keyid {parsed.keyid!r}; pubkey must be registered as a tenant "
+            "maintainer or an enrolled worker before signing requests"
         )
 
     # Verify Ed25519 signature over the canonical base.
@@ -314,7 +316,7 @@ def verify_request(
     except InvalidSignature as e:
         raise InvalidSignatureError("Ed25519 verification failed") from e
 
-    return Credential.researcher(tenant_id=binding.tenant_id, pubkey_hex=parsed.keyid)
+    return credential
 
 
 # ---- signing (for tests + the eventual SDK helper) --------------------------

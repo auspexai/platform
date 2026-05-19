@@ -61,6 +61,9 @@ class ExperimentResponse(BaseModel):
     submitted_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
     started_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
     completed_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
+    submissions_finalized: Annotated[bool | None, ExposureTag.PUBLIC] = None
+    last_action_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
+    last_action_by_class: Annotated[str | None, ExposureTag.PUBLIC] = None
     tenant_experiment_label: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
     manifest_hash: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
     revision: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
@@ -93,6 +96,13 @@ def _to_response(experiment) -> ExperimentResponse:
         completed_at=experiment.completed_at,
         revision=experiment.revision,
         error_summary=experiment.error_summary,
+        submissions_finalized=experiment.submissions_finalized,
+        last_action_at=experiment.last_action_at,
+        last_action_by_class=(
+            experiment.last_action_by_class.value
+            if experiment.last_action_by_class is not None
+            else None
+        ),
     )
 
 
@@ -366,6 +376,104 @@ def build_router(
             audit_repository=audit_repository,
         )
 
+    @router.post(
+        "/experiments/{experiment_id}/actions/pause",
+        response_model=ExperimentResponse,
+        response_model_exclude_none=True,
+    )
+    async def pause_experiment(
+        experiment_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ExperimentResponse:
+        return _transition(
+            experiment_id=experiment_id,
+            new_status=ExperimentStatus.PAUSED,
+            credential=credential,
+            allow_researcher=True,
+            action="experiment.pause",
+            experiment_repository=experiment_repository,
+            audit_repository=audit_repository,
+        )
+
+    @router.post(
+        "/experiments/{experiment_id}/actions/resume",
+        response_model=ExperimentResponse,
+        response_model_exclude_none=True,
+    )
+    async def resume_experiment(
+        experiment_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ExperimentResponse:
+        return _transition(
+            experiment_id=experiment_id,
+            new_status=ExperimentStatus.APPROVED,
+            credential=credential,
+            allow_researcher=True,
+            action="experiment.resume",
+            experiment_repository=experiment_repository,
+            audit_repository=audit_repository,
+        )
+
+    @router.post(
+        "/experiments/{experiment_id}/actions/finalize-submissions",
+        response_model=ExperimentResponse,
+        response_model_exclude_none=True,
+    )
+    async def finalize_submissions(
+        experiment_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ExperimentResponse:
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "experiment_not_found",
+                        "message": f"no experiment with id {experiment_id!r}",
+                        "details": {"experiment_id": experiment_id},
+                    }
+                },
+            )
+        _check_action_authz(credential, experiment, allow_researcher=True)
+        # Only sensible when there's something to receive — block on terminal
+        # states. The transition graph already encodes which statuses are
+        # terminal; finalize is meaningful only for approved/paused.
+        if experiment.status not in {ExperimentStatus.APPROVED, ExperimentStatus.PAUSED}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "finalize_not_applicable",
+                        "message": (
+                            f"submissions can only be finalized while the experiment "
+                            f"is approved or paused (current status: "
+                            f"{experiment.status.value})"
+                        ),
+                        "details": {"current_status": experiment.status.value},
+                    }
+                },
+            )
+        updated = experiment_repository.finalize_submissions(
+            experiment_id, actor_class=credential.kind
+        )
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            actor_tenant_id=credential.tenant_id,
+            action="experiment.finalize_submissions",
+            resource_type="experiment",
+            resource_id=experiment_id,
+            payload={
+                "was_already_finalized": experiment.submissions_finalized,
+            },
+        )
+        return filter_for_credential(
+            _to_response(updated),
+            credential,
+            resource_tenant_id=updated.tenant_id,
+        )
+
     return router
 
 
@@ -395,7 +503,9 @@ def _transition(
         )
     _check_action_authz(credential, experiment, allow_researcher=allow_researcher)
     try:
-        updated = experiment_repository.update_status(experiment_id, new_status)
+        updated = experiment_repository.update_status(
+            experiment_id, new_status, actor_class=credential.kind
+        )
     except InvalidStatusTransitionError as e:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

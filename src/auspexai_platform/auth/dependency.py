@@ -32,8 +32,8 @@ from auspexai_platform.auth.errors import (
     InvalidTokenError,
     MalformedAuthorizationError,
 )
+from auspexai_platform.auth.resolver import CredentialResolver
 from auspexai_platform.auth.signature import RequestSummary, verify_request
-from auspexai_platform.auth.tenant_registry import TenantRegistry
 
 
 def _auth_failure(
@@ -47,11 +47,11 @@ def _auth_failure(
 
 def make_credential_dependency(
     token_store: TokenStore,
-    registry: TenantRegistry,
+    resolver: CredentialResolver,
 ):
-    """Build the `get_credential` dependency bound to a token store + tenant
-    registry. Each `create_app()` call binds its own pair so tests can run in
-    parallel with isolated state."""
+    """Build the `get_credential` dependency bound to a token store + a
+    keyid resolver (tenants + workers). Each `create_app()` call binds its
+    own resolver so tests can run in parallel with isolated state."""
 
     async def get_credential(request: Request) -> Credential:
         auth_header = request.headers.get("Authorization")
@@ -91,7 +91,7 @@ def make_credential_dependency(
                 content_digest_header=request.headers.get("Content-Digest"),
             )
             try:
-                return verify_request(summary, registry)
+                return verify_request(summary, resolver)
             except AuthError as e:
                 raise _auth_failure(e) from e
 
@@ -142,9 +142,26 @@ def require_researcher(credential: Credential) -> Credential:
     return credential
 
 
+def require_worker(credential: Credential) -> Credential:
+    """Sub-dependency that 403s if the credential is not a worker."""
+    if not credential.is_worker():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": {
+                    "code": "worker_required",
+                    "message": "this endpoint requires a worker credential",
+                    "details": {"credential_class": credential.kind.value},
+                }
+            },
+        )
+    return credential
+
+
 __all__ = [
     "CredentialClass",
     "make_credential_dependency",
     "require_maintainer",
     "require_researcher",
+    "require_worker",
 ]

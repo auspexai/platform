@@ -13,12 +13,36 @@ format. Keep them separate.
 from __future__ import annotations
 
 from datetime import datetime
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from auspexai_platform.auth.credential import CredentialClass
+
+
+class TrustTier(IntEnum):
+    """Worker / account trust tiers per §6.1.
+
+    Stored as INTEGER in SQL so comparison ops (>=, <=) work naturally for
+    "promote to at least T1" logic in the scheduler and trust-promotion paths.
+    """
+
+    T0_ANONYMOUS = 0
+    T1_VERIFIED = 1
+    T2_VOUCHED = 2
+    T3_TRUSTED = 3
+    T4_MAINTAINER = 4
+
+
+class IdentityProvider(StrEnum):
+    """Identity providers the coordinator accepts for account binding.
+
+    Phase 1: GitHub only (auspexai org OAuth App). Adding a new IdP requires
+    a migration to relax the accounts.idp CHECK constraint.
+    """
+
+    GITHUB = "github"
 
 
 class ExperimentStatus(StrEnum):
@@ -34,6 +58,21 @@ class ExperimentStatus(StrEnum):
     ABORTED = "aborted"
     COMPLETED = "completed"
     ARCHIVED = "archived"
+
+
+class WorkUnitStatus(StrEnum):
+    """Work-unit lifecycle states (M6c+).
+
+    M6c only writes PENDING on insert. M6d's scheduler / result-submission
+    path drives the rest:
+      pending → in_progress (≥1 assignment outstanding) → completed
+                                                       \\→ failed
+    """
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class Tenant(BaseModel):
@@ -85,6 +124,115 @@ class Experiment(BaseModel):
     completed_at: datetime | None = None
     revision: int = 1
     error_summary: str | None = None
+    # M6e: submission gate + state-change attribution.
+    submissions_finalized: bool = False
+    last_action_at: datetime | None = None
+    last_action_by_class: CredentialClass | None = None
+
+
+class Account(BaseModel):
+    """A row in the `accounts` table — one human identity bound to one IdP."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: str
+    idp: IdentityProvider
+    idp_sub: str
+    display_name: str | None = None
+    email: str | None = None
+    trust_tier: TrustTier = TrustTier.T1_VERIFIED
+    created_at: datetime
+    retired_at: datetime | None = None
+
+
+class OAuthBinding(BaseModel):
+    """A row in the `account_oauth_bindings` table — a short-lived one-shot
+    token. M6b's worker-upgrade endpoint exchanges it for an account binding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    binding_token: str
+    account_id: str
+    created_at: datetime
+    expires_at: datetime
+    consumed_at: datetime | None = None
+
+
+class Assignment(BaseModel):
+    """A row in a per-job DB's `assignments` table — one worker assigned to
+    one unit. (unit_id, worker_id) is unique: a single worker may not get
+    the same unit twice. `result_id` is None until the worker submits a
+    Result for this assignment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    assignment_id: str
+    unit_id: str
+    worker_id: str
+    worker_pubkey_hex: str
+    assigned_at: datetime
+    result_id: str | None = None
+
+
+class Result(BaseModel):
+    """A row in a per-job DB's `results` table — the SDK Result envelope
+    (schemas/result_v0_1.json) plus coordinator-side metadata
+    (`received_at`). `payload` is tenant-opaque; `worker_signature` is the
+    Ed25519 signature over the canonical encoding of the Result body and
+    is stored verbatim for M7 receipt verification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    result_id: str
+    unit_id: str
+    worker_id: str
+    worker_pubkey_hex: str
+    exit_code: int
+    payload: dict[str, Any] = Field(default_factory=dict)
+    worker_signature: str  # base64
+    completed_at: datetime
+    received_at: datetime
+
+
+class WorkUnit(BaseModel):
+    """A row in a per-job DB's `work_units` table.
+
+    `payload` is the tenant-defined work content (opaque to v0 — coordinator
+    stores and ships it but never interprets it). `replication_target` is
+    the number of distinct-worker completions required before the unit is
+    considered done; default 3 matches the most-conservative T0-only case
+    (§6.1). M6d's scheduler may downgrade this for higher-tier workers.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    unit_id: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    status: WorkUnitStatus = WorkUnitStatus.PENDING
+    replication_target: int = 3
+    completions_so_far: int = 0
+    created_at: datetime
+
+
+class Worker(BaseModel):
+    """A row in the `workers` table — an Ed25519-keyed worker daemon.
+
+    `capabilities` is the parsed JSON dict (worker-declared; opaque to v0).
+    `account_id` is None for T0 anonymous workers, set after a successful
+    M6a binding-token upgrade. `last_heartbeat_at` is None until the
+    worker's first heartbeat call.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    worker_id: str
+    pubkey_hex: str  # 64 lowercase hex chars
+    account_id: str | None = None
+    trust_tier: TrustTier = TrustTier.T0_ANONYMOUS
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    registered_at: datetime
+    last_heartbeat_at: datetime | None = None
+    retired_at: datetime | None = None
 
 
 class AuditEntry(BaseModel):

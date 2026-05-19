@@ -2,8 +2,8 @@
 
 Set by the auth dependency; consumed by routes and (M3+) by the field-exposure
 filter. The structure carries enough information for filtering: the class
-tells us which exposure tags are visible, and `tenant_id` resolves tenant-
-scoped queries.
+tells us which exposure tags are visible, and `tenant_id` / `worker_id` /
+`account_id` resolve scope-specific queries.
 """
 
 from __future__ import annotations
@@ -13,16 +13,23 @@ from enum import StrEnum
 
 
 class CredentialClass(StrEnum):
-    """The four Phase 1+ credential classes.
+    """The six Phase 1+ credential classes.
 
-    Three are implemented in Phase 1 (maintainer, researcher, anonymous); the
-    fourth (T1+ account) lands Phase 2-3 as a filter addition. Defined here
-    so other modules can reference it without forward-references.
+    Phase 1 (M1-M6) implements five: maintainer (bearer), researcher (RFC
+    9421 signed; tenant-pubkey-resolved), anonymous-public, worker (RFC
+    9421 signed; worker-pubkey-resolved), and system (M6e: coordinator-
+    driven actions like auto-complete; never bound to an HTTP request,
+    appears only in audit_log entries).
+
+    ACCOUNT lands Phase 2-3 once accounts authenticate directly rather
+    than via a worker they are bound to.
     """
 
     MAINTAINER = "maintainer"
     RESEARCHER = "researcher"
     ANONYMOUS = "anonymous"
+    WORKER = "worker"
+    SYSTEM = "system"
     # Phase 2-3:
     ACCOUNT = "account"
 
@@ -31,15 +38,22 @@ class CredentialClass(StrEnum):
 class Credential:
     """An authenticated request's credential context.
 
-    `kind` chooses which exposure tags are visible. `tenant_id` is set for
-    researcher credentials (used by tenant-scoped queries); None for the others.
-    `pubkey_hex` is the hex-encoded Ed25519 pubkey that signed the request, set
-    for researcher credentials so the audit log can attribute the action.
+    `kind` chooses which exposure tags are visible. Scope fields populated
+    per credential class:
+
+      - researcher: tenant_id + pubkey_hex
+      - worker: worker_id + pubkey_hex; account_id is set iff the worker has
+        upgraded from T0 to T1+ by binding to an account; trust_tier is the
+        worker's current tier
+      - maintainer / anonymous: all scope fields are None
     """
 
     kind: CredentialClass
     tenant_id: str | None = None
     pubkey_hex: str | None = None
+    worker_id: str | None = None
+    account_id: str | None = None
+    trust_tier: int | None = None
 
     @classmethod
     def anonymous(cls) -> Credential:
@@ -51,7 +65,28 @@ class Credential:
 
     @classmethod
     def researcher(cls, tenant_id: str, pubkey_hex: str) -> Credential:
-        return cls(kind=CredentialClass.RESEARCHER, tenant_id=tenant_id, pubkey_hex=pubkey_hex)
+        return cls(
+            kind=CredentialClass.RESEARCHER,
+            tenant_id=tenant_id,
+            pubkey_hex=pubkey_hex,
+        )
+
+    @classmethod
+    def worker(
+        cls,
+        *,
+        worker_id: str,
+        pubkey_hex: str,
+        account_id: str | None,
+        trust_tier: int,
+    ) -> Credential:
+        return cls(
+            kind=CredentialClass.WORKER,
+            pubkey_hex=pubkey_hex,
+            worker_id=worker_id,
+            account_id=account_id,
+            trust_tier=trust_tier,
+        )
 
     def is_maintainer(self) -> bool:
         return self.kind is CredentialClass.MAINTAINER
@@ -61,3 +96,6 @@ class Credential:
 
     def is_anonymous(self) -> bool:
         return self.kind is CredentialClass.ANONYMOUS
+
+    def is_worker(self) -> bool:
+        return self.kind is CredentialClass.WORKER
