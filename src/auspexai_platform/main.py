@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from auspexai_platform import __version__
 from auspexai_platform.api import auth as auth_routes
 from auspexai_platform.api import health
+from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.auth.bearer import TokenStore
 from auspexai_platform.auth.dependency import make_credential_dependency
 from auspexai_platform.auth.tenant_registry import TenantRegistry
@@ -88,6 +89,11 @@ def create_app(
 
     app.include_router(health.build_router(credential_dep), prefix="/api/v0", tags=["system"])
     app.include_router(auth_routes.build_router(credential_dep), prefix="/api/v0", tags=["auth"])
+    app.include_router(
+        tenant_routes.build_router(credential_dep, tenant_repository, audit_repository),
+        prefix="/api/v0",
+        tags=["tenants"],
+    )
 
     return app
 
