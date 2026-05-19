@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 from auspexai_platform.auth.bearer import TokenStore
 from auspexai_platform.auth.tenant_registry import TenantBinding, TenantRegistry
 from auspexai_platform.config import Config
+from auspexai_platform.db import Database, MigrationRunner
+from auspexai_platform.db.repositories import AuditRepository, TenantRepository
 from auspexai_platform.main import create_app
 
 
@@ -66,13 +68,41 @@ def registered_tenant(
     return priv, binding
 
 
+# ---- M4: storage layer fixtures --------------------------------------------
+
+
+@pytest.fixture
+def db(config: Config) -> Generator[Database, None, None]:
+    """Migrated, isolated control DB per test."""
+    database = Database(config.control_db_path)
+    MigrationRunner(database).apply_all()
+    yield database
+    database.close()
+
+
+@pytest.fixture
+def tenant_repository(db: Database) -> TenantRepository:
+    return TenantRepository(db)
+
+
+@pytest.fixture
+def audit_repository(db: Database) -> AuditRepository:
+    return AuditRepository(db)
+
+
 @pytest.fixture
 def client(
     config: Config,
     token_store: TokenStore,
     tenant_registry: TenantRegistry,
+    db: Database,
 ) -> Generator[TestClient, None, None]:
-    """TestClient with all M2 layers wired up."""
-    app = create_app(config=config, token_store=token_store, tenant_registry=tenant_registry)
+    """TestClient with all M2-M4 layers wired up."""
+    app = create_app(
+        config=config,
+        token_store=token_store,
+        tenant_registry=tenant_registry,
+        db=db,
+    )
     with TestClient(app) as c:
         yield c

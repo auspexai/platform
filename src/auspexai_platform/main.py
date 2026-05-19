@@ -6,10 +6,12 @@ store, a pre-populated tenant registry) without monkey-patching globals.
 
 Composition order (one section per M-milestone):
   - M1: health endpoint
-  - M2 (this milestone): config, token store, tenant registry, auth dependency,
-    `/auth/whoami` endpoint
+  - M2: config, token store, tenant registry, auth dependency, `/auth/whoami`
   - M3: field-exposure filter
-  - M4: storage layer wiring (DB lifespan hook; tenant registry moves to DB)
+  - M4 (this milestone): SQLite control DB + repository pattern + migrations.
+    DB is opened at app-construct time and migrations applied; repositories
+    are exposed on `app.state`. The auth-side tenant_registry stays
+    in-memory for now; M5 will migrate the auth path to read from the DB.
   - M5+: resource routes (tenants, experiments, workers, receipts, ...)
 """
 
@@ -24,6 +26,8 @@ from auspexai_platform.auth.bearer import TokenStore
 from auspexai_platform.auth.dependency import make_credential_dependency
 from auspexai_platform.auth.tenant_registry import TenantRegistry
 from auspexai_platform.config import Config
+from auspexai_platform.db import Database, MigrationRunner
+from auspexai_platform.db.repositories import AuditRepository, TenantRepository
 
 
 def create_app(
@@ -31,6 +35,7 @@ def create_app(
     *,
     token_store: TokenStore | None = None,
     tenant_registry: TenantRegistry | None = None,
+    db: Database | None = None,
 ) -> FastAPI:
     """Build and return the coordinator's FastAPI application.
 
@@ -41,10 +46,21 @@ def create_app(
             `config.maintainer_token_path`.
         tenant_registry: researcher pubkey → tenant_id lookup. If None, an
             empty in-memory registry is created; tests typically pre-populate.
+        db: control-DB connection. If None, opened at
+            `config.control_db_path`. Migrations are applied unconditionally
+            (idempotent).
     """
     config = config or Config.from_env()
     token_store = token_store or TokenStore(config.maintainer_token_path)
     tenant_registry = tenant_registry or TenantRegistry()
+    db = db or Database(config.control_db_path)
+
+    # Apply pending migrations on every startup. Idempotent: no-op if
+    # already up-to-date.
+    MigrationRunner(db).apply_all()
+
+    tenant_repository = TenantRepository(db)
+    audit_repository = AuditRepository(db)
 
     app = FastAPI(
         title="AuspexAI Coordinator",
@@ -62,6 +78,9 @@ def create_app(
     app.state.config = config
     app.state.token_store = token_store
     app.state.tenant_registry = tenant_registry
+    app.state.db = db
+    app.state.tenant_repository = tenant_repository
+    app.state.audit_repository = audit_repository
 
     credential_dep = make_credential_dependency(token_store, tenant_registry)
 
