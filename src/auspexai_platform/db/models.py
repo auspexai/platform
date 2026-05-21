@@ -162,7 +162,10 @@ class Assignment(BaseModel):
     """A row in a per-job DB's `assignments` table — one worker assigned to
     one unit. (unit_id, worker_id) is unique: a single worker may not get
     the same unit twice. `result_id` is None until the worker submits a
-    Result for this assignment."""
+    Result for this assignment. `refused_at` is non-null when the worker
+    explicitly refused the assignment via the M3 refuse endpoint
+    (manifest-swap defense, sensitive-content gate, tenant deny/allow).
+    A row may not have both `result_id` and `refused_at` set."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -172,6 +175,9 @@ class Assignment(BaseModel):
     worker_pubkey_hex: str
     assigned_at: datetime
     result_id: str | None = None
+    refused_at: datetime | None = None
+    refused_kind: str | None = None
+    refused_reason: str | None = None
 
 
 class Result(BaseModel):

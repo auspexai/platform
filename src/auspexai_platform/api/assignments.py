@@ -60,7 +60,10 @@ from auspexai_platform.db.repositories import (
     WorkerRepository,
     WorkUnitRepository,
 )
-from auspexai_platform.db.repositories.assignments import DuplicateAssignmentError
+from auspexai_platform.db.repositories.assignments import (
+    AssignmentAlreadyResolvedError,
+    DuplicateAssignmentError,
+)
 from auspexai_platform.db.repositories.experiments import (
     InvalidStatusTransitionError,
 )
@@ -101,6 +104,31 @@ class ResultSubmissionRequest(BaseModel):
     exit_code: int = Field(ge=-255, le=255)
     payload: dict[str, Any]
     worker_signature: str = Field(min_length=1)
+
+
+class RefuseRequest(BaseModel):
+    """POST /workers/{id}/assignments/{unit_id}/refuse body — worker tells the
+    coordinator it's declining a previously-assigned unit (per M3 Q-W4)."""
+
+    kind: str = Field(
+        min_length=1,
+        max_length=64,
+        description=(
+            "Refusal reason code. Worker M3 uses: manifest_swap, sensitive, "
+            "tenant_deny, tenant_allow_list_miss, manual."
+        ),
+    )
+    reason: str = Field(
+        max_length=2048,
+        description="Free-form human-readable detail (operator-visible).",
+    )
+
+
+class RefuseResponse(BaseModel):
+    assignment_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    unit_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    refused_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
+    refused_kind: Annotated[str | None, ExposureTag.PUBLIC] = None
 
 
 class ResultSubmissionResponse(BaseModel):
@@ -367,6 +395,87 @@ def build_router(
             unit_status_after=updated_unit.status.value,
             completions_so_far=updated_unit.completions_so_far,
             replication_target=updated_unit.replication_target,
+        )
+
+    # ---- POST refuse --------------------------------------------------
+
+    @router.post(
+        "/workers/{worker_id}/assignments/{unit_id}/refuse",
+        response_model=RefuseResponse,
+        response_model_exclude_none=True,
+    )
+    async def refuse_assignment(
+        worker_id: str,
+        unit_id: str,
+        body: RefuseRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> RefuseResponse:
+        """Worker explicitly declines a previously-assigned unit. The
+        assignment row is marked refused so the operator console can see
+        the reason; the unit remains eligible for offer to other workers
+        (per the scheduler's unit-state semantics).
+        """
+        _require_self_worker(credential, worker_id)
+
+        experiment_id, per_job_db, assignment = _find_assignment(
+            per_job_factory, unit_id, worker_id
+        )
+        if assignment is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "assignment_not_found",
+                        "message": (f"no assignment for unit {unit_id!r} and worker {worker_id!r}"),
+                    }
+                },
+            )
+
+        assignments_repo = AssignmentRepository(per_job_db)
+        try:
+            updated = assignments_repo.mark_refused(
+                assignment_id=assignment.assignment_id,
+                kind=body.kind,
+                reason=body.reason,
+            )
+        except AssignmentAlreadyResolvedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "assignment_already_resolved",
+                        "message": str(exc),
+                        "details": {
+                            "assignment_id": assignment.assignment_id,
+                            "has_result": assignment.result_id is not None,
+                            "already_refused_at": (
+                                assignment.refused_at.isoformat() if assignment.refused_at else None
+                            ),
+                        },
+                    }
+                },
+            ) from exc
+
+        audit_repository.append(
+            actor_class=CredentialClass.WORKER,
+            actor_identifier=credential.pubkey_hex,
+            action="assignment.refuse",
+            resource_type="assignment",
+            resource_id=assignment.assignment_id,
+            payload={
+                "experiment_id": experiment_id,
+                "unit_id": unit_id,
+                "worker_id": worker_id,
+                "kind": body.kind,
+                "reason": body.reason,
+            },
+        )
+
+        return RefuseResponse(
+            assignment_id=updated.assignment_id,
+            unit_id=updated.unit_id,
+            refused_at=updated.refused_at,
+            refused_kind=updated.refused_kind,
         )
 
     return router

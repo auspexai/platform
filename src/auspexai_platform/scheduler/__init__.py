@@ -89,7 +89,11 @@ class Scheduler:
             for unit in candidates:
                 if assignments.already_assigned(unit.unit_id, worker.worker_id):
                     continue
-                if assignments.count_for_unit(unit.unit_id) >= unit.replication_target:
+                # Refused assignments don't consume a replication slot — the
+                # offer was burned but no progress was made. Use the active
+                # count so refused-then-reschedule actually frees the unit
+                # for another worker. Per M3 Q-W4 resolution.
+                if assignments.count_active_for_unit(unit.unit_id) >= unit.replication_target:
                     continue
                 return SchedulerPick(
                     experiment_id=experiment.experiment_id,

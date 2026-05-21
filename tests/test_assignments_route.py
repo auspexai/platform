@@ -410,3 +410,207 @@ def test_submit_result_rejects_double_submission(
     )
     assert second.status_code == 409
     assert second.json()["detail"]["error"]["code"] == "result_already_submitted"
+
+
+# ---- POST refuse ---------------------------------------------------------
+
+
+def _refuse(client, *, privkey, pubkey_hex, worker_id, unit_id, kind, reason):
+    return _signed_post(
+        client,
+        privkey=privkey,
+        pubkey_hex=pubkey_hex,
+        path=f"/api/v0/workers/{worker_id}/assignments/{unit_id}/refuse",
+        payload={"kind": kind, "reason": reason},
+    )
+
+
+def test_refuse_marks_assignment_and_returns_200(
+    client: TestClient,
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+) -> None:
+    privkey, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    _seed_units(per_job_factory, experiment.experiment_id, ["u1"])
+
+    pulled = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    )
+    unit_id = pulled.json()["work_unit"]["unit_id"]
+
+    response = _refuse(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        worker_id=worker.worker_id,
+        unit_id=unit_id,
+        kind="manifest_swap",
+        reason="testing refuse path",
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["unit_id"] == unit_id
+    assert body["refused_kind"] == "manifest_swap"
+    assert body["refused_at"] is not None
+
+
+def test_refuse_returns_404_when_no_assignment(
+    client: TestClient,
+    enrolled_worker,
+) -> None:
+    privkey, worker = enrolled_worker
+    response = _refuse(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        worker_id=worker.worker_id,
+        unit_id="u-nonexistent",
+        kind="manual",
+        reason="no assignment exists",
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"]["error"]["code"] == "assignment_not_found"
+
+
+def test_refuse_returns_409_on_double_refuse(
+    client: TestClient,
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+) -> None:
+    privkey, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    _seed_units(per_job_factory, experiment.experiment_id, ["u1"])
+
+    pulled = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    )
+    unit_id = pulled.json()["work_unit"]["unit_id"]
+
+    first = _refuse(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        worker_id=worker.worker_id,
+        unit_id=unit_id,
+        kind="manual",
+        reason="first refusal",
+    )
+    assert first.status_code == 200
+
+    second = _refuse(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        worker_id=worker.worker_id,
+        unit_id=unit_id,
+        kind="manual",
+        reason="second refusal",
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"]["error"]["code"] == "assignment_already_resolved"
+
+
+def test_refuse_returns_409_when_result_already_attached(
+    client: TestClient,
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+) -> None:
+    privkey, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    _seed_units(per_job_factory, experiment.experiment_id, ["u1"])
+
+    pulled = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    )
+    unit_id = pulled.json()["work_unit"]["unit_id"]
+
+    result = _signed_post(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments/{unit_id}/result",
+        payload={
+            "unit_id": unit_id,
+            "worker_pubkey": worker.pubkey_hex,
+            "completed_at": "2026-05-19T12:00:00+00:00",
+            "exit_code": 0,
+            "payload": {"out": 0},
+            "worker_signature": "Zm9v",
+        },
+    )
+    assert result.status_code == 201
+
+    refused = _refuse(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        worker_id=worker.worker_id,
+        unit_id=unit_id,
+        kind="manual",
+        reason="too late to refuse",
+    )
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["error"]["code"] == "assignment_already_resolved"
+
+
+def test_refuse_then_other_worker_can_pick_up_unit(
+    client: TestClient,
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    worker_repository,
+) -> None:
+    """Refused assignments don't permanently block re-assignment (Q-W4)."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    privkey, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    # Single unit, replication_target=3 (default).
+    _seed_units(per_job_factory, experiment.experiment_id, ["u1"])
+
+    pulled = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    )
+    unit_id = pulled.json()["work_unit"]["unit_id"]
+    refused = _refuse(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        worker_id=worker.worker_id,
+        unit_id=unit_id,
+        kind="tenant_deny",
+        reason="this worker doesn't want this tenant",
+    )
+    assert refused.status_code == 200
+
+    # Enroll a second worker; verify it can pick up the same unit.
+    other_pk = Ed25519PrivateKey.generate()
+    other_pub = other_pk.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    other = worker_repository.enroll(worker_id="wkr-other-a", pubkey_hex=other_pub)
+
+    pulled2 = _signed_get(
+        client,
+        privkey=other_pk,
+        pubkey_hex=other_pub,
+        path=f"/api/v0/workers/{other.worker_id}/assignments",
+    )
+    assert pulled2.status_code == 200
+    assert pulled2.json()["work_unit"] is not None
+    assert pulled2.json()["work_unit"]["unit_id"] == unit_id

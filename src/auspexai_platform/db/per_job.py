@@ -25,6 +25,7 @@ its own jobs/ tree.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -54,6 +55,9 @@ CREATE TABLE IF NOT EXISTS assignments (
     worker_pubkey_hex    TEXT    NOT NULL,
     assigned_at          TEXT    NOT NULL,
     result_id            TEXT,
+    refused_at           TEXT,
+    refused_kind         TEXT,
+    refused_reason       TEXT,
     UNIQUE (unit_id, worker_id),
     FOREIGN KEY (unit_id) REFERENCES work_units(unit_id)
 );
@@ -103,6 +107,7 @@ class PerJobDatabaseFactory:
             db_path = self._path_for(experiment_id)
             db = Database(db_path)
             db.executescript(PER_JOB_SCHEMA_SQL)
+            _ensure_assignments_refused_columns(db)
             self._cache[experiment_id] = db
             return db
 
@@ -120,8 +125,10 @@ class PerJobDatabaseFactory:
             if not db_path.exists():
                 return None
             # On a fresh coordinator process, the file may exist on disk
-            # but not be cached yet — load it.
+            # but not be cached yet — load it. Apply post-M6d schema
+            # additions idempotently so pre-Option-A per-job DBs work.
             db = Database(db_path)
+            _ensure_assignments_refused_columns(db)
             self._cache[experiment_id] = db
             return db
 
@@ -145,3 +152,23 @@ class PerJobDatabaseFactory:
 
     def _path_for(self, experiment_id: str) -> Path:
         return self._jobs_dir / f"{experiment_id}.db"
+
+
+def _ensure_assignments_refused_columns(db: Database) -> None:
+    """Idempotently add refused_at / refused_kind / refused_reason columns to
+    the per-job `assignments` table. The columns are part of
+    PER_JOB_SCHEMA_SQL for newly-created DBs, but existing pre-Option-A
+    per-job DBs were created without them; ALTER TABLE ADD COLUMN is the
+    cheap way to converge.
+    """
+    for column, sql_type in (
+        ("refused_at", "TEXT"),
+        ("refused_kind", "TEXT"),
+        ("refused_reason", "TEXT"),
+    ):
+        try:
+            db.executescript(f"ALTER TABLE assignments ADD COLUMN {column} {sql_type};")
+        except sqlite3.OperationalError as exc:
+            # "duplicate column name" — column already present, fine.
+            if "duplicate column" not in str(exc).lower():
+                raise
