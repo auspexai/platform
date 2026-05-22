@@ -37,6 +37,13 @@ field in the wire format — the wire format is immutable per §11 Q20.
 
 from __future__ import annotations
 
+from auspexai_platform.receipts.issuance import (
+    HASH_AGREEMENT_METHOD,
+    AgreementOutcome,
+    ReceiptIssuanceOutcome,
+    hash_agreement_reducer,
+    issue_receipts_for_completed_unit,
+)
 from auspexai_platform.receipts.models import (
     QuorumAgreement,
     Receipt,
@@ -59,10 +66,13 @@ from auspexai_platform.receipts.signing import (
 )
 
 __all__ = [
+    "HASH_AGREEMENT_METHOD",
+    "AgreementOutcome",
     "CoseDecodeError",
     "CoseVerificationError",
     "QuorumAgreement",
     "Receipt",
+    "ReceiptIssuanceOutcome",
     "ReceiptRecord",
     "ReceiptRepository",
     "ResultHashAnchor",
@@ -72,5 +82,7 @@ __all__ = [
     "cose_sign1_encode",
     "decode_cbor",
     "encode_cbor",
+    "hash_agreement_reducer",
+    "issue_receipts_for_completed_unit",
     "load_or_generate_signing_key",
 ]

@@ -194,6 +194,7 @@ def create_app(
             per_job_factory,
             audit_repository,
             experiment_repository,
+            receipt_signing_key,
         ),
         prefix="/api/v0",
         tags=["assignments"],

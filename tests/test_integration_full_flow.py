@@ -247,11 +247,42 @@ def test_full_flow_researcher_to_auto_complete(
         "worker.enroll",
         "assignment.create",
         "result.submit",
+        # M7c: on the third result, the unit transitions to completed and
+        # the hash_agreement reducer issues receipts.
+        "receipts.issue.agreed",
         "experiment.auto_complete",
     ]
     assert actions_in_order == expected_subsequence, (
         f"audit trace mismatch:\n  expected: {expected_subsequence}\n  got:      {actions_in_order}"
     )
+
+    # ---- M7c: verify receipts were issued ----
+    from auspexai_platform.receipts import (
+        HASH_AGREEMENT_METHOD,
+        ReceiptRepository,
+        cose_sign1_decode,
+        decode_cbor,
+    )
+
+    per_job_db = client.app.state.per_job_factory.get(coordinator_exp_id)
+    assert per_job_db is not None
+    receipts = ReceiptRepository(per_job_db).list_all()
+    assert len(receipts) == 3, f"expected 3 receipts (one per agreeing worker), got {len(receipts)}"
+    signing_key = client.app.state.receipt_signing_key
+    seen_pubkeys = set()
+    for record in receipts:
+        assert record.signing_key_pubkey_hex == signing_key.pubkey_hex
+        payload, kid = cose_sign1_decode(
+            record.cose_signed_blob, expected_pubkey=signing_key.public_key
+        )
+        assert kid == signing_key.pubkey_hex
+        receipt = decode_cbor(payload)
+        assert receipt.quorum_agreement.method == HASH_AGREEMENT_METHOD
+        assert receipt.quorum_agreement.agreeing_workers == 3
+        assert receipt.quorum_agreement.replication_factor == 3
+        seen_pubkeys.add(receipt.worker_pubkey.hex())
+    # Three distinct workers contributed — three distinct pubkeys in receipts.
+    assert len(seen_pubkeys) == 3
 
     # Verify actor_class attribution on key entries.
     by_action = {e.action: e for e in entries}

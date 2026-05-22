@@ -68,6 +68,11 @@ from auspexai_platform.db.repositories.experiments import (
     InvalidStatusTransitionError,
 )
 from auspexai_platform.exposure import ExposureTag
+from auspexai_platform.receipts import (
+    ReceiptRepository,
+    SigningKey,
+    issue_receipts_for_completed_unit,
+)
 from auspexai_platform.scheduler import Scheduler
 
 # ---- response models ------------------------------------------------------
@@ -178,6 +183,7 @@ def build_router(
     per_job_factory: PerJobDatabaseFactory,
     audit_repository: AuditRepository,
     experiment_repository: ExperimentRepository,
+    receipt_signing_key: SigningKey,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -382,6 +388,50 @@ def build_router(
         # status=approved — paused experiments stay paused until resumed,
         # and the resume action re-checks.
         if updated_unit.status is WorkUnitStatus.COMPLETED:
+            # M7c: hash_agreement reducer + receipt issuance. Best-effort
+            # from the route's perspective — if it fails, the unit stays
+            # `completed` (it really is done from a scheduling standpoint)
+            # and the operator can re-issue receipts manually. Receipt
+            # issuance is wrapped in a broad try/except so a bug here
+            # never blocks the M6d response.
+            try:
+                experiment = experiment_repository.get_by_id(experiment_id)
+                results = ResultRepository(per_job_db).list_for_unit(unit_id)
+                receipt_repo = ReceiptRepository(per_job_db)
+                if experiment is not None:
+                    issuance_outcome = issue_receipts_for_completed_unit(
+                        work_unit=updated_unit,
+                        experiment=experiment,
+                        results=results,
+                        receipt_repo=receipt_repo,
+                        signing_key=receipt_signing_key,
+                    )
+                    audit_repository.append(
+                        actor_class=CredentialClass.SYSTEM,
+                        action=(
+                            "receipts.issue.agreed"
+                            if issuance_outcome.agreement.agreed
+                            else "receipts.issue.disagreed"
+                        ),
+                        resource_type="work_unit",
+                        resource_id=unit_id,
+                        payload={
+                            "experiment_id": experiment_id,
+                            "method": issuance_outcome.agreement.method,
+                            "agreeing_workers": issuance_outcome.agreement.agreeing_workers,
+                            "replication_target": updated_unit.replication_target,
+                            "issued_receipt_ids": issuance_outcome.issued_receipt_ids,
+                        },
+                    )
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    "receipt issuance failed for unit %s; the unit stays "
+                    "completed but receipts may need re-issuance",
+                    unit_id,
+                )
+
             _maybe_auto_complete(
                 experiment_id=experiment_id,
                 per_job_db=per_job_db,
