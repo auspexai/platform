@@ -30,6 +30,7 @@ class ReceiptIndexEntry:
     worker_id: str
     worker_pubkey: str  # 64 lowercase hex
     issued_at: datetime
+    result_id: str | None = None  # M7-tail: backreference to the worker's result row
 
 
 class ReceiptIndexRepository:
@@ -45,20 +46,26 @@ class ReceiptIndexRepository:
         experiment_id: str,
         worker_id: str,
         worker_pubkey: str,
+        result_id: str | None = None,
     ) -> ReceiptIndexEntry:
         """Index a newly-issued receipt. Raises DuplicateReceiptIndexError if
         receipt_id is already indexed (should not happen during normal
-        operation — surfaces real bugs)."""
+        operation — surfaces real bugs).
+
+        `result_id` is M7-tail's backreference: it lets the worker fetch the
+        canonical receipt for one of its results via a single index hit.
+        Nullable for backward compatibility with pre-M7-tail rows.
+        """
         worker_pubkey = worker_pubkey.lower()
         issued_at = datetime.now(UTC).isoformat()
         try:
             self.db.execute(
                 """
                 INSERT INTO receipt_index
-                  (receipt_id, experiment_id, worker_id, worker_pubkey, issued_at)
-                VALUES (?, ?, ?, ?, ?)
+                  (receipt_id, experiment_id, worker_id, worker_pubkey, issued_at, result_id)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (receipt_id, experiment_id, worker_id, worker_pubkey, issued_at),
+                (receipt_id, experiment_id, worker_id, worker_pubkey, issued_at, result_id),
             )
         except sqlite3.IntegrityError as e:
             # Distinguish duplicate-PK from FK-violation by inspecting the
@@ -108,6 +115,20 @@ class ReceiptIndexRepository:
         )
         return [self._row_to_entry(r) for r in rows]
 
+    def get_for_worker_result(self, *, worker_id: str, result_id: str) -> ReceiptIndexEntry | None:
+        """Find the receipt index entry for a specific (worker, result) pair
+        (M7-tail). Returns None if no receipt was issued for this result
+        (e.g., the unit's quorum disagreed) or if the receipt was indexed
+        before M7-tail (result_id IS NULL)."""
+        rows = self.db.execute(
+            """
+            SELECT * FROM receipt_index
+            WHERE worker_id = ? AND result_id = ?
+            """,
+            (worker_id, result_id),
+        )
+        return self._row_to_entry(rows[0]) if rows else None
+
     def list_for_pubkey(self, pubkey_hex: str) -> list[ReceiptIndexEntry]:
         """All receipts where the contributing worker had this pubkey.
 
@@ -129,10 +150,16 @@ class ReceiptIndexRepository:
 
     @staticmethod
     def _row_to_entry(row: sqlite3.Row) -> ReceiptIndexEntry:
+        # result_id is M7-tail; nullable on rows from before that migration.
+        try:
+            result_id = row["result_id"]
+        except (KeyError, IndexError):
+            result_id = None
         return ReceiptIndexEntry(
             receipt_id=row["receipt_id"],
             experiment_id=row["experiment_id"],
             worker_id=row["worker_id"],
             worker_pubkey=row["worker_pubkey"],
             issued_at=datetime.fromisoformat(row["issued_at"]),
+            result_id=result_id,
         )

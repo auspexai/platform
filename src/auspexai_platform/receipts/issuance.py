@@ -224,6 +224,7 @@ def issue_receipts_for_completed_unit(
                     experiment_id=experiment.experiment_id,
                     worker_id=result.worker_id,
                     worker_pubkey=result.worker_pubkey_hex,
+                    result_id=result.result_id,
                 )
             except Exception:
                 logger.exception(

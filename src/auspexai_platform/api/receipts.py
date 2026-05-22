@@ -463,6 +463,99 @@ def build_router(
         entries = receipt_index_repository.list_for_worker(worker_id)
         return ReceiptListResponse(receipts=[_entry_to_summary(e) for e in entries])
 
+    # ---- M7-tail: GET /workers/{id}/results/{result_id}/canonical-receipt ----
+
+    @router.get(
+        "/workers/{worker_id}/results/{result_id}/canonical-receipt",
+        response_model=ReceiptFetchResponse,
+        response_model_exclude_none=True,
+    )
+    async def get_canonical_receipt_for_result(
+        worker_id: str,
+        result_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ReceiptFetchResponse:
+        """Worker-self + maintainer. Fetch the canonical COSE-Sign1 receipt
+        bytes for one of this worker's submitted results.
+
+        Used by the worker's background fetch loop (M7-tail) to populate its
+        local `submitted_results.canonical_blob` cache, which `auspexai-worker
+        receipts show <id>` then serves instead of the M5 placeholder.
+
+        404 if no receipt exists for this (worker, result) pair — most
+        commonly because the unit's quorum disagreed and no receipts were
+        issued, or the request raced ahead of M7c's issuance hook.
+        """
+        _require_worker_self_or_maintainer(credential, worker_id)
+
+        entry = receipt_index_repository.get_for_worker_result(
+            worker_id=worker_id, result_id=result_id
+        )
+        if entry is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "receipt_not_issued",
+                        "message": (
+                            f"no receipt issued for worker={worker_id} "
+                            f"result={result_id} — likely the unit's quorum "
+                            f"disagreed, or M7c issuance hasn't fired yet"
+                        ),
+                    }
+                },
+            )
+
+        per_job_db = per_job_factory.get(entry.experiment_id)
+        if per_job_db is None:
+            logger.warning(
+                "receipt_index has %s but per-job DB for %s is missing",
+                entry.receipt_id,
+                entry.experiment_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "receipt_storage_missing",
+                        "message": (
+                            "receipt index entry exists but the per-job DB "
+                            "is unreachable — likely a coordinator bug"
+                        ),
+                    }
+                },
+            )
+        record = ReceiptRepository(per_job_db).get_by_id(entry.receipt_id)
+        if record is None:
+            logger.warning(
+                "receipt_index has %s but per-job row is missing",
+                entry.receipt_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "receipt_storage_missing",
+                        "message": (
+                            "receipt index entry exists but the per-job row "
+                            "is missing — likely a coordinator bug"
+                        ),
+                    }
+                },
+            )
+        try:
+            receipt_body = decode_cbor(record.receipt_body_cbor)
+        except Exception:
+            receipt_body = None
+        return ReceiptFetchResponse(
+            receipt_id=record.receipt_id,
+            experiment_id=entry.experiment_id,
+            issued_at=record.issued_at,
+            signing_key_pubkey_hex=record.signing_key_pubkey_hex,
+            cose_signed_blob_b64=base64.b64encode(record.cose_signed_blob).decode("ascii"),
+            receipt=receipt_body,
+        )
+
     # ---- M7f: GET /accounts/{account_id}/receipt-stats ------------------
 
     if eligibility_thresholds is not None:
