@@ -56,6 +56,7 @@ from auspexai_platform.db.repositories import (
     AssignmentRepository,
     AuditRepository,
     ExperimentRepository,
+    ReceiptIndexRepository,
     ResultRepository,
     WorkerRepository,
     WorkUnitRepository,
@@ -184,6 +185,7 @@ def build_router(
     audit_repository: AuditRepository,
     experiment_repository: ExperimentRepository,
     receipt_signing_key: SigningKey,
+    receipt_index_repository: ReceiptIndexRepository,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -405,6 +407,7 @@ def build_router(
                         results=results,
                         receipt_repo=receipt_repo,
                         signing_key=receipt_signing_key,
+                        receipt_index_repo=receipt_index_repository,
                     )
                     audit_repository.append(
                         actor_class=CredentialClass.SYSTEM,

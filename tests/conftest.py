@@ -117,6 +117,13 @@ def retired_key_repository(db: Database) -> RetiredKeyRepository:
 
 
 @pytest.fixture
+def receipt_index_repository(db: Database):
+    from auspexai_platform.db.repositories import ReceiptIndexRepository
+
+    return ReceiptIndexRepository(db)
+
+
+@pytest.fixture
 def worker_registry(worker_repository: WorkerRepository) -> WorkerRegistry:
     return WorkerRegistry(worker_repository)
 

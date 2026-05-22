@@ -42,6 +42,7 @@ from auspexai_platform.db.repositories import (
     AuditRepository,
     ExperimentRepository,
     ManifestRepository,
+    ReceiptIndexRepository,
     RetiredKeyRepository,
     TenantRepository,
     WorkerRepository,
@@ -91,6 +92,7 @@ def create_app(
     audit_repository = AuditRepository(db)
     worker_repository = WorkerRepository(db)
     retired_key_repository = RetiredKeyRepository(db)
+    receipt_index_repository = ReceiptIndexRepository(db)
     per_job_factory = PerJobDatabaseFactory(config.jobs_dir)
 
     # M7b: load or generate the persistent receipt-signing key. The same
@@ -134,6 +136,7 @@ def create_app(
     app.state.scheduler = scheduler
     app.state.identity_verifier = identity_verifier
     app.state.receipt_signing_key = receipt_signing_key
+    app.state.receipt_index_repository = receipt_index_repository
 
     credential_dep = make_credential_dependency(token_store, credential_resolver)
 
@@ -196,12 +199,20 @@ def create_app(
             audit_repository,
             experiment_repository,
             receipt_signing_key,
+            receipt_index_repository,
         ),
         prefix="/api/v0",
         tags=["assignments"],
     )
     app.include_router(
-        receipt_routes.build_router(coordinator_mode=config.receipts_mode),
+        receipt_routes.build_router(
+            coordinator_mode=config.receipts_mode,
+            credential_dep=credential_dep,
+            receipt_index_repository=receipt_index_repository,
+            worker_repository=worker_repository,
+            account_repository=account_repository,
+            per_job_factory=per_job_factory,
+        ),
         prefix="/api/v0",
         tags=["receipts"],
     )

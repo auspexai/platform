@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 
 from auspexai_platform.db.models import Experiment, Result, WorkUnit
+from auspexai_platform.db.repositories import ReceiptIndexRepository
 from auspexai_platform.receipts.models import (
     QuorumAgreement,
     Receipt,
@@ -144,6 +145,7 @@ def issue_receipts_for_completed_unit(
     results: list[Result],
     receipt_repo: ReceiptRepository,
     signing_key: SigningKey,
+    receipt_index_repo: ReceiptIndexRepository | None = None,
 ) -> ReceiptIssuanceOutcome:
     """Build, sign, and persist one receipt per agreeing worker.
 
@@ -210,6 +212,25 @@ def issue_receipts_for_completed_unit(
             signing_key_pubkey_hex=signing_key.pubkey_hex,
         )
         issued.append(record.receipt_id)
+        # M7e: index the receipt on the control DB so cross-experiment
+        # lookups (receipt-by-id, list-for-account, list-for-worker) don't
+        # need to walk every per-job DB. Best-effort: if the index write
+        # fails for some reason, the per-job receipt row is the source of
+        # truth and a sweep can rebuild the index later.
+        if receipt_index_repo is not None:
+            try:
+                receipt_index_repo.record(
+                    receipt_id=record.receipt_id,
+                    experiment_id=experiment.experiment_id,
+                    worker_id=result.worker_id,
+                    worker_pubkey=result.worker_pubkey_hex,
+                )
+            except Exception:
+                logger.exception(
+                    "receipt_index insert failed for %s; per-job row is "
+                    "intact and the index can be rebuilt by a sweep",
+                    record.receipt_id,
+                )
         logger.info(
             "issued receipt %s for unit %s worker %s (agreement=%s, agreeing=%d/%d)",
             record.receipt_id,

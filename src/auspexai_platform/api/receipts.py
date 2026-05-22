@@ -39,17 +39,26 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+from datetime import datetime
 from typing import Annotated
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
+from auspexai_platform.auth.credential import Credential, CredentialClass
+from auspexai_platform.db.per_job import PerJobDatabaseFactory
+from auspexai_platform.db.repositories import (
+    AccountRepository,
+    ReceiptIndexRepository,
+    WorkerRepository,
+)
 from auspexai_platform.exposure import ExposureTag
 from auspexai_platform.receipts import (
     CoseDecodeError,
     CoseVerificationError,
     Receipt,
+    ReceiptRepository,
     cose_sign1_decode,
     decode_cbor,
 )
@@ -117,13 +126,60 @@ _AUTHORIZED_SIGNER_NOTE_M7D = (
 )
 
 
-def build_router(*, coordinator_mode: str) -> APIRouter:
-    """Build the /receipts/verify router.
+class ReceiptSummary(BaseModel):
+    """Summary row for receipt-list endpoints. Just enough to identify and
+    locate the receipt; the full COSE bytes + body come from
+    GET /receipts/{receipt_id}."""
+
+    receipt_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    experiment_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    worker_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    worker_pubkey: Annotated[str | None, ExposureTag.PUBLIC] = None
+    issued_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
+
+
+class ReceiptListResponse(BaseModel):
+    receipts: Annotated[list[ReceiptSummary] | None, ExposureTag.PUBLIC] = None
+
+
+class ReceiptFetchResponse(BaseModel):
+    """Full receipt content for `GET /receipts/{receipt_id}` (anonymous-public).
+
+    The `cose_signed_blob_b64` field is the canonical wire bytes — what
+    a verifier feeds into `POST /receipts/verify`. The `receipt` field
+    is the Pydantic-decoded body for convenience; verifiers should not
+    trust it without the COSE signature check.
+    """
+
+    receipt_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    experiment_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    issued_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
+    signing_key_pubkey_hex: Annotated[str | None, ExposureTag.PUBLIC] = None
+    cose_signed_blob_b64: Annotated[str | None, ExposureTag.PUBLIC] = None
+    receipt: Annotated[Receipt | None, ExposureTag.PUBLIC] = None
+
+
+def build_router(
+    *,
+    coordinator_mode: str,
+    credential_dep=None,
+    receipt_index_repository: ReceiptIndexRepository | None = None,
+    worker_repository: WorkerRepository | None = None,
+    account_repository: AccountRepository | None = None,
+    per_job_factory: PerJobDatabaseFactory | None = None,
+) -> APIRouter:
+    """Build the receipts router.
 
     Args:
-        coordinator_mode: `Config.receipts_mode` value — either `"dev"` or
-            `"operational"`. Surfaces in every response so callers can see
-            the trust posture without consulting docs.
+        coordinator_mode: `Config.receipts_mode` value — surfaces in
+            verify responses so callers can see trust posture.
+        credential_dep: FastAPI dependency for the auth-credential.
+            Required for the M7e list/fetch endpoints; left optional for
+            backward compatibility with the M7d-only build (verify is
+            anonymous-public and doesn't need a credential).
+        receipt_index_repository / worker_repository / account_repository /
+        per_job_factory: required for M7e endpoints. The verify endpoint
+            (M7d) doesn't need them.
     """
     router = APIRouter()
 
@@ -221,4 +277,209 @@ def build_router(*, coordinator_mode: str) -> APIRouter:
             errors=errors or None,
         )
 
+    # ---- M7e endpoints ----------------------------------------------------
+    #
+    # These three are only mounted when their dependencies were provided.
+    # The verify endpoint above stays anonymous-public; these three add
+    # receipt-by-id (anonymous-public, DOI-analogue), account-listing
+    # (account-self + maintainer), and worker-listing (worker-self +
+    # maintainer).
+
+    if (
+        credential_dep is None
+        or receipt_index_repository is None
+        or worker_repository is None
+        or account_repository is None
+        or per_job_factory is None
+    ):
+        return router
+
+    @router.get(
+        "/receipts/{receipt_id}",
+        response_model=ReceiptFetchResponse,
+        response_model_exclude_none=True,
+    )
+    async def get_receipt(receipt_id: str) -> ReceiptFetchResponse:
+        """Anonymous-public. Fetch a receipt by its ID.
+
+        Per §6.8.1 DOI-analogue framing: receipts are cite-by-ID artifacts.
+        Receipt IDs are unguessable (~72 bits of entropy), so enumeration
+        attacks aren't viable; the caller must already know the ID, and
+        knowing the ID implies someone shared it.
+
+        Note: the returned receipt body contains worker_pubkey by design
+        (it's the receipt's identity binding per §6.8.1 + the
+        receipt_v0_1.cddl comment). This endpoint does NOT leak the
+        worker_pubkey→account_id mapping; that mapping is operator-only.
+        """
+        entry = receipt_index_repository.get_by_id(receipt_id)
+        if entry is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "receipt_not_found",
+                        "message": f"no receipt with id {receipt_id!r}",
+                    }
+                },
+            )
+        per_job_db = per_job_factory.get(entry.experiment_id)
+        if per_job_db is None:
+            # Index pointed at an experiment whose per-job DB no longer
+            # exists. Shouldn't happen at Phase 1 lab altitude.
+            logger.warning(
+                "receipt_index has %s but per-job DB for %s is missing",
+                receipt_id,
+                entry.experiment_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "receipt_storage_missing",
+                        "message": (
+                            "receipt index entry exists but the per-job DB "
+                            "is unreachable — likely a coordinator bug"
+                        ),
+                    }
+                },
+            )
+        record = ReceiptRepository(per_job_db).get_by_id(receipt_id)
+        if record is None:
+            # Same kind of inconsistency — index exists but per-job row
+            # was deleted. Shouldn't happen.
+            logger.warning(
+                "receipt_index has %s but per-job receipts row is missing",
+                receipt_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "receipt_storage_missing",
+                        "message": (
+                            "receipt index entry exists but the per-job row "
+                            "is missing — likely a coordinator bug"
+                        ),
+                    }
+                },
+            )
+        # Decode the inner CBOR for convenience. Best-effort: if the
+        # inner payload is somehow malformed at storage time, still return
+        # the COSE bytes — verifier can paste them into /receipts/verify
+        # and get a structured error there.
+        try:
+            receipt_body = decode_cbor(record.receipt_body_cbor)
+        except Exception:
+            receipt_body = None
+        return ReceiptFetchResponse(
+            receipt_id=record.receipt_id,
+            experiment_id=entry.experiment_id,
+            issued_at=record.issued_at,
+            signing_key_pubkey_hex=record.signing_key_pubkey_hex,
+            cose_signed_blob_b64=base64.b64encode(record.cose_signed_blob).decode("ascii"),
+            receipt=receipt_body,
+        )
+
+    @router.get(
+        "/accounts/{account_id}/receipts",
+        response_model=ReceiptListResponse,
+        response_model_exclude_none=True,
+    )
+    async def list_account_receipts(
+        account_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ReceiptListResponse:
+        """List all receipts attributable to one account. Account-self +
+        maintainer only.
+
+        Account-self check: the credential is a worker bound to this
+        account_id. Anonymous + T0 workers (no account binding) cannot
+        list account receipts — they have no account.
+        """
+        _require_account_self_or_maintainer(credential, account_id, account_repository)
+
+        entries = receipt_index_repository.list_for_account(account_id)
+        return ReceiptListResponse(receipts=[_entry_to_summary(e) for e in entries])
+
+    @router.get(
+        "/workers/{worker_id}/receipts",
+        response_model=ReceiptListResponse,
+        response_model_exclude_none=True,
+    )
+    async def list_worker_receipts(
+        worker_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ReceiptListResponse:
+        """List all receipts attributable to one worker. Worker-self +
+        maintainer only."""
+        _require_worker_self_or_maintainer(credential, worker_id)
+
+        entries = receipt_index_repository.list_for_worker(worker_id)
+        return ReceiptListResponse(receipts=[_entry_to_summary(e) for e in entries])
+
     return router
+
+
+def _entry_to_summary(entry) -> ReceiptSummary:
+    return ReceiptSummary(
+        receipt_id=entry.receipt_id,
+        experiment_id=entry.experiment_id,
+        worker_id=entry.worker_id,
+        worker_pubkey=entry.worker_pubkey,
+        issued_at=entry.issued_at,
+    )
+
+
+def _require_account_self_or_maintainer(
+    credential: Credential,
+    url_account_id: str,
+    account_repository: AccountRepository,
+) -> None:
+    """403 unless the credential is bound to `url_account_id` OR a maintainer."""
+    if credential.kind == CredentialClass.MAINTAINER:
+        return
+    if credential.account_id is not None and credential.account_id == url_account_id:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error": {
+                "code": "account_self_or_maintainer_required",
+                "message": (
+                    "this endpoint requires a worker credential bound to "
+                    "the requested account_id OR a maintainer credential"
+                ),
+                "details": {
+                    "credential_class": credential.kind.value,
+                    "credential_account_id": credential.account_id,
+                    "url_account_id": url_account_id,
+                },
+            }
+        },
+    )
+
+
+def _require_worker_self_or_maintainer(credential: Credential, url_worker_id: str) -> None:
+    """403 unless the credential is the worker itself OR a maintainer."""
+    if credential.kind == CredentialClass.MAINTAINER:
+        return
+    if credential.worker_id is not None and credential.worker_id == url_worker_id:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error": {
+                "code": "worker_self_or_maintainer_required",
+                "message": (
+                    "this endpoint requires the worker credential whose "
+                    "worker_id matches the URL OR a maintainer credential"
+                ),
+                "details": {
+                    "credential_class": credential.kind.value,
+                    "credential_worker_id": credential.worker_id,
+                    "url_worker_id": url_worker_id,
+                },
+            }
+        },
+    )
