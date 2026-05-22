@@ -81,6 +81,23 @@ CREATE TABLE IF NOT EXISTS results (
 
 CREATE INDEX IF NOT EXISTS results_unit_idx ON results(unit_id);
 CREATE INDEX IF NOT EXISTS results_worker_idx ON results(worker_id);
+
+
+-- M7b: receipts table. One row per issued contribution receipt. Stores
+-- both the canonical COSE-Sign1 wire bytes (what verifiers consume) and
+-- the inner CBOR payload (handy for debug / aggregation queries / future
+-- Rekor anchoring). `work_unit_ids_json` is a JSON array because a single
+-- receipt may attest to multiple units in the same experiment.
+CREATE TABLE IF NOT EXISTS receipts (
+    receipt_id              TEXT    PRIMARY KEY,
+    work_unit_ids_json      TEXT    NOT NULL,
+    cose_signed_blob        BLOB    NOT NULL,
+    receipt_body_cbor       BLOB    NOT NULL,
+    signing_key_pubkey_hex  TEXT    NOT NULL,
+    issued_at               TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS receipts_issued_idx ON receipts(issued_at);
 """
 
 

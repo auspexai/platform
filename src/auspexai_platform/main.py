@@ -46,6 +46,7 @@ from auspexai_platform.db.repositories import (
     WorkerRepository,
 )
 from auspexai_platform.oauth import IdentityVerifier, build_default_verifier
+from auspexai_platform.receipts import load_or_generate_signing_key
 from auspexai_platform.scheduler import Scheduler
 
 
@@ -90,6 +91,12 @@ def create_app(
     worker_repository = WorkerRepository(db)
     retired_key_repository = RetiredKeyRepository(db)
     per_job_factory = PerJobDatabaseFactory(config.jobs_dir)
+
+    # M7b: load or generate the persistent receipt-signing key. The same
+    # key file is used in both `dev` and `operational` receipts_mode; the
+    # mode flag controls how the verifier endpoint (M7d) renders the trust
+    # posture of the resulting receipts, not which key signs them.
+    receipt_signing_key = load_or_generate_signing_key(config.receipt_signing_key_path)
     # Registries are façades over the repositories. Constructed here so the
     # auth path reads from the DB on every request.
     tenant_registry = tenant_registry or TenantRegistry(tenant_repository)
@@ -125,6 +132,7 @@ def create_app(
     app.state.per_job_factory = per_job_factory
     app.state.scheduler = scheduler
     app.state.identity_verifier = identity_verifier
+    app.state.receipt_signing_key = receipt_signing_key
 
     credential_dep = make_credential_dependency(token_store, credential_resolver)
 
