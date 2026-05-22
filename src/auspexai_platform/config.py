@@ -26,6 +26,16 @@ DEFAULT_STATE_DIR = Path("./state")
 DEFAULT_RECEIPTS_MODE = "dev"
 VALID_RECEIPTS_MODES = ("dev", "operational")
 
+# M7f tier-eligibility thresholds. Per §6.2 these are the receipt-history
+# preconditions that the eligibility readout reports on. They do NOT
+# auto-promote — per §6.1, T1→T2 also requires a real-identity check OR
+# vouching by an existing T2+, plus human review. The eligibility surface
+# only reports "thresholds met / not met"; the §6.1 identity gate and the
+# tier-bump endpoint itself ship with the vouching / identity-verification
+# milestone(s).
+DEFAULT_TIER_T2_RECEIPT_THRESHOLD = 50
+DEFAULT_TIER_T2_DISTINCT_EXPERIMENTS = 3
+
 
 @dataclass(frozen=True)
 class Config:
@@ -33,11 +43,21 @@ class Config:
 
     state_dir: Path
     receipts_mode: str = DEFAULT_RECEIPTS_MODE
+    tier_t2_receipt_threshold: int = DEFAULT_TIER_T2_RECEIPT_THRESHOLD
+    tier_t2_distinct_experiments: int = DEFAULT_TIER_T2_DISTINCT_EXPERIMENTS
 
     def __post_init__(self) -> None:
         if self.receipts_mode not in VALID_RECEIPTS_MODES:
             raise ValueError(
                 f"receipts_mode must be one of {VALID_RECEIPTS_MODES}, got {self.receipts_mode!r}"
+            )
+        if self.tier_t2_receipt_threshold < 1:
+            raise ValueError(
+                f"tier_t2_receipt_threshold must be >=1, got {self.tier_t2_receipt_threshold}"
+            )
+        if self.tier_t2_distinct_experiments < 1:
+            raise ValueError(
+                f"tier_t2_distinct_experiments must be >=1, got {self.tier_t2_distinct_experiments}"
             )
 
     @property
@@ -81,4 +101,21 @@ class Config:
         else:
             resolved_state_dir = DEFAULT_STATE_DIR
         receipts_mode = os.environ.get("AUSPEXAI_RECEIPTS_MODE", DEFAULT_RECEIPTS_MODE)
-        return cls(state_dir=resolved_state_dir, receipts_mode=receipts_mode)
+        t2_receipts = int(
+            os.environ.get(
+                "AUSPEXAI_TIER_T2_RECEIPT_THRESHOLD",
+                DEFAULT_TIER_T2_RECEIPT_THRESHOLD,
+            )
+        )
+        t2_experiments = int(
+            os.environ.get(
+                "AUSPEXAI_TIER_T2_DISTINCT_EXPERIMENTS",
+                DEFAULT_TIER_T2_DISTINCT_EXPERIMENTS,
+            )
+        )
+        return cls(
+            state_dir=resolved_state_dir,
+            receipts_mode=receipts_mode,
+            tier_t2_receipt_threshold=t2_receipts,
+            tier_t2_distinct_experiments=t2_experiments,
+        )

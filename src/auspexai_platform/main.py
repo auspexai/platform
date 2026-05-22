@@ -47,6 +47,7 @@ from auspexai_platform.db.repositories import (
     TenantRepository,
     WorkerRepository,
 )
+from auspexai_platform.eligibility import EligibilityThresholds
 from auspexai_platform.oauth import IdentityVerifier, build_default_verifier
 from auspexai_platform.receipts import load_or_generate_signing_key
 from auspexai_platform.scheduler import Scheduler
@@ -204,6 +205,10 @@ def create_app(
         prefix="/api/v0",
         tags=["assignments"],
     )
+    eligibility_thresholds = EligibilityThresholds(
+        t2_receipt_threshold=config.tier_t2_receipt_threshold,
+        t2_distinct_experiments=config.tier_t2_distinct_experiments,
+    )
     app.include_router(
         receipt_routes.build_router(
             coordinator_mode=config.receipts_mode,
@@ -212,6 +217,7 @@ def create_app(
             worker_repository=worker_repository,
             account_repository=account_repository,
             per_job_factory=per_job_factory,
+            eligibility_thresholds=eligibility_thresholds,
         ),
         prefix="/api/v0",
         tags=["receipts"],

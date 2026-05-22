@@ -53,6 +53,10 @@ from auspexai_platform.db.repositories import (
     ReceiptIndexRepository,
     WorkerRepository,
 )
+from auspexai_platform.eligibility import (
+    EligibilityThresholds,
+    compute_receipt_stats,
+)
 from auspexai_platform.exposure import ExposureTag
 from auspexai_platform.receipts import (
     CoseDecodeError,
@@ -142,6 +146,46 @@ class ReceiptListResponse(BaseModel):
     receipts: Annotated[list[ReceiptSummary] | None, ExposureTag.PUBLIC] = None
 
 
+class TierEligibilityResponse(BaseModel):
+    """One row of `ReceiptStatsResponse.eligibility_by_tier` — automated-gate
+    state for one future tier. The `_pending` flags signal that the §6.1
+    identity gate or vouching gate still needs human review; they NEVER
+    flip to False from automatic computation (M7f is read-only)."""
+
+    tier: Annotated[int | None, ExposureTag.PUBLIC] = None
+    tier_name: Annotated[str | None, ExposureTag.PUBLIC] = None
+    receipt_threshold_met: Annotated[bool | None, ExposureTag.PUBLIC] = None
+    distinct_experiments_threshold_met: Annotated[bool | None, ExposureTag.PUBLIC] = None
+    thresholds: Annotated[dict[str, int] | None, ExposureTag.PUBLIC] = None
+    actuals: Annotated[dict[str, int] | None, ExposureTag.PUBLIC] = None
+    identity_check_pending: Annotated[bool | None, ExposureTag.PUBLIC] = None
+    vouching_pending: Annotated[bool | None, ExposureTag.PUBLIC] = None
+    ready_for_human_review: Annotated[bool | None, ExposureTag.PUBLIC] = None
+
+
+class ReceiptStatsResponse(BaseModel):
+    """Account-level receipt-history aggregate + per-tier eligibility readout
+    (M7f). Account-self + maintainer only.
+
+    The `eligibility_by_tier` field implements §6.2's "tier promotion logic
+    [that] inspects receipt history at thresholds" — as a passive signal,
+    not as an automatic promotion. Per §6.1, T2+ promotions require a
+    real-identity check OR vouching by an existing T2+ plus human review;
+    the actual tier-bump endpoint lives in a future milestone bundled with
+    that work.
+    """
+
+    account_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    current_tier: Annotated[int | None, ExposureTag.PUBLIC] = None
+    current_tier_name: Annotated[str | None, ExposureTag.PUBLIC] = None
+    total_receipts: Annotated[int | None, ExposureTag.PUBLIC] = None
+    distinct_experiments: Annotated[int | None, ExposureTag.PUBLIC] = None
+    distinct_tenants: Annotated[int | None, ExposureTag.PUBLIC] = None
+    first_receipt_at: Annotated[str | None, ExposureTag.PUBLIC] = None
+    last_receipt_at: Annotated[str | None, ExposureTag.PUBLIC] = None
+    eligibility_by_tier: Annotated[list[TierEligibilityResponse] | None, ExposureTag.PUBLIC] = None
+
+
 class ReceiptFetchResponse(BaseModel):
     """Full receipt content for `GET /receipts/{receipt_id}` (anonymous-public).
 
@@ -167,6 +211,7 @@ def build_router(
     worker_repository: WorkerRepository | None = None,
     account_repository: AccountRepository | None = None,
     per_job_factory: PerJobDatabaseFactory | None = None,
+    eligibility_thresholds: EligibilityThresholds | None = None,
 ) -> APIRouter:
     """Build the receipts router.
 
@@ -417,6 +462,73 @@ def build_router(
 
         entries = receipt_index_repository.list_for_worker(worker_id)
         return ReceiptListResponse(receipts=[_entry_to_summary(e) for e in entries])
+
+    # ---- M7f: GET /accounts/{account_id}/receipt-stats ------------------
+
+    if eligibility_thresholds is not None:
+
+        @router.get(
+            "/accounts/{account_id}/receipt-stats",
+            response_model=ReceiptStatsResponse,
+            response_model_exclude_none=True,
+        )
+        async def get_receipt_stats(
+            account_id: str,
+            credential: Credential = Depends(credential_dep),  # noqa: B008
+        ) -> ReceiptStatsResponse:
+            """Account-level receipt-history aggregates + per-tier eligibility
+            readout (M7f). Account-self + maintainer only.
+
+            Per §6.2 this is "tier promotion logic [that] inspects receipt
+            history at thresholds" — rendered as a passive signal. Per §6.1
+            the actual T2+ promotion requires real-identity verification OR
+            vouching by an existing T2+ plus human review; the tier-bump
+            endpoint itself is a future milestone.
+            """
+            _require_account_self_or_maintainer(credential, account_id, account_repository)
+
+            account = account_repository.get_by_id(account_id)
+            if account is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={
+                        "error": {
+                            "code": "account_not_found",
+                            "message": f"no account with id {account_id!r}",
+                        }
+                    },
+                )
+
+            stats = compute_receipt_stats(
+                account_id=account_id,
+                current_tier=int(account.trust_tier),
+                receipt_index_repository=receipt_index_repository,
+                thresholds=eligibility_thresholds,
+            )
+            return ReceiptStatsResponse(
+                account_id=stats.account_id,
+                current_tier=stats.current_tier,
+                current_tier_name=stats.current_tier_name,
+                total_receipts=stats.total_receipts,
+                distinct_experiments=stats.distinct_experiments,
+                distinct_tenants=stats.distinct_tenants,
+                first_receipt_at=stats.first_receipt_at,
+                last_receipt_at=stats.last_receipt_at,
+                eligibility_by_tier=[
+                    TierEligibilityResponse(
+                        tier=e.tier,
+                        tier_name=e.tier_name,
+                        receipt_threshold_met=e.receipt_threshold_met,
+                        distinct_experiments_threshold_met=e.distinct_experiments_threshold_met,
+                        thresholds=e.thresholds,
+                        actuals=e.actuals,
+                        identity_check_pending=e.identity_check_pending,
+                        vouching_pending=e.vouching_pending,
+                        ready_for_human_review=e.ready_for_human_review,
+                    )
+                    for e in stats.eligibility_by_tier
+                ],
+            )
 
     return router
 
