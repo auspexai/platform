@@ -25,6 +25,7 @@ from auspexai_platform.api import assignments as assignment_routes
 from auspexai_platform.api import auth as auth_routes
 from auspexai_platform.api import experiments as experiment_routes
 from auspexai_platform.api import health
+from auspexai_platform.api import receipts as receipt_routes
 from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.api import work_units as work_unit_routes
 from auspexai_platform.api import workers as worker_routes
@@ -198,6 +199,11 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["assignments"],
+    )
+    app.include_router(
+        receipt_routes.build_router(coordinator_mode=config.receipts_mode),
+        prefix="/api/v0",
+        tags=["receipts"],
     )
 
     return app
