@@ -41,6 +41,7 @@ from auspexai_platform.db.repositories import (
     AuditRepository,
     ExperimentRepository,
     ManifestRepository,
+    RetiredKeyRepository,
     TenantRepository,
     WorkerRepository,
 )
@@ -87,6 +88,7 @@ def create_app(
     experiment_repository = ExperimentRepository(db)
     audit_repository = AuditRepository(db)
     worker_repository = WorkerRepository(db)
+    retired_key_repository = RetiredKeyRepository(db)
     per_job_factory = PerJobDatabaseFactory(config.jobs_dir)
     # Registries are façades over the repositories. Constructed here so the
     # auth path reads from the DB on every request.
@@ -159,6 +161,7 @@ def create_app(
             worker_repository,
             account_repository,
             audit_repository,
+            retired_key_repository,
             tenant_registry,
             worker_registry,
         ),

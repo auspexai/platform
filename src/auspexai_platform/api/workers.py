@@ -44,6 +44,7 @@ from auspexai_platform.db.models import TrustTier
 from auspexai_platform.db.repositories import (
     AccountRepository,
     AuditRepository,
+    RetiredKeyRepository,
     WorkerRepository,
 )
 from auspexai_platform.db.repositories.accounts import (
@@ -167,6 +168,7 @@ def build_router(
     worker_repository: WorkerRepository,
     account_repository: AccountRepository,
     audit_repository: AuditRepository,
+    retired_key_repository: RetiredKeyRepository,
     tenant_registry: TenantRegistry,
     worker_registry: WorkerRegistry,
 ) -> APIRouter:
@@ -185,6 +187,26 @@ def build_router(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> WorkerEnrollResponse:
         pubkey_hex = body.pubkey_hex.lower()
+
+        # M7a: refuse re-enrollment of a withdrawn key. The retired_keys
+        # registry is populated by the M6b retire endpoint and is intended
+        # to be permanent — the §5.15 withdrawal commitment is that a
+        # withdrawn key cannot be re-bound to a new worker_id.
+        if retired_key_repository.contains(pubkey_hex):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "pubkey_retired",
+                        "message": (
+                            "this pubkey was previously retired and cannot be "
+                            "re-enrolled; generate a fresh keypair to enroll "
+                            "as a new worker"
+                        ),
+                        "details": {"pubkey_hex": pubkey_hex},
+                    }
+                },
+            )
 
         # Cross-table disjointness: the same pubkey can't be both a tenant
         # maintainer and a worker. The CredentialResolver tries tenants first
@@ -446,6 +468,25 @@ def build_router(
                     }
                 },
             ) from e
+
+        # M7a: record the pubkey in retired_keys so future enroll attempts
+        # with the same key are refused. `retire` is idempotent (re-retire
+        # of an already-retired worker is a no-op upstream), so the
+        # DuplicateRetiredKeyError path here is the second-retire case —
+        # treat as success since the registry already has the row.
+        from auspexai_platform.db.repositories.retired_keys import (
+            DuplicateRetiredKeyError,
+        )
+
+        try:
+            retired_key_repository.retire(
+                pubkey_hex=worker.pubkey_hex,
+                worker_id=worker.worker_id,
+                reason="withdraw",
+            )
+        except DuplicateRetiredKeyError:
+            # Already in registry from a prior retire call — fine.
+            pass
 
         audit_repository.append(
             actor_class=credential.kind,

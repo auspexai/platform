@@ -22,6 +22,7 @@ from auspexai_platform.db.repositories import (
     AuditRepository,
     ExperimentRepository,
     ManifestRepository,
+    RetiredKeyRepository,
     TenantRepository,
     WorkerRepository,
 )
@@ -108,6 +109,11 @@ def account_repository(db: Database) -> AccountRepository:
 @pytest.fixture
 def worker_repository(db: Database) -> WorkerRepository:
     return WorkerRepository(db)
+
+
+@pytest.fixture
+def retired_key_repository(db: Database) -> RetiredKeyRepository:
+    return RetiredKeyRepository(db)
 
 
 @pytest.fixture
