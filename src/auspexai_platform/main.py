@@ -17,7 +17,9 @@ Composition order (one section per M-milestone):
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from auspexai_platform import __version__
 from auspexai_platform.api import accounts as account_routes
@@ -30,7 +32,8 @@ from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.api import work_units as work_unit_routes
 from auspexai_platform.api import workers as worker_routes
 from auspexai_platform.auth.bearer import TokenStore
-from auspexai_platform.auth.dependency import make_credential_dependency
+from auspexai_platform.auth.credential import Credential
+from auspexai_platform.auth.dependency import make_credential_dependency, require_maintainer
 from auspexai_platform.auth.resolver import CredentialResolver
 from auspexai_platform.auth.tenant_registry import TenantRegistry
 from auspexai_platform.auth.worker_registry import WorkerRegistry
@@ -118,6 +121,12 @@ def create_app(
             "researcher dashboard. A fifth consumer (public receipt verifier) "
             "uses the anonymous-public credential class."
         ),
+        # Disable FastAPI's auto-mounted Swagger UI / ReDoc / openapi.json.
+        # Re-served below as maintainer-only custom routes so the API surface
+        # isn't anonymously enumerable on a publicly-reachable coord.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     # Stash the layer state on the app so tests + CLI helpers can introspect.
@@ -223,7 +232,107 @@ def create_app(
         tags=["receipts"],
     )
 
+    _install_root_and_docs(app, credential_dep)
     return app
+
+
+_ROOT_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AuspexAI Coordinator</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 640px; margin: 4em auto; padding: 0 1em; color: #1a1a2e; background: #f5f5fa; line-height: 1.5; }
+    h1 { font-weight: 600; margin-top: 0; }
+    code { font-family: ui-monospace, monospace; background: #e3e3eb; padding: 0.1em 0.35em; border-radius: 3px; }
+    a { color: #5a4af4; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .endpoint { display: block; margin: 0.4em 0; }
+    .meta { color: #555; font-size: 0.9em; margin-top: 2em; }
+  </style>
+</head>
+<body>
+  <h1>AuspexAI Coordinator</h1>
+  <p>Coordinator daemon for the <a href="https://github.com/auspexai">AuspexAI</a> volunteer compute network. Currently a Phase 2 closed-beta lab deployment.</p>
+  <p>Public endpoints:</p>
+  <code class="endpoint"><a href="/api/v0/health/public">GET /api/v0/health/public</a></code>
+  <code class="endpoint">POST /api/v0/receipts/verify</code>
+  <p>Signing roster: <a href="https://github.com/auspexai/.github/blob/main/security/AUTHORIZED_SIGNERS.md">AUTHORIZED_SIGNERS.md</a></p>
+  <p class="meta">Worker installer: <a href="https://github.com/auspexai/worker/releases">github.com/auspexai/worker/releases</a></p>
+</body>
+</html>
+"""
+
+
+def _install_root_and_docs(app: FastAPI, credential_dep) -> None:
+    """Mount the public root-discovery doc + maintainer-only docs UIs.
+
+    Public surface: `GET /` returns HTML to browsers and JSON to programs.
+    Operator surface: `/docs`, `/redoc`, `/openapi.json` require maintainer
+    auth (the FastAPI auto-mounted versions are disabled at construct time).
+    Browser visits to `/docs` after authing render the Swagger UI shell,
+    but the page's JS fetch of `/openapi.json` carries no Authorization
+    header — maintainers can curl the schema with their bearer token for
+    actual inspection. Full browser-side Swagger auth (security-scheme
+    plumbing) is deferred.
+    """
+
+    @app.get("/", include_in_schema=False)
+    async def root(request: Request) -> Response:
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept.lower():
+            return HTMLResponse(content=_ROOT_HTML)
+        return JSONResponse(
+            content={
+                "name": "AuspexAI Coordinator",
+                "version": __version__,
+                "phase": "Phase 2 closed-beta lab deployment",
+                "public_endpoints": {
+                    "health": "/api/v0/health/public",
+                    "receipts_verify": "POST /api/v0/receipts/verify",
+                },
+                "github_org": "https://github.com/auspexai",
+                "authorized_signers": (
+                    "https://github.com/auspexai/.github/blob/main/security/AUTHORIZED_SIGNERS.md"
+                ),
+                "worker_releases": "https://github.com/auspexai/worker/releases",
+            }
+        )
+
+    # Old-style `Depends(...)` in default (with B008 noqa) rather than the
+    # Annotated[T, Depends(...)] form, because PEP 563 stringification at
+    # the top of this module makes FastAPI eval the annotation against
+    # module globals — `credential_dep` is a local in this enclosing
+    # function and can't be resolved that way. Matches existing routes
+    # (see api/tenants.py).
+
+    @app.get("/openapi.json", include_in_schema=False)
+    async def openapi_authed(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> JSONResponse:
+        require_maintainer(credential)
+        return JSONResponse(app.openapi())
+
+    @app.get("/docs", include_in_schema=False)
+    async def docs_authed(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> HTMLResponse:
+        require_maintainer(credential)
+        return get_swagger_ui_html(
+            openapi_url="/openapi.json",
+            title=f"{app.title} — Swagger UI",
+        )
+
+    @app.get("/redoc", include_in_schema=False)
+    async def redoc_authed(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> HTMLResponse:
+        require_maintainer(credential)
+        return get_redoc_html(
+            openapi_url="/openapi.json",
+            title=f"{app.title} — ReDoc",
+        )
 
 
 app = create_app()
