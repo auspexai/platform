@@ -67,9 +67,18 @@ def main() -> None:
     help="Reload on source changes (dev only).",
 )
 def serve(host: str, port: int, reload: bool) -> None:
-    """Run the coordinator HTTP server."""
+    """Run the coordinator HTTP server.
+
+    Uses uvicorn's factory pattern (`factory=True`) — uvicorn calls
+    `create_app()` exactly once to build the app. The alternative
+    (`auspexai_platform.main:app` as a module-level instance) double-
+    registers slowapi rate-limit decorators whenever tests also call
+    `create_app()` themselves, since the decorators have no idempotency
+    and append to the limiter's per-route list on each invocation.
+    """
     uvicorn.run(
-        "auspexai_platform.main:app",
+        "auspexai_platform.main:create_app",
+        factory=True,
         host=host,
         port=port,
         reload=reload,

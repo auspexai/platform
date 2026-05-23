@@ -31,6 +31,21 @@ from auspexai_platform.oauth.identity import (
     IdentityClaim,
     InvalidAccessTokenError,
 )
+from auspexai_platform.rate_limit import reset_for_tests as _reset_rate_limit
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter_between_tests():
+    """Clear slowapi rate-limit state at the start of every test.
+
+    The slowapi `Limiter` keeps an in-memory bucket per (key, route)
+    that survives across tests in the same process. Without this fixture,
+    tests that hit anonymous-public endpoints (worker enroll, oauth
+    exchange, receipts verify) would accumulate state and eventually
+    earn spurious 429s in later tests — order-dependent flakes.
+    """
+    _reset_rate_limit()
+    yield
 
 
 @pytest.fixture

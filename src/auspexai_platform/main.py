@@ -20,6 +20,8 @@ from __future__ import annotations
 from fastapi import Depends, FastAPI, Request
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from auspexai_platform import __version__
 from auspexai_platform.api import accounts as account_routes
@@ -52,6 +54,7 @@ from auspexai_platform.db.repositories import (
 )
 from auspexai_platform.eligibility import EligibilityThresholds
 from auspexai_platform.oauth import IdentityVerifier, build_default_verifier
+from auspexai_platform.rate_limit import limiter
 from auspexai_platform.receipts import load_or_generate_signing_key
 from auspexai_platform.scheduler import Scheduler
 
@@ -128,6 +131,13 @@ def create_app(
         redoc_url=None,
         openapi_url=None,
     )
+
+    # Per-IP rate limits on anonymous-public endpoints. Decorators are
+    # applied inside the routers (api/workers.py, api/accounts.py,
+    # api/receipts.py); here we wire the slowapi limiter onto the app and
+    # register the 429 exception handler.
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     # Stash the layer state on the app so tests + CLI helpers can introspect.
     app.state.config = config
@@ -236,6 +246,16 @@ def create_app(
     return app
 
 
+# NOTE: do NOT add a module-level `# `app = create_app()` removed; uvicorn factory pattern in cli.py` here.
+# uvicorn's factory pattern (configured in cli.py) calls create_app()
+# exactly once. A module-level call would also fire at import time —
+# any test that imports `from auspexai_platform.main import create_app`
+# and then calls `create_app()` itself would double-register slowapi
+# rate-limit decorators because slowapi's @limiter.limit decorator
+# appends to the per-route registry on every invocation with no
+# idempotency check, effectively halving any configured limit.
+
+
 _ROOT_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -335,4 +355,4 @@ def _install_root_and_docs(app: FastAPI, credential_dep) -> None:
         )
 
 
-app = create_app()
+# `app = create_app()` removed; uvicorn factory pattern in cli.py

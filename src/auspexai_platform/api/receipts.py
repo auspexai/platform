@@ -43,7 +43,7 @@ from datetime import datetime
 from typing import Annotated
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
@@ -58,6 +58,7 @@ from auspexai_platform.eligibility import (
     compute_receipt_stats,
 )
 from auspexai_platform.exposure import ExposureTag
+from auspexai_platform.rate_limit import limiter
 from auspexai_platform.receipts import (
     CoseDecodeError,
     CoseVerificationError,
@@ -234,7 +235,8 @@ def build_router(
         response_model_exclude_none=True,
         status_code=status.HTTP_200_OK,
     )
-    async def verify_receipt(body: ReceiptVerifyRequest) -> ReceiptVerifyResponse:
+    @limiter.limit("60/minute")
+    async def verify_receipt(request: Request, body: ReceiptVerifyRequest) -> ReceiptVerifyResponse:
         # 1. Base64-decode. Malformed base64 is the only condition that
         #    earns a 4xx — every other failure is a "well-formed request
         #    but the receipt is invalid" 200 verdict.

@@ -33,7 +33,7 @@ import secrets
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
@@ -46,6 +46,7 @@ from auspexai_platform.oauth import (
     InvalidAccessTokenError,
     UnknownIdentityProviderError,
 )
+from auspexai_platform.rate_limit import limiter
 
 # ---- request / response models --------------------------------------------
 
@@ -95,7 +96,9 @@ def build_router(
         response_model_exclude_none=True,
         status_code=status.HTTP_200_OK,
     )
+    @limiter.limit("30/hour")
     async def oauth_exchange(
+        request: Request,
         body: OAuthExchangeRequest,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> OAuthExchangeResponse:
