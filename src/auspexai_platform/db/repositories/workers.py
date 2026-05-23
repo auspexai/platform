@@ -146,6 +146,55 @@ class WorkerRepository:
         assert got is not None
         return got
 
+    def quarantine(self, worker_id: str, reason: str | None = None) -> Worker:
+        """Mark a worker as quarantined — they remain enrolled, can heartbeat,
+        but the assignment endpoint refuses to give them work. Reversible
+        via unquarantine. Idempotent on re-quarantine (timestamp preserved
+        on first call; reason can be updated on subsequent calls).
+        Raises WorkerNotFoundError if the worker_id is unknown.
+        Raises ValueError if the worker is retired (retire is terminal;
+        quarantine doesn't apply to a worker that's already left the
+        network)."""
+        now = datetime.now(UTC).isoformat()
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE workers
+                SET quarantined_at = COALESCE(quarantined_at, ?),
+                    quarantine_reason = ?
+                WHERE worker_id = ? AND retired_at IS NULL
+                """,
+                (now, reason, worker_id),
+            )
+            if cur.rowcount == 0:
+                # Distinguish "no such worker" from "retired worker".
+                existing = self.get_by_id(worker_id)
+                if existing is None:
+                    raise WorkerNotFoundError(worker_id)
+                raise ValueError(f"worker {worker_id} is retired; quarantine does not apply")
+        got = self.get_by_id(worker_id)
+        assert got is not None
+        return got
+
+    def unquarantine(self, worker_id: str) -> Worker:
+        """Clear quarantine on a worker. Idempotent (no-op if not quarantined).
+        Raises WorkerNotFoundError if the worker_id is unknown."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE workers
+                SET quarantined_at = NULL,
+                    quarantine_reason = NULL
+                WHERE worker_id = ?
+                """,
+                (worker_id,),
+            )
+            if cur.rowcount == 0:
+                raise WorkerNotFoundError(worker_id)
+        got = self.get_by_id(worker_id)
+        assert got is not None
+        return got
+
     # ---- reads ----
 
     def get_by_id(self, worker_id: str) -> Worker | None:
@@ -190,4 +239,8 @@ class WorkerRepository:
                 else None
             ),
             retired_at=(datetime.fromisoformat(row["retired_at"]) if row["retired_at"] else None),
+            quarantined_at=(
+                datetime.fromisoformat(row["quarantined_at"]) if row["quarantined_at"] else None
+            ),
+            quarantine_reason=row["quarantine_reason"],
         )

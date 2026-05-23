@@ -239,6 +239,8 @@ class Worker(BaseModel):
     registered_at: datetime
     last_heartbeat_at: datetime | None = None
     retired_at: datetime | None = None
+    quarantined_at: datetime | None = None
+    quarantine_reason: str | None = None
 
 
 class AuditEntry(BaseModel):

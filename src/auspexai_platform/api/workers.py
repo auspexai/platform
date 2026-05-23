@@ -71,6 +71,8 @@ class WorkerResponse(BaseModel):
     registered_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
     last_heartbeat_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
     retired_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
+    quarantined_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
+    quarantine_reason: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     pubkey_hex: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     account_id: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     capabilities: Annotated[dict[str, Any] | None, ExposureTag.OPERATOR_ONLY] = None
@@ -119,6 +121,18 @@ class WorkerHeartbeatRequest(BaseModel):
     )
 
 
+class WorkerQuarantineRequest(BaseModel):
+    reason: str | None = Field(
+        default=None,
+        max_length=2000,
+        description=(
+            "Free-form note from the maintainer; surfaces to operator-only "
+            "views. Volunteer-visible response carries only the quarantine "
+            "timestamp, not this reason."
+        ),
+    )
+
+
 # ---- helpers --------------------------------------------------------------
 
 
@@ -134,6 +148,8 @@ def _worker_to_response(worker) -> WorkerResponse:
         registered_at=worker.registered_at,
         last_heartbeat_at=worker.last_heartbeat_at,
         retired_at=worker.retired_at,
+        quarantined_at=worker.quarantined_at,
+        quarantine_reason=worker.quarantine_reason,
         pubkey_hex=worker.pubkey_hex,
         account_id=worker.account_id,
         capabilities=worker.capabilities,
@@ -495,6 +511,88 @@ def build_router(
             actor_class=credential.kind,
             actor_identifier=credential.pubkey_hex,
             action="worker.retire",
+            resource_type="worker",
+            resource_id=worker.worker_id,
+        )
+
+        return filter_for_credential(_worker_to_response(worker), credential)
+
+    # ---- POST /workers/{id}/actions/quarantine (maintainer-only) --------
+
+    @router.post(
+        "/workers/{worker_id}/actions/quarantine",
+        response_model=WorkerResponse,
+        response_model_exclude_none=True,
+    )
+    async def quarantine_worker(
+        worker_id: str,
+        body: WorkerQuarantineRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> WorkerResponse:
+        require_maintainer(credential)
+        try:
+            worker = worker_repository.quarantine(worker_id, body.reason)
+        except WorkerNotFoundError as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "worker_not_found",
+                        "message": f"no worker with id {worker_id!r}",
+                    }
+                },
+            ) from e
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "worker_retired",
+                        "message": str(e),
+                    }
+                },
+            ) from e
+
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            action="worker.quarantine",
+            resource_type="worker",
+            resource_id=worker.worker_id,
+            payload={"reason": body.reason} if body.reason else None,
+        )
+
+        return filter_for_credential(_worker_to_response(worker), credential)
+
+    # ---- POST /workers/{id}/actions/unquarantine (maintainer-only) ------
+
+    @router.post(
+        "/workers/{worker_id}/actions/unquarantine",
+        response_model=WorkerResponse,
+        response_model_exclude_none=True,
+    )
+    async def unquarantine_worker(
+        worker_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> WorkerResponse:
+        require_maintainer(credential)
+        try:
+            worker = worker_repository.unquarantine(worker_id)
+        except WorkerNotFoundError as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "worker_not_found",
+                        "message": f"no worker with id {worker_id!r}",
+                    }
+                },
+            ) from e
+
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            action="worker.unquarantine",
             resource_type="worker",
             resource_id=worker.worker_id,
         )

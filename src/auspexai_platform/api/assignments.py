@@ -214,6 +214,29 @@ def build_router(
                     }
                 },
             )
+        if worker.quarantined_at is not None:
+            # Maintainer-applied pause. The worker is still alive (and can
+            # still heartbeat); we just don't dispatch work to it. Return
+            # 423 Locked so the worker's `auspexai-worker status` can
+            # surface the state honestly instead of looking like an idle
+            # network with no assignments. Reason text intentionally NOT
+            # included in the response — that's operator-only per the
+            # WorkerResponse exposure-tag config.
+            raise HTTPException(
+                status_code=status.HTTP_423_LOCKED,
+                detail={
+                    "error": {
+                        "code": "worker_quarantined",
+                        "message": (
+                            "this worker is quarantined; contact the operator "
+                            "or wait for unquarantine"
+                        ),
+                        "details": {
+                            "quarantined_at": worker.quarantined_at.isoformat(),
+                        },
+                    }
+                },
+            )
 
         pick = scheduler.pick_for_worker(worker)
         if pick is None:
