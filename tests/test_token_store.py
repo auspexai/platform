@@ -32,43 +32,80 @@ def test_initialize_with_force_overwrites(state_dir: Path) -> None:
     first = store.initialize()
     second = store.initialize(force=True)
     assert first != second
-    assert store.verify(second)
-    assert not store.verify(first)
+    assert store.verify(second) is not None
+    assert store.verify(first) is None
 
 
 def test_verify_accepts_active_token(state_dir: Path) -> None:
     store = TokenStore(state_dir / "maintainer.token")
     token = store.initialize()
-    assert store.verify(token) is True
+    assert store.verify(token) is not None
 
 
 def test_verify_rejects_unknown_token(state_dir: Path) -> None:
     store = TokenStore(state_dir / "maintainer.token")
     store.initialize()
-    assert store.verify("not-the-token") is False
+    assert store.verify("not-the-token") is None
 
 
 def test_verify_rejects_empty_string(state_dir: Path) -> None:
     store = TokenStore(state_dir / "maintainer.token")
     store.initialize()
-    assert store.verify("") is False
+    assert store.verify("") is None
 
 
 def test_rotate_keeps_old_token_valid_during_overlap(state_dir: Path) -> None:
     store = TokenStore(state_dir / "maintainer.token")
     old = store.initialize()
     new = store.rotate(overlap=timedelta(minutes=5))
-    assert store.verify(new)
-    assert store.verify(old), "previous token must still verify during overlap window"
+    assert store.verify(new) is not None
+    assert store.verify(old) is not None, "previous token must still verify during overlap window"
 
 
 def test_rotate_invalidates_old_after_overlap_expires(state_dir: Path) -> None:
     store = TokenStore(state_dir / "maintainer.token")
     old = store.initialize()
     store.rotate(overlap=timedelta(seconds=1))
-    # Move clock forward past the overlap.
     later = datetime.now(UTC) + timedelta(minutes=10)
-    assert store.verify(old, now=later) is False
+    assert store.verify(old, now=later) is None
+
+
+def test_issue_per_maintainer_token(state_dir: Path) -> None:
+    store = TokenStore(state_dir / "maintainer.token")
+    store.initialize()
+    token = store.issue(login="alice")
+    result = store.verify(token)
+    assert result == "alice"
+
+
+def test_issue_replaces_existing_for_same_login(state_dir: Path) -> None:
+    store = TokenStore(state_dir / "maintainer.token")
+    store.initialize()
+    first = store.issue(login="alice")
+    second = store.issue(login="alice")
+    assert first != second
+    assert store.verify(second) == "alice"
+    later = datetime.now(UTC) + timedelta(minutes=10)
+    assert store.verify(first, now=later) is None
+
+
+def test_revoke_removes_login_tokens(state_dir: Path) -> None:
+    store = TokenStore(state_dir / "maintainer.token")
+    store.initialize()
+    token = store.issue(login="bob")
+    assert store.verify(token) == "bob"
+    count = store.revoke(login="bob")
+    assert count == 1
+    assert store.verify(token) is None
+
+
+def test_multiple_maintainer_tokens_coexist(state_dir: Path) -> None:
+    store = TokenStore(state_dir / "maintainer.token")
+    store.initialize()
+    t1 = store.issue(login="alice")
+    t2 = store.issue(login="bob")
+    assert store.verify(t1) == "alice"
+    assert store.verify(t2) == "bob"
 
 
 def test_active_tokens_returns_one_steady_state(state_dir: Path) -> None:

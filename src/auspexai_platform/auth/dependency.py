@@ -65,11 +65,12 @@ def make_credential_dependency(
                     )
                 )
             token = auth_header[len("Bearer ") :].strip()
-            if not token_store.verify(token):
+            matched_login = token_store.verify(token)
+            if matched_login is None:
                 raise _auth_failure(
                     InvalidTokenError("maintainer token is not valid or has expired")
                 )
-            return Credential.maintainer()
+            return Credential.maintainer(maintainer_login=matched_login or None)
 
         if signature_input_header:
             signature_header = request.headers.get("Signature")

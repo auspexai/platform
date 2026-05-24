@@ -41,11 +41,17 @@ TOKEN_BYTES = 32  # → 43 chars of base64url
 
 @dataclass(frozen=True)
 class TokenEntry:
-    """One active or expiring token in the maintainer token file."""
+    """One active or expiring token in the maintainer token file.
+
+    `login` identifies which Maintainer owns this token. None for legacy
+    tokens created before per-maintainer support (treated as the sole
+    Maintainer's token).
+    """
 
     token: str
     created_at: datetime
     expires_at: datetime | None  # None = active; datetime = expires at that wall-clock instant
+    login: str | None = None
 
     def is_active(self, now: datetime) -> bool:
         if self.expires_at is None:
@@ -53,11 +59,14 @@ class TokenEntry:
         return now < self.expires_at
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "token": self.token,
             "created_at": self.created_at.isoformat(),
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
         }
+        if self.login is not None:
+            d["login"] = self.login
+        return d
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> TokenEntry:
@@ -65,6 +74,7 @@ class TokenEntry:
             token=raw["token"],
             created_at=datetime.fromisoformat(raw["created_at"]),
             expires_at=datetime.fromisoformat(raw["expires_at"]) if raw["expires_at"] else None,
+            login=raw.get("login"),
         )
 
 
@@ -151,24 +161,78 @@ class TokenStore:
         self._write(new_entries)
         return fresh
 
+    def issue(self, *, login: str) -> str:
+        """Issue a new per-maintainer token. If the login already has an active
+        token, it is expired (5-min overlap) and a fresh one is appended."""
+        now = datetime.now(UTC)
+        entries = self._read()
+        new_entries: list[TokenEntry] = []
+        for entry in entries:
+            if entry.login == login and entry.is_active(now):
+                new_entries.append(
+                    TokenEntry(
+                        token=entry.token,
+                        created_at=entry.created_at,
+                        expires_at=now + DEFAULT_OVERLAP,
+                        login=entry.login,
+                    )
+                )
+            elif entry.is_active(now):
+                new_entries.append(entry)
+        fresh = secrets.token_urlsafe(TOKEN_BYTES)
+        new_entries.append(TokenEntry(token=fresh, created_at=now, expires_at=None, login=login))
+        self._write(new_entries)
+        return fresh
+
+    def revoke(self, *, login: str) -> int:
+        """Immediately expire all tokens for a login. Returns count revoked."""
+        now = datetime.now(UTC)
+        entries = self._read()
+        count = 0
+        new_entries: list[TokenEntry] = []
+        for entry in entries:
+            if entry.login == login and entry.is_active(now):
+                count += 1
+            elif entry.is_active(now):
+                new_entries.append(entry)
+        self._write(new_entries)
+        return count
+
     def active_tokens(self, *, now: datetime | None = None) -> list[str]:
         """Return all currently-valid tokens (in load order). May be 1
-        (steady state) or 2 (during rotation overlap)."""
+        (steady state) or 2+ (during rotation overlap / multi-maintainer)."""
         now = now or datetime.now(UTC)
         return [e.token for e in self._read() if e.is_active(now)]
 
-    def verify(self, presented: str, *, now: datetime | None = None) -> bool:
-        """Constant-time compare against all currently-valid tokens. Empty or
-        too-short tokens always return False without leaking timing."""
+    def active_entries(self, *, now: datetime | None = None) -> list[TokenEntry]:
+        """Return all currently-valid entries with login metadata."""
+        now = now or datetime.now(UTC)
+        return [e for e in self._read() if e.is_active(now)]
+
+    _NO_MATCH = object()
+
+    def verify(self, presented: str, *, now: datetime | None = None) -> str | None:
+        """Constant-time compare against all currently-valid tokens.
+
+        Returns the `login` of the matching token on success. For legacy
+        tokens without a login field, returns empty string "".
+        Returns the sentinel `_NO_MATCH` (used internally) — callers
+        should use `verify_ok()` for a simple bool check or `verify()`
+        for the login.
+
+        Actually simplified: returns str (login or "") on match, None on
+        no match.
+        """
         now = now or datetime.now(UTC)
         if not presented:
-            return False
-        valid = self.active_tokens(now=now)
-        if not valid:
-            return False
-        # Walk every entry (don't early-exit on match) to keep verify-time roughly constant.
-        result = False
-        for token in valid:
-            if hmac.compare_digest(presented, token):
-                result = True
-        return result
+            return None
+        entries = self.active_entries(now=now)
+        if not entries:
+            return None
+        matched_login: str | None = None
+        found = False
+        for entry in entries:
+            if hmac.compare_digest(presented, entry.token):
+                matched_login = entry.login or ""
+                found = True
+        return matched_login if found else None

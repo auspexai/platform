@@ -54,14 +54,15 @@ class Credential:
     worker_id: str | None = None
     account_id: str | None = None
     trust_tier: int | None = None
+    maintainer_login: str | None = None
 
     @classmethod
     def anonymous(cls) -> Credential:
         return cls(kind=CredentialClass.ANONYMOUS)
 
     @classmethod
-    def maintainer(cls) -> Credential:
-        return cls(kind=CredentialClass.MAINTAINER)
+    def maintainer(cls, maintainer_login: str | None = None) -> Credential:
+        return cls(kind=CredentialClass.MAINTAINER, maintainer_login=maintainer_login)
 
     @classmethod
     def researcher(cls, tenant_id: str, pubkey_hex: str) -> Credential:

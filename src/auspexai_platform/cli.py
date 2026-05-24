@@ -147,20 +147,59 @@ def token_rotate(state_dir: Path | None, overlap_minutes: int) -> None:
 @token.command("show")
 @_state_dir_option
 def token_show(state_dir: Path | None) -> None:
-    """List all currently-valid maintainer tokens (steady state: 1; during rotation overlap: 2)."""
+    """List all currently-valid maintainer tokens with login attribution."""
     config = _resolve_config(state_dir)
     store = TokenStore(config.maintainer_token_path)
     if not config.maintainer_token_path.exists():
         click.echo(f"No maintainer.token at {config.maintainer_token_path}.", err=True)
         raise SystemExit(1)
-    tokens = store.active_tokens()
-    if not tokens:
+    entries = store.active_entries()
+    if not entries:
         click.echo(
             "No active tokens — all have expired. Run `token rotate` or `token init --force`."
         )
         raise SystemExit(1)
-    for i, t in enumerate(tokens, 1):
-        click.echo(f"[{i}] {t}")
+    for i, e in enumerate(entries, 1):
+        login_label = e.login or "(legacy — no login)"
+        expires = f"expires {e.expires_at.isoformat()}" if e.expires_at else "active"
+        click.echo(f"[{i}] {login_label}  {e.token}  ({expires})")
+
+
+@token.command("issue")
+@_state_dir_option
+@click.option("--login", required=True, help="GitHub login of the Maintainer to issue a token for.")
+def token_issue(state_dir: Path | None, login: str) -> None:
+    """Issue a per-maintainer token. If the login already has one, the old token
+    is expired with a 5-minute overlap and a fresh one is appended."""
+    config = _resolve_config(state_dir)
+    store = TokenStore(config.maintainer_token_path)
+    if not config.maintainer_token_path.exists():
+        click.echo(
+            f"ERROR: no maintainer.token at {config.maintainer_token_path}. Run `token init` first.",
+            err=True,
+        )
+        raise SystemExit(1)
+    new_token = store.issue(login=login)
+    click.echo(f"Issued token for {login}:")
+    click.echo(f"Token: {new_token}")
+    click.echo("Pass via `Authorization: Bearer <token>` — audit trail will attribute actions to this login.")
+
+
+@token.command("revoke")
+@_state_dir_option
+@click.option("--login", required=True, help="GitHub login whose tokens to revoke.")
+def token_revoke(state_dir: Path | None, login: str) -> None:
+    """Immediately revoke all tokens for a Maintainer login."""
+    config = _resolve_config(state_dir)
+    store = TokenStore(config.maintainer_token_path)
+    if not config.maintainer_token_path.exists():
+        click.echo(f"No maintainer.token at {config.maintainer_token_path}.", err=True)
+        raise SystemExit(1)
+    count = store.revoke(login=login)
+    if count == 0:
+        click.echo(f"No active tokens found for {login}.")
+    else:
+        click.echo(f"Revoked {count} token(s) for {login}.")
 
 
 if __name__ == "__main__":

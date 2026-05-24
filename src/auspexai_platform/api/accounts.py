@@ -277,7 +277,7 @@ def build_router(
         if body.verification_method is not None:
             account_repository.verify_identity(
                 account_id,
-                verified_by=f"maintainer",
+                verified_by=credential.maintainer_login or "maintainer",
                 method=body.verification_method,
                 note=body.verification_note,
             )
@@ -291,6 +291,7 @@ def build_router(
 
         audit_repository.append(
             actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=credential.maintainer_login,
             action="account.promote",
             resource_type="account",
             resource_id=account_id,
@@ -344,6 +345,7 @@ def build_router(
 
         audit_repository.append(
             actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=credential.maintainer_login,
             action="account.demote",
             resource_type="account",
             resource_id=account_id,
@@ -386,6 +388,7 @@ def build_router(
 
         audit_repository.append(
             actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=credential.maintainer_login,
             action="account.suspend",
             resource_type="account",
             resource_id=account_id,
@@ -423,6 +426,7 @@ def build_router(
 
         audit_repository.append(
             actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=credential.maintainer_login,
             action="account.unsuspend",
             resource_type="account",
             resource_id=account_id,
