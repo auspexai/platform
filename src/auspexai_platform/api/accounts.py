@@ -238,6 +238,33 @@ def build_router(
             credential,
         )
 
+    # ---- account list (maintainer-only) ------------------------------------
+
+    @router.get("/accounts", status_code=status.HTTP_200_OK)
+    async def list_accounts(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> dict:
+        _require_maintainer(credential)
+        accounts = account_repository.list_all()
+        return {
+            "accounts": [
+                {
+                    "account_id": a.account_id,
+                    "idp": a.idp.value,
+                    "idp_sub": a.idp_sub,
+                    "display_name": a.display_name,
+                    "trust_tier": int(a.trust_tier),
+                    "trust_tier_name": _tier_name(int(a.trust_tier)),
+                    "created_at": a.created_at.isoformat(),
+                    "retired_at": a.retired_at.isoformat() if a.retired_at else None,
+                    "suspended_at": a.suspended_at.isoformat() if a.suspended_at else None,
+                    "identity_verified_at": a.identity_verified_at.isoformat() if a.identity_verified_at else None,
+                    "identity_verification_method": a.identity_verification_method.value if a.identity_verification_method else None,
+                }
+                for a in accounts
+            ]
+        }
+
     # ---- trust escalation (§6.2.3) ----------------------------------------
 
     @router.post(

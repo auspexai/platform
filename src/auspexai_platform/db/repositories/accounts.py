@@ -249,6 +249,11 @@ class AccountRepository:
         )
         return self._row_to_account(rows[0]) if rows else None
 
+    def list_all(self) -> list[Account]:
+        """Return all accounts, newest first."""
+        rows = self.db.execute("SELECT * FROM accounts ORDER BY created_at DESC")
+        return [self._row_to_account(r) for r in rows]
+
     def get_by_idp_subject(self, idp: IdentityProvider, idp_sub: str) -> Account | None:
         rows = self.db.execute(
             "SELECT * FROM accounts WHERE idp = ? AND idp_sub = ?",
