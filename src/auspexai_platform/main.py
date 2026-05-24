@@ -261,30 +261,33 @@ def create_app(
 # idempotency check, effectively halving any configured limit.
 
 
-_ROOT_HTML = """<!doctype html>
+_ROOT_HTML = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <title>AuspexAI Coordinator</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body { font-family: -apple-system, system-ui, sans-serif; max-width: 640px; margin: 4em auto; padding: 0 1em; color: #1a1a2e; background: #f5f5fa; line-height: 1.5; }
-    h1 { font-weight: 600; margin-top: 0; }
-    code { font-family: ui-monospace, monospace; background: #e3e3eb; padding: 0.1em 0.35em; border-radius: 3px; }
-    a { color: #5a4af4; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .endpoint { display: block; margin: 0.4em 0; }
-    .meta { color: #555; font-size: 0.9em; margin-top: 2em; }
+    body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 640px; margin: 4em auto; padding: 0 1em; color: #1a1a2e; background: #f5f5fa; line-height: 1.5; }}
+    h1 {{ font-weight: 600; margin-top: 0; }}
+    code {{ font-family: ui-monospace, monospace; background: #e3e3eb; padding: 0.1em 0.35em; border-radius: 3px; }}
+    a {{ color: #5a4af4; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    .endpoint {{ display: block; margin: 0.4em 0; }}
+    .meta {{ color: #555; font-size: 0.9em; margin-top: 2em; }}
+    .version {{ color: #888; font-size: 0.85em; }}
   </style>
 </head>
 <body>
-  <h1>AuspexAI Coordinator</h1>
-  <p>Coordinator daemon for the <a href="https://github.com/auspexai">AuspexAI</a> volunteer compute network. Currently a Phase 2 closed-beta lab deployment.</p>
+  <h1>AuspexAI Coordinator <span class="version">v{__version__}</span></h1>
+  <p>Coordinator daemon for the <a href="https://github.com/auspexai">AuspexAI</a> volunteer compute network. Phase 2 closed-beta.</p>
   <p>Public endpoints:</p>
   <code class="endpoint"><a href="/api/v0/health/public">GET /api/v0/health/public</a></code>
   <code class="endpoint">POST /api/v0/receipts/verify</code>
+  <code class="endpoint"><a href="/api/v0/receipts/">GET /api/v0/receipts/{{receipt_id}}</a></code>
   <p>Signing roster: <a href="https://github.com/auspexai/.github/blob/main/security/AUTHORIZED_SIGNERS.md">AUTHORIZED_SIGNERS.md</a></p>
-  <p class="meta">Worker installer: <a href="https://github.com/auspexai/worker/releases">github.com/auspexai/worker/releases</a></p>
+  <p class="meta">Worker installer: <a href="https://github.com/auspexai/worker/releases">github.com/auspexai/worker/releases</a> · Operator console: <a href="https://ops.auspexai.network">ops.auspexai.network</a></p>
+  <p class="meta">Last updated: 2026-05-24</p>
 </body>
 </html>
 """
@@ -312,16 +315,19 @@ def _install_root_and_docs(app: FastAPI, credential_dep) -> None:
             content={
                 "name": "AuspexAI Coordinator",
                 "version": __version__,
-                "phase": "Phase 2 closed-beta lab deployment",
+                "phase": "Phase 2 closed-beta",
+                "last_updated": "2026-05-24",
                 "public_endpoints": {
-                    "health": "/api/v0/health/public",
+                    "health": "GET /api/v0/health/public",
                     "receipts_verify": "POST /api/v0/receipts/verify",
+                    "receipt_by_id": "GET /api/v0/receipts/{receipt_id}",
                 },
                 "github_org": "https://github.com/auspexai",
                 "authorized_signers": (
                     "https://github.com/auspexai/.github/blob/main/security/AUTHORIZED_SIGNERS.md"
                 ),
                 "worker_releases": "https://github.com/auspexai/worker/releases",
+                "operator_console": "https://ops.auspexai.network",
             }
         )
 
