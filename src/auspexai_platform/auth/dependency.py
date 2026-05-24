@@ -70,7 +70,11 @@ def make_credential_dependency(
                 raise _auth_failure(
                     InvalidTokenError("maintainer token is not valid or has expired")
                 )
-            return Credential.maintainer(maintainer_login=matched_login or None)
+            effective_login = matched_login or None
+            proxy_login = request.headers.get("X-Maintainer-Login")
+            if proxy_login and effective_login:
+                effective_login = proxy_login
+            return Credential.maintainer(maintainer_login=effective_login)
 
         if signature_input_header:
             signature_header = request.headers.get("Signature")
