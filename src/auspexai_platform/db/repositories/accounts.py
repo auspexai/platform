@@ -23,6 +23,7 @@ from auspexai_platform.db.database import Database
 from auspexai_platform.db.models import (
     Account,
     IdentityProvider,
+    IdentityVerificationMethod,
     OAuthBinding,
     TrustTier,
 )
@@ -30,6 +31,10 @@ from auspexai_platform.db.models import (
 # 5 minutes: long enough for the caller to round-trip the exchange + binder
 # call, short enough that a leaked token has tight blast radius.
 DEFAULT_BINDING_TTL = timedelta(minutes=5)
+
+
+class AccountNotFoundError(Exception):
+    """Raised when an account_id is unknown or retired."""
 
 
 class DuplicateAccountError(Exception):
@@ -62,7 +67,7 @@ class AccountRepository:
         idp_sub: str,
         display_name: str | None = None,
         email: str | None = None,
-        trust_tier: TrustTier = TrustTier.T1_VERIFIED,
+        trust_tier: TrustTier = TrustTier.T1_AUTHENTICATED,
     ) -> Account:
         """Insert an account. Raises DuplicateAccountError on (idp, idp_sub) collision."""
         created_at = datetime.now(UTC).isoformat()
@@ -86,6 +91,151 @@ class AccountRepository:
             )
         except sqlite3.IntegrityError as e:
             raise DuplicateAccountError(str(e)) from e
+        got = self.get_by_id(account_id)
+        assert got is not None
+        return got
+
+    # ---- trust escalation (§6.2.3) ----
+
+    def promote(
+        self,
+        account_id: str,
+        *,
+        target_tier: TrustTier,
+    ) -> Account:
+        """Bump trust_tier to target_tier. Caller is responsible for gate
+        validation (receipt thresholds, identity gate). Raises AccountNotFoundError
+        if account_id is unknown or retired."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE accounts SET trust_tier = ?
+                WHERE account_id = ? AND retired_at IS NULL AND suspended_at IS NULL
+                """,
+                (int(target_tier), account_id),
+            )
+            if cur.rowcount == 0:
+                raise AccountNotFoundError(account_id)
+        got = self.get_by_id(account_id)
+        assert got is not None
+        return got
+
+    def demote(
+        self,
+        account_id: str,
+        *,
+        target_tier: TrustTier,
+    ) -> Account:
+        """Drop trust_tier to target_tier. Revokes identity verification if
+        crossing below T2. Raises AccountNotFoundError if unknown/retired."""
+        with self.db.transaction() as cur:
+            if target_tier < TrustTier.T2_TRUSTED:
+                cur.execute(
+                    """
+                    UPDATE accounts
+                    SET trust_tier = ?,
+                        identity_verified_at = NULL,
+                        identity_verified_by = NULL,
+                        identity_verification_method = NULL,
+                        identity_verification_note = NULL
+                    WHERE account_id = ? AND retired_at IS NULL
+                    """,
+                    (int(target_tier), account_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE accounts SET trust_tier = ?
+                    WHERE account_id = ? AND retired_at IS NULL
+                    """,
+                    (int(target_tier), account_id),
+                )
+            if cur.rowcount == 0:
+                raise AccountNotFoundError(account_id)
+        got = self.get_by_id(account_id)
+        assert got is not None
+        return got
+
+    def suspend(self, account_id: str) -> Account:
+        """Freeze account. Raises AccountNotFoundError if unknown/retired.
+        Idempotent on re-suspend (timestamp preserved)."""
+        now = datetime.now(UTC).isoformat()
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE accounts SET suspended_at = COALESCE(suspended_at, ?)
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (now, account_id),
+            )
+            if cur.rowcount == 0:
+                raise AccountNotFoundError(account_id)
+        got = self.get_by_id(account_id)
+        assert got is not None
+        return got
+
+    def unsuspend(self, account_id: str) -> Account:
+        """Clear suspension. Idempotent. Raises AccountNotFoundError if unknown."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE accounts SET suspended_at = NULL
+                WHERE account_id = ?
+                """,
+                (account_id,),
+            )
+            if cur.rowcount == 0:
+                raise AccountNotFoundError(account_id)
+        got = self.get_by_id(account_id)
+        assert got is not None
+        return got
+
+    # ---- identity verification (§6.2.1) ----
+
+    def verify_identity(
+        self,
+        account_id: str,
+        *,
+        verified_by: str,
+        method: IdentityVerificationMethod,
+        note: str | None = None,
+    ) -> Account:
+        """Mark identity as verified. Raises AccountNotFoundError if unknown."""
+        now = datetime.now(UTC).isoformat()
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE accounts
+                SET identity_verified_at = ?,
+                    identity_verified_by = ?,
+                    identity_verification_method = ?,
+                    identity_verification_note = ?
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (now, verified_by, method.value, note, account_id),
+            )
+            if cur.rowcount == 0:
+                raise AccountNotFoundError(account_id)
+        got = self.get_by_id(account_id)
+        assert got is not None
+        return got
+
+    def revoke_identity(self, account_id: str) -> Account:
+        """Clear identity verification. Raises AccountNotFoundError if unknown."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE accounts
+                SET identity_verified_at = NULL,
+                    identity_verified_by = NULL,
+                    identity_verification_method = NULL,
+                    identity_verification_note = NULL
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (account_id,),
+            )
+            if cur.rowcount == 0:
+                raise AccountNotFoundError(account_id)
         got = self.get_by_id(account_id)
         assert got is not None
         return got
@@ -194,6 +344,23 @@ class AccountRepository:
             trust_tier=TrustTier(row["trust_tier"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             retired_at=(datetime.fromisoformat(row["retired_at"]) if row["retired_at"] else None),
+            identity_verified_at=(
+                datetime.fromisoformat(row["identity_verified_at"])
+                if row["identity_verified_at"]
+                else None
+            ),
+            identity_verified_by=row["identity_verified_by"],
+            identity_verification_method=(
+                IdentityVerificationMethod(row["identity_verification_method"])
+                if row["identity_verification_method"]
+                else None
+            ),
+            identity_verification_note=row["identity_verification_note"],
+            suspended_at=(
+                datetime.fromisoformat(row["suspended_at"])
+                if row["suspended_at"]
+                else None
+            ),
         )
 
     @staticmethod

@@ -30,7 +30,7 @@ def test_create_returns_account_with_defaults(account_repository: AccountReposit
     assert account.idp is IdentityProvider.GITHUB
     assert account.idp_sub == "246774008"
     assert account.display_name == "jasongagne-git"
-    assert account.trust_tier is TrustTier.T1_VERIFIED
+    assert account.trust_tier is TrustTier.T1_AUTHENTICATED
     assert account.retired_at is None
 
 

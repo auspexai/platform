@@ -354,7 +354,7 @@ def build_router(
             worker = worker_repository.bind_account(
                 worker_id,
                 account_id=binding.account_id,
-                trust_tier=TrustTier.T1_VERIFIED,
+                trust_tier=TrustTier.T1_AUTHENTICATED,
             )
         except WorkerNotFoundError as e:  # pragma: no cover — credential check above prevents
             raise HTTPException(

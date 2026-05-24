@@ -10,11 +10,15 @@ experiments in registration order; for each, walk pending + in_progress
 work units in creation order; pick the first one this worker is
 eligible for and not already assigned to.
 
-Eligibility (v0):
+Eligibility:
   - Worker not retired (filtered upstream by CredentialResolver)
   - Worker hasn't already been assigned this unit
   - Unit's total assignment count < unit.replication_target
     (no over-assignment beyond the quorum target)
+  - **Per-tier replication floor (ratified 2026-05-24)**: workers are
+    only eligible for units whose replication_target meets or exceeds
+    their tier floor. T0 requires N≥3, T1 N≥2, T2+ N≥1. A T0 worker
+    is skipped for units with replication_target < 3.
 
 **Capability matching is deferred to M6d-polish or M7.** Per §5.8 the
 scheduler should match worker capabilities (OS, GPU, locally-installed
@@ -22,25 +26,30 @@ models) to work-unit requirements. v0 ignores this — every worker is
 eligible for every unit. The infrastructure (`Worker.capabilities` dict)
 is in place; the matching logic is left for when there's a concrete
 tenant whose units carry capability requirements.
-
-**Tier-driven replication adjustment is deferred** similarly. Per §6.1
-T0 workers need N≥3 replicas, T1 N=2, T2+ N=1 — but v0 uses the unit's
-static `replication_target` (default 3) without dynamic per-assignment
-adjustment. Effect: when a T2+ worker handles a T0-default unit, we
-over-replicate by 2 replicas. Suboptimal, not incorrect.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from auspexai_platform.db.models import ExperimentStatus, Worker, WorkUnit
+from auspexai_platform.db.models import ExperimentStatus, TrustTier, Worker, WorkUnit
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AssignmentRepository,
     ExperimentRepository,
     WorkUnitRepository,
 )
+
+_TIER_REPLICATION_FLOOR = {
+    TrustTier.T0_ANONYMOUS: 3,
+    TrustTier.T1_AUTHENTICATED: 2,
+    TrustTier.T2_TRUSTED: 1,
+    TrustTier.T3_VETTED: 1,
+}
+
+
+def replication_floor_for_tier(tier: TrustTier) -> int:
+    return _TIER_REPLICATION_FLOOR.get(tier, 3)
 
 
 @dataclass(frozen=True)
@@ -67,10 +76,8 @@ class Scheduler:
     def pick_for_worker(self, worker: Worker) -> SchedulerPick | None:
         """Return the first eligible (experiment_id, work_unit) pair, or
         None if no work is available for this worker."""
-        # Approved experiments only — paused/aborted/completed/archived
-        # are not assignable. Paused stops new assignments but accepts
-        # in-flight results (M6e); the gating happens here at scheduler
-        # entry, not at result-submission.
+        tier_floor = replication_floor_for_tier(worker.trust_tier)
+
         for experiment in self._experiments.list_all(status=ExperimentStatus.APPROVED):
             per_job_db = self._per_job_factory.get(experiment.experiment_id)
             if per_job_db is None:
@@ -78,21 +85,17 @@ class Scheduler:
             work_units = WorkUnitRepository(per_job_db)
             assignments = AssignmentRepository(per_job_db)
 
-            # Pending units first, then in_progress (units that still need more
-            # replicas). list_all returns in created-at order.
-            candidates: list[WorkUnit] = []
             from auspexai_platform.db.models import WorkUnitStatus
 
+            candidates: list[WorkUnit] = []
             candidates.extend(work_units.list_all(status=WorkUnitStatus.PENDING))
             candidates.extend(work_units.list_all(status=WorkUnitStatus.IN_PROGRESS))
 
             for unit in candidates:
+                if unit.replication_target < tier_floor:
+                    continue
                 if assignments.already_assigned(unit.unit_id, worker.worker_id):
                     continue
-                # Refused assignments don't consume a replication slot — the
-                # offer was burned but no progress was made. Use the active
-                # count so refused-then-reschedule actually frees the unit
-                # for another worker. Per M3 Q-W4 resolution.
                 if assignments.count_active_for_unit(unit.unit_id) >= unit.replication_target:
                     continue
                 return SchedulerPick(

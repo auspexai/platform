@@ -100,6 +100,8 @@ def create_app(
     worker_repository = WorkerRepository(db)
     retired_key_repository = RetiredKeyRepository(db)
     receipt_index_repository = ReceiptIndexRepository(db)
+    from auspexai_platform.db.repositories.vouches import VouchRepository
+    vouch_repository = VouchRepository(db)
     per_job_factory = PerJobDatabaseFactory(config.jobs_dir)
 
     # M7b: load or generate the persistent receipt-signing key. The same
@@ -183,6 +185,8 @@ def create_app(
             account_repository,
             audit_repository,
             identity_verifier,
+            worker_repository=worker_repository,
+            vouch_repository=vouch_repository,
         ),
         prefix="/api/v0",
         tags=["accounts"],
@@ -237,6 +241,7 @@ def create_app(
             account_repository=account_repository,
             per_job_factory=per_job_factory,
             eligibility_thresholds=eligibility_thresholds,
+            vouch_repository=vouch_repository,
         ),
         prefix="/api/v0",
         tags=["receipts"],

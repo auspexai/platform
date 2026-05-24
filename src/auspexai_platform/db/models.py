@@ -22,17 +22,19 @@ from auspexai_platform.auth.credential import CredentialClass
 
 
 class TrustTier(IntEnum):
-    """Worker / account trust tiers per §6.1.
+    """Worker / account trust tiers per §6.1 (revised 2026-05-24).
 
     Stored as INTEGER in SQL so comparison ops (>=, <=) work naturally for
-    "promote to at least T1" logic in the scheduler and trust-promotion paths.
+    tier-floor logic in the scheduler and trust-promotion paths.
+
+    T3 is the maximum worker tier. "Maintainer" is an account-level governance
+    role (§6.5), not a worker tier — a maintainer's workers are T3.
     """
 
     T0_ANONYMOUS = 0
-    T1_VERIFIED = 1
-    T2_VOUCHED = 2
-    T3_TRUSTED = 3
-    T4_MAINTAINER = 4
+    T1_AUTHENTICATED = 1
+    T2_TRUSTED = 2
+    T3_VETTED = 3
 
 
 class IdentityProvider(StrEnum):
@@ -130,6 +132,14 @@ class Experiment(BaseModel):
     last_action_by_class: CredentialClass | None = None
 
 
+class IdentityVerificationMethod(StrEnum):
+    """Methods for satisfying the §6.2.1 identity gate."""
+
+    MAINTAINER_ATTESTED = "maintainer_attested"
+    GITHUB_PROFILE = "github_profile"
+    INSTITUTIONAL_EMAIL = "institutional_email"
+
+
 class Account(BaseModel):
     """A row in the `accounts` table — one human identity bound to one IdP."""
 
@@ -140,9 +150,27 @@ class Account(BaseModel):
     idp_sub: str
     display_name: str | None = None
     email: str | None = None
-    trust_tier: TrustTier = TrustTier.T1_VERIFIED
+    trust_tier: TrustTier = TrustTier.T1_AUTHENTICATED
     created_at: datetime
     retired_at: datetime | None = None
+    identity_verified_at: datetime | None = None
+    identity_verified_by: str | None = None
+    identity_verification_method: IdentityVerificationMethod | None = None
+    identity_verification_note: str | None = None
+    suspended_at: datetime | None = None
+
+
+class Vouch(BaseModel):
+    """A row in the `vouches` table — a T2+ account vouching for a T1 account."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    vouch_id: str
+    voucher_account_id: str
+    target_account_id: str
+    rationale: str | None = None
+    created_at: datetime
+    revoked_at: datetime | None = None
 
 
 class OAuthBinding(BaseModel):

@@ -158,7 +158,7 @@ class TestReceiptIndexRepository:
         worker_repository.bind_account(
             worker_a.worker_id,
             account_id=account.account_id,
-            trust_tier=TrustTier.T1_VERIFIED,
+            trust_tier=TrustTier.T1_AUTHENTICATED,
         )
         worker_b = worker_repository.enroll(
             worker_id="wkr-anon",
@@ -441,7 +441,7 @@ class TestListAccountReceipts:
         worker_repository.bind_account(
             worker.worker_id,
             account_id=account.account_id,
-            trust_tier=TrustTier.T1_VERIFIED,
+            trust_tier=TrustTier.T1_AUTHENTICATED,
         )
         receipt_id = _seed_receipt_via_issuance(client, "exp-bob", worker.worker_id, pubkey_hex)
         return priv, pubkey_hex, account.account_id, worker.worker_id, receipt_id
@@ -509,7 +509,7 @@ class TestListAccountReceipts:
         worker_repository.bind_account(
             worker_b.worker_id,
             account_id=account_b.account_id,
-            trust_tier=TrustTier.T1_VERIFIED,
+            trust_tier=TrustTier.T1_AUTHENTICATED,
         )
 
         # Carol tries to list Alice/Bob's account receipts.

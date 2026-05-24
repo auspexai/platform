@@ -195,6 +195,75 @@ class WorkerRepository:
         assert got is not None
         return got
 
+    def update_tier_for_account(
+        self,
+        account_id: str,
+        *,
+        trust_tier: TrustTier,
+    ) -> list[str]:
+        """Propagate a tier change to all active (non-retired) workers bound to
+        an account. Returns the list of affected worker_ids."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE workers SET trust_tier = ?
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (int(trust_tier), account_id),
+            )
+            cur.execute(
+                """
+                SELECT worker_id FROM workers
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (account_id,),
+            )
+            return [row["worker_id"] for row in cur.fetchall()]
+
+    def quarantine_for_account(self, account_id: str, reason: str | None = None) -> list[str]:
+        """Quarantine all active workers bound to an account atomically.
+        Returns affected worker_ids."""
+        now = datetime.now(UTC).isoformat()
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE workers
+                SET quarantined_at = COALESCE(quarantined_at, ?),
+                    quarantine_reason = ?
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (now, reason, account_id),
+            )
+            cur.execute(
+                """
+                SELECT worker_id FROM workers
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (account_id,),
+            )
+            return [row["worker_id"] for row in cur.fetchall()]
+
+    def unquarantine_for_account(self, account_id: str) -> list[str]:
+        """Clear quarantine on all workers bound to an account.
+        Returns affected worker_ids."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE workers
+                SET quarantined_at = NULL, quarantine_reason = NULL
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (account_id,),
+            )
+            cur.execute(
+                """
+                SELECT worker_id FROM workers
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (account_id,),
+            )
+            return [row["worker_id"] for row in cur.fetchall()]
+
     # ---- reads ----
 
     def get_by_id(self, worker_id: str) -> Worker | None:

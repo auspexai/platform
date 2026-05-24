@@ -71,10 +71,10 @@ def test_bind_account_promotes_to_t1(
         account_id="acct-1", idp=IdentityProvider.GITHUB, idp_sub="1"
     )
     bound = worker_repository.bind_account(
-        "wkr-up", account_id=account.account_id, trust_tier=TrustTier.T1_VERIFIED
+        "wkr-up", account_id=account.account_id, trust_tier=TrustTier.T1_AUTHENTICATED
     )
     assert bound.account_id == account.account_id
-    assert bound.trust_tier is TrustTier.T1_VERIFIED
+    assert bound.trust_tier is TrustTier.T1_AUTHENTICATED
 
 
 def test_bind_account_unknown_worker_raises(
@@ -88,7 +88,7 @@ def test_bind_account_unknown_worker_raises(
         worker_repository.bind_account(
             "wkr-nope",
             account_id=account.account_id,
-            trust_tier=TrustTier.T1_VERIFIED,
+            trust_tier=TrustTier.T1_AUTHENTICATED,
         )
 
 
@@ -105,7 +105,7 @@ def test_bind_account_retired_worker_raises(
         worker_repository.bind_account(
             "wkr-retire",
             account_id=account.account_id,
-            trust_tier=TrustTier.T1_VERIFIED,
+            trust_tier=TrustTier.T1_AUTHENTICATED,
         )
 
 
@@ -177,7 +177,7 @@ def test_list_for_account(
     worker_repository.enroll(worker_id="wkr-a", pubkey_hex="a" * 64)
     worker_repository.enroll(worker_id="wkr-b", pubkey_hex="b" * 64)
     worker_repository.bind_account(
-        "wkr-a", account_id=account.account_id, trust_tier=TrustTier.T1_VERIFIED
+        "wkr-a", account_id=account.account_id, trust_tier=TrustTier.T1_AUTHENTICATED
     )
     workers = worker_repository.list_for_account(account.account_id)
     assert [w.worker_id for w in workers] == ["wkr-a"]

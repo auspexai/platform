@@ -37,9 +37,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
-from auspexai_platform.db.models import IdentityProvider
+from auspexai_platform.db.models import (
+    IdentityProvider,
+    IdentityVerificationMethod,
+    TrustTier,
+)
 from auspexai_platform.db.repositories import AccountRepository, AuditRepository
-from auspexai_platform.db.repositories.accounts import DuplicateAccountError
+from auspexai_platform.db.repositories.accounts import AccountNotFoundError, DuplicateAccountError
+from auspexai_platform.db.repositories.vouches import VouchRepository
+from auspexai_platform.db.repositories.workers import WorkerRepository
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.oauth import (
     IdentityVerifier,
@@ -69,6 +75,41 @@ class OAuthExchangeResponse(BaseModel):
     is_new_account: Annotated[bool | None, ExposureTag.PUBLIC] = None
 
 
+class PromoteRequest(BaseModel):
+    target_tier: int = Field(ge=1, le=3)
+    verification_method: IdentityVerificationMethod | None = None
+    verification_note: str | None = None
+
+
+class DemoteRequest(BaseModel):
+    target_tier: int = Field(ge=0, le=2)
+    reason: str
+
+
+class SuspendRequest(BaseModel):
+    reason: str | None = None
+
+
+class AccountTrustResponse(BaseModel):
+    account_id: str
+    trust_tier: int
+    trust_tier_name: str
+    affected_worker_ids: list[str] = Field(default_factory=list)
+
+
+class VouchRequest(BaseModel):
+    rationale: str | None = None
+
+
+class VouchResponse(BaseModel):
+    vouch_id: str
+    voucher_account_id: str
+    target_account_id: str
+    rationale: str | None = None
+    created_at: datetime
+    revoked_at: datetime | None = None
+
+
 # ---- helpers --------------------------------------------------------------
 
 
@@ -80,11 +121,23 @@ def _generate_account_id() -> str:
 # ---- router ---------------------------------------------------------------
 
 
+def _require_maintainer(credential: Credential) -> None:
+    if credential.kind != CredentialClass.MAINTAINER:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="maintainer required")
+
+
+def _tier_name(tier: int) -> str:
+    names = {0: "T0 anonymous", 1: "T1 authenticated", 2: "T2 trusted", 3: "T3 vetted"}
+    return names.get(tier, f"T{tier}")
+
+
 def build_router(
     credential_dep,
     account_repository: AccountRepository,
     audit_repository: AuditRepository,
     identity_verifier: IdentityVerifier,
+    worker_repository: WorkerRepository | None = None,
+    vouch_repository: VouchRepository | None = None,
 ) -> APIRouter:
     """Build /accounts router bound to repository instances + verifier."""
 
@@ -183,6 +236,312 @@ def build_router(
                 is_new_account=is_new,
             ),
             credential,
+        )
+
+    # ---- trust escalation (§6.2.3) ----------------------------------------
+
+    @router.post(
+        "/accounts/{account_id}/actions/promote",
+        response_model=AccountTrustResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def promote_account(
+        account_id: str,
+        body: PromoteRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> AccountTrustResponse:
+        _require_maintainer(credential)
+        assert worker_repository is not None
+
+        account = account_repository.get_by_id(account_id)
+        if account is None or account.retired_at is not None:
+            raise HTTPException(status_code=404, detail="account not found")
+        if account.suspended_at is not None:
+            raise HTTPException(status_code=409, detail="account is suspended")
+
+        current = account.trust_tier
+        target = TrustTier(body.target_tier)
+        if target != current + 1:
+            raise HTTPException(
+                status_code=422,
+                detail=f"can only promote one step: current={current}, requested={int(target)}",
+            )
+
+        has_quarantined = any(
+            w.quarantined_at is not None
+            for w in worker_repository.list_for_account(account_id)
+        )
+        if has_quarantined:
+            raise HTTPException(status_code=409, detail="account has quarantined workers")
+
+        if body.verification_method is not None:
+            account_repository.verify_identity(
+                account_id,
+                verified_by=f"maintainer",
+                method=body.verification_method,
+                note=body.verification_note,
+            )
+
+        try:
+            account = account_repository.promote(account_id, target_tier=target)
+        except AccountNotFoundError:
+            raise HTTPException(status_code=404, detail="account not found")
+
+        affected = worker_repository.update_tier_for_account(account_id, trust_tier=target)
+
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            action="account.promote",
+            resource_type="account",
+            resource_id=account_id,
+            payload={
+                "old_tier": int(current),
+                "new_tier": int(target),
+                "verification_method": body.verification_method.value if body.verification_method else None,
+                "verification_note": body.verification_note,
+                "affected_worker_ids": affected,
+            },
+        )
+
+        return AccountTrustResponse(
+            account_id=account_id,
+            trust_tier=int(target),
+            trust_tier_name=_tier_name(int(target)),
+            affected_worker_ids=affected,
+        )
+
+    @router.post(
+        "/accounts/{account_id}/actions/demote",
+        response_model=AccountTrustResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def demote_account(
+        account_id: str,
+        body: DemoteRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> AccountTrustResponse:
+        _require_maintainer(credential)
+        assert worker_repository is not None
+
+        account = account_repository.get_by_id(account_id)
+        if account is None or account.retired_at is not None:
+            raise HTTPException(status_code=404, detail="account not found")
+
+        current = account.trust_tier
+        target = TrustTier(body.target_tier)
+        if target >= current:
+            raise HTTPException(
+                status_code=422,
+                detail=f"target tier must be lower: current={current}, requested={int(target)}",
+            )
+
+        try:
+            account = account_repository.demote(account_id, target_tier=target)
+        except AccountNotFoundError:
+            raise HTTPException(status_code=404, detail="account not found")
+
+        affected = worker_repository.update_tier_for_account(account_id, trust_tier=target)
+
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            action="account.demote",
+            resource_type="account",
+            resource_id=account_id,
+            payload={
+                "old_tier": int(current),
+                "new_tier": int(target),
+                "reason": body.reason,
+                "affected_worker_ids": affected,
+            },
+        )
+
+        return AccountTrustResponse(
+            account_id=account_id,
+            trust_tier=int(target),
+            trust_tier_name=_tier_name(int(target)),
+            affected_worker_ids=affected,
+        )
+
+    @router.post(
+        "/accounts/{account_id}/actions/suspend",
+        response_model=AccountTrustResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def suspend_account(
+        account_id: str,
+        body: SuspendRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> AccountTrustResponse:
+        _require_maintainer(credential)
+        assert worker_repository is not None
+
+        try:
+            account = account_repository.suspend(account_id)
+        except AccountNotFoundError:
+            raise HTTPException(status_code=404, detail="account not found")
+
+        affected = worker_repository.quarantine_for_account(
+            account_id, reason=f"account suspended: {body.reason or 'no reason given'}"
+        )
+
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            action="account.suspend",
+            resource_type="account",
+            resource_id=account_id,
+            payload={
+                "reason": body.reason,
+                "affected_worker_ids": affected,
+            },
+        )
+
+        return AccountTrustResponse(
+            account_id=account_id,
+            trust_tier=int(account.trust_tier),
+            trust_tier_name=_tier_name(int(account.trust_tier)),
+            affected_worker_ids=affected,
+        )
+
+    @router.post(
+        "/accounts/{account_id}/actions/unsuspend",
+        response_model=AccountTrustResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def unsuspend_account(
+        account_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> AccountTrustResponse:
+        _require_maintainer(credential)
+        assert worker_repository is not None
+
+        try:
+            account = account_repository.unsuspend(account_id)
+        except AccountNotFoundError:
+            raise HTTPException(status_code=404, detail="account not found")
+
+        affected = worker_repository.unquarantine_for_account(account_id)
+
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            action="account.unsuspend",
+            resource_type="account",
+            resource_id=account_id,
+            payload={"affected_worker_ids": affected},
+        )
+
+        return AccountTrustResponse(
+            account_id=account_id,
+            trust_tier=int(account.trust_tier),
+            trust_tier_name=_tier_name(int(account.trust_tier)),
+            affected_worker_ids=affected,
+        )
+
+    # ---- vouching (§6.2.2) ------------------------------------------------
+
+    @router.post(
+        "/accounts/{account_id}/vouches",
+        response_model=VouchResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_vouch(
+        account_id: str,
+        body: VouchRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> VouchResponse:
+        assert vouch_repository is not None
+
+        if not credential.is_worker() or credential.account_id is None:
+            raise HTTPException(status_code=403, detail="must be an authenticated worker with account binding")
+        if credential.trust_tier is None or credential.trust_tier < int(TrustTier.T2_TRUSTED):
+            raise HTTPException(status_code=403, detail="voucher must be T2+")
+        if credential.account_id == account_id:
+            raise HTTPException(status_code=422, detail="cannot vouch for yourself")
+
+        target = account_repository.get_by_id(account_id)
+        if target is None or target.retired_at is not None:
+            raise HTTPException(status_code=404, detail="target account not found")
+        if target.trust_tier != TrustTier.T1_AUTHENTICATED:
+            raise HTTPException(status_code=422, detail="can only vouch for T1 accounts")
+
+        from auspexai_platform.db.repositories.vouches import DuplicateVouchError
+
+        try:
+            vouch = vouch_repository.create(
+                voucher_account_id=credential.account_id,
+                target_account_id=account_id,
+                rationale=body.rationale,
+            )
+        except DuplicateVouchError:
+            raise HTTPException(status_code=409, detail="already vouched for this account")
+
+        audit_repository.append(
+            actor_class=CredentialClass.WORKER,
+            actor_identifier=credential.pubkey_hex,
+            action="vouch.create",
+            resource_type="account",
+            resource_id=account_id,
+            payload={
+                "vouch_id": vouch.vouch_id,
+                "voucher_account_id": credential.account_id,
+                "rationale": body.rationale,
+            },
+        )
+
+        return VouchResponse(
+            vouch_id=vouch.vouch_id,
+            voucher_account_id=vouch.voucher_account_id,
+            target_account_id=vouch.target_account_id,
+            rationale=vouch.rationale,
+            created_at=vouch.created_at,
+        )
+
+    @router.delete(
+        "/accounts/{account_id}/vouches/{vouch_id}",
+        response_model=VouchResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def revoke_vouch(
+        account_id: str,
+        vouch_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> VouchResponse:
+        assert vouch_repository is not None
+
+        if not credential.is_worker() or credential.account_id is None:
+            raise HTTPException(status_code=403, detail="must be an authenticated worker with account binding")
+
+        from auspexai_platform.db.repositories.vouches import VouchNotFoundError
+
+        vouch = vouch_repository.get_by_id(vouch_id)
+        if vouch is None or vouch.target_account_id != account_id:
+            raise HTTPException(status_code=404, detail="vouch not found")
+        if vouch.voucher_account_id != credential.account_id:
+            raise HTTPException(status_code=403, detail="can only revoke your own vouches")
+
+        try:
+            vouch = vouch_repository.revoke(vouch_id)
+        except VouchNotFoundError:
+            raise HTTPException(status_code=404, detail="vouch not found")
+
+        audit_repository.append(
+            actor_class=CredentialClass.WORKER,
+            actor_identifier=credential.pubkey_hex,
+            action="vouch.revoke",
+            resource_type="account",
+            resource_id=account_id,
+            payload={
+                "vouch_id": vouch_id,
+                "voucher_account_id": credential.account_id,
+            },
+        )
+
+        return VouchResponse(
+            vouch_id=vouch.vouch_id,
+            voucher_account_id=vouch.voucher_account_id,
+            target_account_id=vouch.target_account_id,
+            rationale=vouch.rationale,
+            created_at=vouch.created_at,
+            revoked_at=vouch.revoked_at,
         )
 
     return router

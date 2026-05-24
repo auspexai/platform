@@ -131,12 +131,12 @@ def test_upgrade_binds_account_and_promotes_to_t1(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["worker_id"] == worker.worker_id
-    assert body["trust_tier"] == int(TrustTier.T1_VERIFIED)
+    assert body["trust_tier"] == int(TrustTier.T1_AUTHENTICATED)
 
     # DB reflects the upgrade.
     reread = worker_repository.get_by_id(worker.worker_id)
     assert reread is not None
-    assert reread.trust_tier is TrustTier.T1_VERIFIED
+    assert reread.trust_tier is TrustTier.T1_AUTHENTICATED
     assert reread.account_id == account_id
 
 

@@ -56,7 +56,7 @@ def _seed_account_with_receipts(
     worker_repository.bind_account(
         worker.worker_id,
         account_id=account.account_id,
-        trust_tier=TrustTier.T1_VERIFIED,
+        trust_tier=TrustTier.T1_AUTHENTICATED,
     )
     for i in range(n_receipts):
         exp_idx = i % n_distinct_experiments
@@ -73,23 +73,22 @@ def _seed_account_with_receipts(
 
 
 class TestComputeT2Eligibility:
-    def test_both_thresholds_met(self) -> None:
+    def test_both_thresholds_met_no_identity(self) -> None:
         e = compute_t2_eligibility(
             receipt_count=10,
             distinct_experiments=5,
             thresholds=_THRESHOLDS_LOW,
         )
-        assert e.tier == int(TrustTier.T2_VOUCHED)
-        assert e.tier_name == "T2 vouched"
+        assert e.tier == int(TrustTier.T2_TRUSTED)
+        assert e.tier_name == "T2 trusted"
         assert e.receipt_threshold_met is True
         assert e.distinct_experiments_threshold_met is True
         assert e.thresholds == {"receipts": 3, "distinct_experiments": 2}
         assert e.actuals == {"receipts": 10, "distinct_experiments": 5}
-        # The pending flags NEVER flip to False from automatic computation.
         assert e.identity_check_pending is True
         assert e.vouching_pending is True
-        # ready_for_human_review reflects automatic-gate status only.
-        assert e.ready_for_human_review is True
+        assert e.identity_gate.satisfied is False
+        assert e.ready_for_human_review is False  # identity gate not satisfied
 
     def test_receipt_threshold_unmet(self) -> None:
         e = compute_t2_eligibility(
@@ -139,24 +138,50 @@ class TestComputeReceiptStats:
             n_receipts=5,
             n_distinct_experiments=2,
         )
+        account = account_repository.get_by_id("acct-test")
+        assert account is not None
+
+        # Without identity verification: ready_for_human_review is False.
         stats = compute_receipt_stats(
             account_id="acct-test",
-            current_tier=int(TrustTier.T1_VERIFIED),
+            current_tier=int(TrustTier.T1_AUTHENTICATED),
             receipt_index_repository=receipt_index_repository,
             thresholds=_THRESHOLDS_LOW,
+            account=account,
         )
         assert stats.total_receipts == 5
         assert stats.distinct_experiments == 2
-        assert stats.current_tier == int(TrustTier.T1_VERIFIED)
-        assert stats.current_tier_name == "T1 verified"
+        assert stats.current_tier == int(TrustTier.T1_AUTHENTICATED)
+        assert stats.current_tier_name == "T1 authenticated"
         assert stats.first_receipt_at is not None
         assert stats.last_receipt_at is not None
 
-        # T2 eligibility readout present because account is below T2.
         assert len(stats.eligibility_by_tier) == 1
         t2 = stats.eligibility_by_tier[0]
-        assert t2.tier == int(TrustTier.T2_VOUCHED)
-        assert t2.ready_for_human_review is True
+        assert t2.tier == int(TrustTier.T2_TRUSTED)
+        assert t2.identity_gate.satisfied is False
+        assert t2.ready_for_human_review is False
+
+        # With identity verification: ready_for_human_review flips True.
+        from auspexai_platform.db.models import IdentityVerificationMethod
+
+        account = account_repository.verify_identity(
+            "acct-test",
+            verified_by="maintainer",
+            method=IdentityVerificationMethod.MAINTAINER_ATTESTED,
+            note="test",
+        )
+        stats2 = compute_receipt_stats(
+            account_id="acct-test",
+            current_tier=int(TrustTier.T1_AUTHENTICATED),
+            receipt_index_repository=receipt_index_repository,
+            thresholds=_THRESHOLDS_LOW,
+            account=account,
+        )
+        t2_verified = stats2.eligibility_by_tier[0]
+        assert t2_verified.identity_gate.satisfied is True
+        assert t2_verified.identity_gate.method == "verified"
+        assert t2_verified.ready_for_human_review is True
 
     def test_account_with_no_receipts(
         self,
@@ -172,7 +197,7 @@ class TestComputeReceiptStats:
         )
         stats = compute_receipt_stats(
             account_id="acct-test",
-            current_tier=int(TrustTier.T1_VERIFIED),
+            current_tier=int(TrustTier.T1_AUTHENTICATED),
             receipt_index_repository=receipt_index_repository,
             thresholds=_THRESHOLDS_LOW,
         )
@@ -204,14 +229,14 @@ class TestComputeReceiptStats:
         # would happen via the future tier-bump endpoint).
         stats = compute_receipt_stats(
             account_id="acct-test",
-            current_tier=int(TrustTier.T2_VOUCHED),
+            current_tier=int(TrustTier.T2_TRUSTED),
             receipt_index_repository=receipt_index_repository,
             thresholds=_THRESHOLDS_LOW,
         )
         # Already T2 — no T2 readout shown. T3 readout not yet implemented.
         assert stats.eligibility_by_tier == []
-        assert stats.current_tier == int(TrustTier.T2_VOUCHED)
-        assert stats.current_tier_name == "T2 vouched"
+        assert stats.current_tier == int(TrustTier.T2_TRUSTED)
+        assert stats.current_tier_name == "T2 trusted"
 
 
 # ---- M7f explicit non-promotion property --------------------------------
@@ -234,22 +259,20 @@ class TestNoAutoPromotion:
             n_receipts=100,
             n_distinct_experiments=10,
         )
-        # Multiple calls to compute_receipt_stats — even with sky-high
-        # numbers, the account stays at T1.
-        for _ in range(3):
-            stats = compute_receipt_stats(
-                account_id="acct-test",
-                current_tier=int(TrustTier.T1_VERIFIED),
-                receipt_index_repository=receipt_index_repository,
-                thresholds=_THRESHOLDS_LOW,
-            )
-            assert stats.eligibility_by_tier[0].ready_for_human_review is True
-            assert stats.eligibility_by_tier[0].identity_check_pending is True
-            assert stats.eligibility_by_tier[0].vouching_pending is True
+        # Even with sky-high receipt counts, no identity → not ready.
+        stats = compute_receipt_stats(
+            account_id="acct-test",
+            current_tier=int(TrustTier.T1_AUTHENTICATED),
+            receipt_index_repository=receipt_index_repository,
+            thresholds=_THRESHOLDS_LOW,
+        )
+        assert stats.eligibility_by_tier[0].receipt_threshold_met is True
+        assert stats.eligibility_by_tier[0].identity_gate.satisfied is False
+        assert stats.eligibility_by_tier[0].ready_for_human_review is False
 
         # The actual stored tier is unchanged.
         account = account_repository.get_by_id("acct-test")
-        assert account.trust_tier == TrustTier.T1_VERIFIED
+        assert account.trust_tier == TrustTier.T1_AUTHENTICATED
 
 
 # ---- GET /accounts/{account_id}/receipt-stats endpoint -----------------
@@ -296,7 +319,7 @@ class TestReceiptStatsEndpoint:
         worker_repository.bind_account(
             worker.worker_id,
             account_id=account.account_id,
-            trust_tier=TrustTier.T1_VERIFIED,
+            trust_tier=TrustTier.T1_AUTHENTICATED,
         )
         for i in range(n_receipts):
             exp_idx = i % n_distinct_experiments
@@ -319,14 +342,14 @@ class TestReceiptStatsEndpoint:
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["account_id"] == account.account_id
-        assert body["current_tier"] == int(TrustTier.T1_VERIFIED)
-        assert body["current_tier_name"] == "T1 verified"
+        assert body["current_tier"] == int(TrustTier.T1_AUTHENTICATED)
+        assert body["current_tier_name"] == "T1 authenticated"
         assert body["total_receipts"] == 5
         assert body["distinct_experiments"] == 2
         # Eligibility readout for T2 present and shows the pending flags.
         assert len(body["eligibility_by_tier"]) == 1
         t2 = body["eligibility_by_tier"][0]
-        assert t2["tier"] == int(TrustTier.T2_VOUCHED)
+        assert t2["tier"] == int(TrustTier.T2_TRUSTED)
         assert t2["identity_check_pending"] is True
         assert t2["vouching_pending"] is True
 
@@ -363,7 +386,7 @@ class TestReceiptStatsEndpoint:
         worker_repository.bind_account(
             worker_b.worker_id,
             account_id=account_b.account_id,
-            trust_tier=TrustTier.T1_VERIFIED,
+            trust_tier=TrustTier.T1_AUTHENTICATED,
         )
 
         # Worker B tries to fetch account A's stats — denied.

@@ -4,16 +4,11 @@ Implements the §6.2 "tier promotion logic [that] inspects receipt history
 at thresholds" — as a **read-only signal**, not as an auto-promotion
 mechanism.
 
-Per Principles & Scope §6.1, T2 promotion requires a real-identity check
-OR vouching by an existing T2+ — neither of which is built yet. Per §6.2,
-T2+ promotions "may require human review." So this module produces a
-structured eligibility readout that lets maintainers (or, later, the
-Approver pool) see at a glance which receipt-history gates are satisfied
-and which §6.1 identity gates remain.
-
-The actual tier-bump action lives in a future milestone bundled with the
-vouching / identity-verification work. M7f does not write to the
-accounts table.
+Per Principles & Scope §6.2 (revised 2026-05-24), T2 promotion requires
+both receipt-history thresholds AND an identity gate (§6.2.1 Maintainer
+verification OR §6.2.2 vouching by T2+) AND Maintainer approval. This
+module produces the read-only eligibility signal; the actual tier-bump
+is performed by the §6.2.3 promote endpoint.
 
 Eligibility shape returned for each future tier:
 
@@ -38,7 +33,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from auspexai_platform.db.models import TrustTier
+from auspexai_platform.db.models import Account, TrustTier, Vouch
 from auspexai_platform.db.repositories import ReceiptIndexRepository
 
 
@@ -51,11 +46,22 @@ class EligibilityThresholds:
 
 
 @dataclass(frozen=True)
+class IdentityGateStatus:
+    """Status of the §6.2.1 / §6.2.2 identity gate for one account."""
+
+    satisfied: bool
+    method: str | None = None  # "verified" or "vouched"
+    verified_by: str | None = None
+    verification_method: str | None = None
+    vouched_by: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class TierEligibility:
     """Eligibility status for one specific tier.
 
-    A maintainer reads this to decide whether to perform the §6.1 identity
-    check + tier bump (via a future endpoint that does NOT exist yet).
+    A maintainer reads this to decide whether to perform the tier bump
+    via POST /accounts/{id}/actions/promote (§6.2.3).
     """
 
     tier: int
@@ -64,9 +70,10 @@ class TierEligibility:
     distinct_experiments_threshold_met: bool
     thresholds: dict[str, int]
     actuals: dict[str, int]
-    identity_check_pending: bool  # always True until §6.1 machinery ships
-    vouching_pending: bool  # always True until vouching machinery ships
-    ready_for_human_review: bool  # True iff all automatic gates pass
+    identity_check_pending: bool
+    vouching_pending: bool
+    identity_gate: IdentityGateStatus
+    ready_for_human_review: bool
 
 
 @dataclass(frozen=True)
@@ -87,10 +94,9 @@ class ReceiptStats:
 
 _TIER_NAMES = {
     0: "T0 anonymous",
-    1: "T1 verified",
-    2: "T2 vouched",
-    3: "T3 trusted",
-    4: "T4 maintainer",
+    1: "T1 authenticated",
+    2: "T2 trusted",
+    3: "T3 vetted",
 }
 
 
@@ -98,24 +104,46 @@ def _tier_name(tier: int) -> str:
     return _TIER_NAMES.get(tier, f"T{tier}")
 
 
+def _compute_identity_gate(
+    account: Account | None,
+    active_vouches: list[Vouch],
+) -> IdentityGateStatus:
+    """Determine whether the identity gate is satisfied for an account."""
+    if account is not None and account.identity_verified_at is not None:
+        return IdentityGateStatus(
+            satisfied=True,
+            method="verified",
+            verified_by=account.identity_verified_by,
+            verification_method=(
+                account.identity_verification_method.value
+                if account.identity_verification_method
+                else None
+            ),
+        )
+    if active_vouches:
+        return IdentityGateStatus(
+            satisfied=True,
+            method="vouched",
+            vouched_by=[v.voucher_account_id for v in active_vouches],
+        )
+    return IdentityGateStatus(satisfied=False)
+
+
 def compute_t2_eligibility(
     *,
     receipt_count: int,
     distinct_experiments: int,
     thresholds: EligibilityThresholds,
+    account: Account | None = None,
+    active_vouches: list[Vouch] | None = None,
 ) -> TierEligibility:
-    """Compute T1→T2 eligibility given an account's aggregates.
-
-    The receipt + distinct-experiments thresholds are the only AUTOMATIC
-    gates per §6.2. The §6.1 identity / vouching gates are listed as
-    `_pending=True` to signal the maintainer still has work to do; they
-    never flip to False from automatic checks.
-    """
+    """Compute T1→T2 eligibility given an account's aggregates + identity state."""
     receipt_met = receipt_count >= thresholds.t2_receipt_threshold
     distinct_met = distinct_experiments >= thresholds.t2_distinct_experiments
+    identity_gate = _compute_identity_gate(account, active_vouches or [])
     return TierEligibility(
-        tier=int(TrustTier.T2_VOUCHED),
-        tier_name=_tier_name(int(TrustTier.T2_VOUCHED)),
+        tier=int(TrustTier.T2_TRUSTED),
+        tier_name=_tier_name(int(TrustTier.T2_TRUSTED)),
         receipt_threshold_met=receipt_met,
         distinct_experiments_threshold_met=distinct_met,
         thresholds={
@@ -126,10 +154,12 @@ def compute_t2_eligibility(
             "receipts": receipt_count,
             "distinct_experiments": distinct_experiments,
         },
-        # Always pending — §6.1 identity check / vouching milestones not yet shipped.
-        identity_check_pending=True,
-        vouching_pending=True,
-        ready_for_human_review=receipt_met and distinct_met,
+        identity_check_pending=account is None or account.identity_verified_at is None,
+        vouching_pending=not bool(active_vouches),
+        identity_gate=identity_gate,
+        ready_for_human_review=(
+            receipt_met and distinct_met and identity_gate.satisfied
+        ),
     )
 
 
@@ -139,6 +169,8 @@ def compute_receipt_stats(
     current_tier: int,
     receipt_index_repository: ReceiptIndexRepository,
     thresholds: EligibilityThresholds,
+    account: Account | None = None,
+    active_vouches: list[Vouch] | None = None,
 ) -> ReceiptStats:
     """Aggregate one account's receipt history + render the eligibility readout
     for every future tier (currently just T2; T3 lands when T3-bound vetting
@@ -146,30 +178,22 @@ def compute_receipt_stats(
     """
     entries = receipt_index_repository.list_for_account(account_id)
     distinct_experiment_ids = {e.experiment_id for e in entries}
-    # `tenant_id` isn't stored on the receipt_index row (intentional — keeps
-    # the index small). At the M7f reporting layer we'd need a JOIN through
-    # experiments to compute distinct_tenants. For Phase 1 lab altitude we
-    # report distinct_experiments (which is a stricter cut anyway — multiple
-    # experiments per tenant means distinct_tenants ≤ distinct_experiments).
-    # Wiring distinct_tenants properly is a small follow-up if needed.
     distinct_tenant_count = len(distinct_experiment_ids)  # upper-bound placeholder
 
     first_at = entries[-1].issued_at.isoformat() if entries else None
     last_at = entries[0].issued_at.isoformat() if entries else None
 
     eligibility_by_tier: list[TierEligibility] = []
-    if current_tier < int(TrustTier.T2_VOUCHED):
+    if current_tier < int(TrustTier.T2_TRUSTED):
         eligibility_by_tier.append(
             compute_t2_eligibility(
                 receipt_count=len(entries),
                 distinct_experiments=len(distinct_experiment_ids),
                 thresholds=thresholds,
+                account=account,
+                active_vouches=active_vouches,
             )
         )
-    # T3 eligibility deliberately omitted at M7f — the §6.1 T3 requirement
-    # ("personally vetted, often institutional affiliation") doesn't yet
-    # have a thresholded shape we can report on. The T3 milestone designs
-    # its own readout.
 
     return ReceiptStats(
         account_id=account_id,

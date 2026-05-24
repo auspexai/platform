@@ -147,11 +147,21 @@ class ReceiptListResponse(BaseModel):
     receipts: Annotated[list[ReceiptSummary] | None, ExposureTag.PUBLIC] = None
 
 
+class IdentityGateResponse(BaseModel):
+    """Status of the §6.2.1 / §6.2.2 identity gate."""
+
+    satisfied: Annotated[bool | None, ExposureTag.PUBLIC] = None
+    method: Annotated[str | None, ExposureTag.PUBLIC] = None
+    verified_by: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
+    verification_method: Annotated[str | None, ExposureTag.PUBLIC] = None
+    vouched_by: Annotated[list[str] | None, ExposureTag.OPERATOR_ONLY] = None
+
+
 class TierEligibilityResponse(BaseModel):
-    """One row of `ReceiptStatsResponse.eligibility_by_tier` — automated-gate
-    state for one future tier. The `_pending` flags signal that the §6.1
-    identity gate or vouching gate still needs human review; they NEVER
-    flip to False from automatic computation (M7f is read-only)."""
+    """One row of `ReceiptStatsResponse.eligibility_by_tier` — gate state
+    for one future tier. identity_check_pending and vouching_pending now
+    reflect real data from §6.2.1 verification columns and §6.2.2 vouches
+    table (no longer hardcoded True)."""
 
     tier: Annotated[int | None, ExposureTag.PUBLIC] = None
     tier_name: Annotated[str | None, ExposureTag.PUBLIC] = None
@@ -161,6 +171,7 @@ class TierEligibilityResponse(BaseModel):
     actuals: Annotated[dict[str, int] | None, ExposureTag.PUBLIC] = None
     identity_check_pending: Annotated[bool | None, ExposureTag.PUBLIC] = None
     vouching_pending: Annotated[bool | None, ExposureTag.PUBLIC] = None
+    identity_gate: Annotated[IdentityGateResponse | None, ExposureTag.PUBLIC] = None
     ready_for_human_review: Annotated[bool | None, ExposureTag.PUBLIC] = None
 
 
@@ -213,6 +224,7 @@ def build_router(
     account_repository: AccountRepository | None = None,
     per_job_factory: PerJobDatabaseFactory | None = None,
     eligibility_thresholds: EligibilityThresholds | None = None,
+    vouch_repository=None,
 ) -> APIRouter:
     """Build the receipts router.
 
@@ -594,11 +606,19 @@ def build_router(
                     },
                 )
 
+            active_vouches = (
+                vouch_repository.list_for_target(account_id, active_only=True)
+                if vouch_repository is not None
+                else []
+            )
+
             stats = compute_receipt_stats(
                 account_id=account_id,
                 current_tier=int(account.trust_tier),
                 receipt_index_repository=receipt_index_repository,
                 thresholds=eligibility_thresholds,
+                account=account,
+                active_vouches=active_vouches,
             )
             return ReceiptStatsResponse(
                 account_id=stats.account_id,
@@ -619,6 +639,13 @@ def build_router(
                         actuals=e.actuals,
                         identity_check_pending=e.identity_check_pending,
                         vouching_pending=e.vouching_pending,
+                        identity_gate=IdentityGateResponse(
+                            satisfied=e.identity_gate.satisfied,
+                            method=e.identity_gate.method,
+                            verified_by=e.identity_gate.verified_by,
+                            verification_method=e.identity_gate.verification_method,
+                            vouched_by=e.identity_gate.vouched_by or None,
+                        ),
                         ready_for_human_review=e.ready_for_human_review,
                     )
                     for e in stats.eligibility_by_tier
