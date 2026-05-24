@@ -47,6 +47,25 @@ class IdentityProvider(StrEnum):
     GITHUB = "github"
 
 
+class IntegrityPolicy(StrEnum):
+    """Per-experiment integrity policy set by Maintainer at approval time.
+
+    Determines the base replication_target for work units. The scheduler
+    enforces per-tier replication floors on top of this base.
+    """
+
+    STANDARD = "standard"  # base replication_target=3
+    HIGH = "high"  # base replication_target=5
+    TRUSTED = "trusted"  # base replication_target=1 (only T2+ via tier floor)
+
+
+INTEGRITY_POLICY_REPLICATION = {
+    IntegrityPolicy.STANDARD: 3,
+    IntegrityPolicy.HIGH: 5,
+    IntegrityPolicy.TRUSTED: 1,
+}
+
+
 class ExperimentStatus(StrEnum):
     """Experiment lifecycle states.
 
@@ -130,6 +149,7 @@ class Experiment(BaseModel):
     submissions_finalized: bool = False
     last_action_at: datetime | None = None
     last_action_by_class: CredentialClass | None = None
+    integrity_policy: IntegrityPolicy = IntegrityPolicy.STANDARD
 
 
 class IdentityVerificationMethod(StrEnum):

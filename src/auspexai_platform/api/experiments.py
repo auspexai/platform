@@ -68,6 +68,7 @@ class ExperimentResponse(BaseModel):
     manifest_hash: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
     revision: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     error_summary: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
+    integrity_policy: Annotated[str | None, ExposureTag.PUBLIC] = None
 
 
 class ExperimentListResponse(BaseModel):
@@ -103,6 +104,9 @@ def _to_response(experiment) -> ExperimentResponse:
             if experiment.last_action_by_class is not None
             else None
         ),
+        integrity_policy=experiment.integrity_policy.value
+        if hasattr(experiment, "integrity_policy") and experiment.integrity_policy
+        else "standard",
     )
 
 
@@ -324,9 +328,22 @@ def build_router(
     )
     async def approve_experiment(
         experiment_id: str,
+        integrity_policy: str | None = None,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ExperimentResponse:
         require_maintainer(credential)
+        if integrity_policy is not None:
+            from auspexai_platform.db.models import IntegrityPolicy
+
+            try:
+                policy = IntegrityPolicy(integrity_policy)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"invalid integrity_policy: {integrity_policy!r}; "
+                    f"must be one of: standard, high, trusted",
+                )
+            experiment_repository.set_integrity_policy(experiment_id, policy)
         return _transition(
             experiment_id=experiment_id,
             new_status=ExperimentStatus.APPROVED,

@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 
 from auspexai_platform.auth.credential import CredentialClass
 from auspexai_platform.db.database import Database
-from auspexai_platform.db.models import Experiment, ExperimentStatus
+from auspexai_platform.db.models import Experiment, ExperimentStatus, IntegrityPolicy
 
 
 class DuplicateExperimentLabelError(Exception):
@@ -206,6 +206,22 @@ class ExperimentRepository:
         assert got is not None
         return got
 
+    def set_integrity_policy(
+        self,
+        experiment_id: str,
+        policy: IntegrityPolicy,
+    ) -> Experiment:
+        """Set the integrity policy for an experiment. Typically called at
+        approval time by the Maintainer."""
+        self.db.execute(
+            "UPDATE experiments SET integrity_policy = ? WHERE experiment_id = ?",
+            (policy.value, experiment_id),
+        )
+        got = self.get_by_id(experiment_id)
+        if got is None:
+            raise ExperimentNotFoundError(experiment_id)
+        return got
+
     # ---- reads ----
 
     def get_by_id(self, experiment_id: str) -> Experiment | None:
@@ -262,4 +278,7 @@ class ExperimentRepository:
                 if row["last_action_by_class"]
                 else None
             ),
+            integrity_policy=IntegrityPolicy(row["integrity_policy"])
+            if row["integrity_policy"]
+            else IntegrityPolicy.STANDARD,
         )

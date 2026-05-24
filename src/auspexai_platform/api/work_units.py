@@ -294,12 +294,20 @@ def build_router(
                 )
             seen_ids.add(unit.unit_id)
 
-        # Get-or-create the per-job DB; insert atomically.
+        # Compute replication_target from the experiment's integrity policy
+        # (set by Maintainer at approval time). Researcher does not control this.
+        from auspexai_platform.db.models import INTEGRITY_POLICY_REPLICATION
+
+        replication_target = INTEGRITY_POLICY_REPLICATION.get(
+            experiment.integrity_policy, 3
+        )
+
         per_job_db = per_job_factory.get_or_create(experiment_id)
         repo = WorkUnitRepository(per_job_db)
         try:
             inserted = repo.submit_batch(
-                [{"unit_id": u.unit_id, "payload": u.payload} for u in body.work_units]
+                [{"unit_id": u.unit_id, "payload": u.payload} for u in body.work_units],
+                replication_target=replication_target,
             )
         except DuplicateWorkUnitError as e:
             raise HTTPException(
