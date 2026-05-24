@@ -85,6 +85,11 @@ class Scheduler:
             work_units = WorkUnitRepository(per_job_db)
             assignments = AssignmentRepository(per_job_db)
 
+            if experiment.max_concurrent_assignments is not None:
+                total_active = assignments.count_active_for_experiment()
+                if total_active >= experiment.max_concurrent_assignments:
+                    continue
+
             from auspexai_platform.db.models import WorkUnitStatus
 
             candidates: list[WorkUnit] = []

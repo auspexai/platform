@@ -294,9 +294,49 @@ def build_router(
                 )
             seen_ids.add(unit.unit_id)
 
-        # Compute replication_target from the experiment's integrity policy
-        # (set by Maintainer at approval time). Researcher does not control this.
+        # ---- resource bounds enforcement (set by Maintainer at approval) ----
         from auspexai_platform.db.models import INTEGRITY_POLICY_REPLICATION
+
+        if experiment.max_payload_bytes is not None:
+            import json as _json
+
+            for unit in body.work_units:
+                payload_size = len(_json.dumps(unit.payload).encode("utf-8"))
+                if payload_size > experiment.max_payload_bytes:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": {
+                                "code": "payload_too_large",
+                                "message": (
+                                    f"work unit {unit.unit_id!r} payload is {payload_size} bytes; "
+                                    f"experiment limit is {experiment.max_payload_bytes} bytes"
+                                ),
+                                "details": {"unit_id": unit.unit_id, "size": payload_size},
+                            }
+                        },
+                    )
+
+        if experiment.max_units is not None:
+            per_job_db_check = per_job_factory.get(experiment_id)
+            existing_count = 0
+            if per_job_db_check is not None:
+                existing_units = WorkUnitRepository(per_job_db_check).list_all()
+                existing_count = len(existing_units)
+            if existing_count + len(body.work_units) > experiment.max_units:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": {
+                            "code": "max_units_exceeded",
+                            "message": (
+                                f"submitting {len(body.work_units)} units would exceed "
+                                f"the experiment limit of {experiment.max_units} "
+                                f"(currently {existing_count} submitted)"
+                            ),
+                        }
+                    },
+                )
 
         replication_target = INTEGRITY_POLICY_REPLICATION.get(
             experiment.integrity_policy, 3

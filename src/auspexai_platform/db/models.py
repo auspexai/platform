@@ -150,6 +150,10 @@ class Experiment(BaseModel):
     last_action_at: datetime | None = None
     last_action_by_class: CredentialClass | None = None
     integrity_policy: IntegrityPolicy = IntegrityPolicy.STANDARD
+    max_unit_duration_seconds: int | None = None
+    max_units: int | None = None
+    max_concurrent_assignments: int | None = None
+    max_payload_bytes: int | None = None
 
 
 class IdentityVerificationMethod(StrEnum):

@@ -69,6 +69,10 @@ class ExperimentResponse(BaseModel):
     revision: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     error_summary: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     integrity_policy: Annotated[str | None, ExposureTag.PUBLIC] = None
+    max_unit_duration_seconds: Annotated[int | None, ExposureTag.PUBLIC] = None
+    max_units: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
+    max_concurrent_assignments: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
+    max_payload_bytes: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
 
 
 class ExperimentListResponse(BaseModel):
@@ -107,6 +111,10 @@ def _to_response(experiment) -> ExperimentResponse:
         integrity_policy=experiment.integrity_policy.value
         if hasattr(experiment, "integrity_policy") and experiment.integrity_policy
         else "standard",
+        max_unit_duration_seconds=experiment.max_unit_duration_seconds,
+        max_units=experiment.max_units,
+        max_concurrent_assignments=experiment.max_concurrent_assignments,
+        max_payload_bytes=experiment.max_payload_bytes,
     )
 
 
@@ -329,6 +337,10 @@ def build_router(
     async def approve_experiment(
         experiment_id: str,
         integrity_policy: str | None = None,
+        max_unit_duration_seconds: int | None = None,
+        max_units: int | None = None,
+        max_concurrent_assignments: int | None = None,
+        max_payload_bytes: int | None = None,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ExperimentResponse:
         require_maintainer(credential)
@@ -344,6 +356,14 @@ def build_router(
                     f"must be one of: standard, high, trusted",
                 )
             experiment_repository.set_integrity_policy(experiment_id, policy)
+        if any(v is not None for v in [max_unit_duration_seconds, max_units, max_concurrent_assignments, max_payload_bytes]):
+            experiment_repository.set_resource_bounds(
+                experiment_id,
+                max_unit_duration_seconds=max_unit_duration_seconds,
+                max_units=max_units,
+                max_concurrent_assignments=max_concurrent_assignments,
+                max_payload_bytes=max_payload_bytes,
+            )
         return _transition(
             experiment_id=experiment_id,
             new_status=ExperimentStatus.APPROVED,

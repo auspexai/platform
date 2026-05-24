@@ -206,6 +206,36 @@ class ExperimentRepository:
         assert got is not None
         return got
 
+    def set_resource_bounds(
+        self,
+        experiment_id: str,
+        *,
+        max_unit_duration_seconds: int | None = None,
+        max_units: int | None = None,
+        max_concurrent_assignments: int | None = None,
+        max_payload_bytes: int | None = None,
+    ) -> Experiment:
+        """Set resource bounds for an experiment. Called at approval time."""
+        self.db.execute(
+            """UPDATE experiments SET
+                max_unit_duration_seconds = ?,
+                max_units = ?,
+                max_concurrent_assignments = ?,
+                max_payload_bytes = ?
+            WHERE experiment_id = ?""",
+            (
+                max_unit_duration_seconds,
+                max_units,
+                max_concurrent_assignments,
+                max_payload_bytes,
+                experiment_id,
+            ),
+        )
+        got = self.get_by_id(experiment_id)
+        if got is None:
+            raise ExperimentNotFoundError(experiment_id)
+        return got
+
     def set_integrity_policy(
         self,
         experiment_id: str,
@@ -281,4 +311,8 @@ class ExperimentRepository:
             integrity_policy=IntegrityPolicy(row["integrity_policy"])
             if row["integrity_policy"]
             else IntegrityPolicy.STANDARD,
+            max_unit_duration_seconds=row["max_unit_duration_seconds"],
+            max_units=row["max_units"],
+            max_concurrent_assignments=row["max_concurrent_assignments"],
+            max_payload_bytes=row["max_payload_bytes"],
         )

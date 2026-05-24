@@ -165,6 +165,14 @@ class AssignmentRepository:
         )
         return int(rows[0]["n"]) if rows else 0
 
+    def count_active_for_experiment(self) -> int:
+        """Count all active (non-refused, no result yet) assignments across
+        the entire per-job DB. Used for max_concurrent_assignments enforcement."""
+        rows = self.db.execute(
+            "SELECT COUNT(*) AS n FROM assignments WHERE refused_at IS NULL AND result_id IS NULL",
+        )
+        return int(rows[0]["n"]) if rows else 0
+
     def already_assigned(self, unit_id: str, worker_id: str) -> bool:
         return self.get_for_unit_and_worker(unit_id, worker_id) is not None
 
