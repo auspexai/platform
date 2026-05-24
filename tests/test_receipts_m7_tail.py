@@ -32,6 +32,7 @@ from auspexai_platform.receipts import (
     cose_sign1_decode,
     decode_cbor,
     issue_receipts_for_completed_unit,
+    unwrap_statement,
 )
 
 AUTHORITY = "testserver"
@@ -199,7 +200,7 @@ class TestCanonicalReceiptEndpoint:
         signing_key = client.app.state.receipt_signing_key
         payload, kid = cose_sign1_decode(cose_bytes, expected_pubkey=signing_key.public_key)
         assert kid == signing_key.pubkey_hex
-        receipt = decode_cbor(payload)
+        receipt = decode_cbor(unwrap_statement(payload))
         assert receipt.tenant_id == "tenant-test"
         assert receipt.experiment_id == "tail-test"
         # Receipt body carried in response too (convenience).

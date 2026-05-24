@@ -32,6 +32,7 @@ from auspexai_platform.receipts import (
     hash_agreement_reducer,
     issue_receipts_for_completed_unit,
     load_or_generate_signing_key,
+    unwrap_statement,
 )
 
 
@@ -182,7 +183,7 @@ class TestIssueReceiptsForCompletedUnit:
                 record.cose_signed_blob, expected_pubkey=signing_key.public_key
             )
             assert kid == signing_key.pubkey_hex
-            receipt = decode_cbor(payload)
+            receipt = decode_cbor(unwrap_statement(payload))
             assert receipt.tenant_id == "tenant-a"
             # experiment_id in receipt is tenant-side label, not coord-side id.
             assert receipt.experiment_id == "doubler-v1"

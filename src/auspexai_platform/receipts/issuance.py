@@ -38,6 +38,7 @@ from hashlib import sha256
 
 from auspexai_platform.db.models import Experiment, Result, WorkUnit
 from auspexai_platform.db.repositories import ReceiptIndexRepository
+from auspexai_platform.receipts.intoto import build_statement
 from auspexai_platform.receipts.models import (
     QuorumAgreement,
     Receipt,
@@ -45,6 +46,7 @@ from auspexai_platform.receipts.models import (
     TimeWindow,
     encode_cbor,
 )
+from auspexai_platform.receipts.rekor import NoOpRekorClient, RekorClient
 from auspexai_platform.receipts.repository import ReceiptRecord, ReceiptRepository
 from auspexai_platform.receipts.signing import SigningKey, cose_sign1_encode
 
@@ -146,6 +148,7 @@ def issue_receipts_for_completed_unit(
     receipt_repo: ReceiptRepository,
     signing_key: SigningKey,
     receipt_index_repo: ReceiptIndexRepository | None = None,
+    rekor_client: RekorClient | NoOpRekorClient | None = None,
 ) -> ReceiptIssuanceOutcome:
     """Build, sign, and persist one receipt per agreeing worker.
 
@@ -185,8 +188,11 @@ def issue_receipts_for_completed_unit(
     time_window_start = min(r.completed_at for r in results)
     time_window_end = max(r.completed_at for r in results)
 
+    _rekor = rekor_client or NoOpRekorClient()
+
     issued: list[str] = []
     for result in results:
+        receipt_id = _generate_receipt_id()
         receipt = Receipt(
             version="0.1",
             tenant_id=experiment.tenant_id,
@@ -202,8 +208,42 @@ def issue_receipts_for_completed_unit(
             result_hash_anchors=anchors,
         )
         cbor_payload = encode_cbor(receipt)
-        cose_blob = cose_sign1_encode(payload=cbor_payload, signing_key=signing_key)
-        receipt_id = _generate_receipt_id()
+
+        statement_cbor = build_statement(
+            receipt_cbor=cbor_payload,
+            receipt_id=receipt_id,
+        )
+        cose_blob = cose_sign1_encode(payload=statement_cbor, signing_key=signing_key)
+
+        try:
+            rekor_entry = _rekor.record(cose_blob)
+        except Exception:
+            logger.exception(
+                "rekor recording failed for receipt %s; using placeholder anchors",
+                receipt_id,
+            )
+            rekor_entry = NoOpRekorClient().record(cose_blob)
+
+        if rekor_entry.log_index != 0 or rekor_entry.entry_uuid != "lab-mode-no-rekor":
+            receipt = receipt.model_copy(
+                update={
+                    "result_hash_anchors": [
+                        ResultHashAnchor(
+                            rekor_log_index=rekor_entry.log_index,
+                            rekor_entry_uuid=rekor_entry.entry_uuid,
+                            result_sha256=a.result_sha256,
+                        )
+                        for a in anchors
+                    ]
+                }
+            )
+            cbor_payload = encode_cbor(receipt)
+            statement_cbor = build_statement(
+                receipt_cbor=cbor_payload,
+                receipt_id=receipt_id,
+            )
+            cose_blob = cose_sign1_encode(payload=statement_cbor, signing_key=signing_key)
+
         record: ReceiptRecord = receipt_repo.insert(
             receipt_id=receipt_id,
             work_unit_ids=[work_unit.unit_id],

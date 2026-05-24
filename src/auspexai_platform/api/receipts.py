@@ -316,11 +316,21 @@ def build_router(
             # but guard anyway.
             errors.append(f"cose_decode_verify: {exc}")
 
-        # 4-5. CBOR-decode the inner payload and Pydantic-validate.
+        # 4-5. Unwrap in-toto Statement (if present) then CBOR-decode receipt.
         receipt: Receipt | None = None
         schema_valid = False
         try:
-            receipt = decode_cbor(payload_bytes)
+            import cbor2 as _cbor2
+
+            inner = _cbor2.loads(payload_bytes)
+            if isinstance(inner, dict) and inner.get("_type") == "https://www.in-toto.io/Statement/v1":
+                receipt_cbor = inner.get("predicate", b"")
+                if isinstance(receipt_cbor, bytes):
+                    receipt = decode_cbor(receipt_cbor)
+                else:
+                    receipt = Receipt.model_validate(receipt_cbor)
+            else:
+                receipt = decode_cbor(payload_bytes)
             schema_valid = True
         except Exception as exc:
             errors.append(f"schema: {exc}")

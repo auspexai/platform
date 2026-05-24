@@ -262,6 +262,7 @@ def test_full_flow_researcher_to_auto_complete(
         ReceiptRepository,
         cose_sign1_decode,
         decode_cbor,
+        unwrap_statement,
     )
 
     per_job_db = client.app.state.per_job_factory.get(coordinator_exp_id)
@@ -276,7 +277,8 @@ def test_full_flow_researcher_to_auto_complete(
             record.cose_signed_blob, expected_pubkey=signing_key.public_key
         )
         assert kid == signing_key.pubkey_hex
-        receipt = decode_cbor(payload)
+        receipt_cbor = unwrap_statement(payload)
+        receipt = decode_cbor(receipt_cbor)
         assert receipt.quorum_agreement.method == HASH_AGREEMENT_METHOD
         assert receipt.quorum_agreement.agreeing_workers == 3
         assert receipt.quorum_agreement.replication_factor == 3

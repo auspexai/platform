@@ -56,6 +56,7 @@ from auspexai_platform.receipts.repository import (
     ReceiptRecord,
     ReceiptRepository,
 )
+from auspexai_platform.receipts.intoto import unwrap_statement
 from auspexai_platform.receipts.signing import (
     CoseDecodeError,
     CoseVerificationError,
