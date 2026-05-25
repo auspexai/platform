@@ -323,6 +323,12 @@ def build_router(
                 gate_warnings.append(f"distinct experiments threshold not met ({elig.actuals['distinct_experiments']}/{elig.thresholds['distinct_experiments']})")
             if not elig.identity_gate.satisfied:
                 gate_warnings.append("identity gate not satisfied (no verification or vouching)")
+        elif target == TrustTier.T3_VETTED:
+            if account.identity_verified_at is None:
+                gate_warnings.append("identity not formally verified (T3 = personally vetted by Maintainer)")
+            entries = receipt_index_repository.list_for_account(account_id) if receipt_index_repository else []
+            if not entries:
+                gate_warnings.append("no receipt history")
 
         if body.verification_method is not None:
             account_repository.verify_identity(
