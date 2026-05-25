@@ -95,6 +95,8 @@ class AccountTrustResponse(BaseModel):
     trust_tier: int
     trust_tier_name: str
     affected_worker_ids: list[str] = Field(default_factory=list)
+    gate_override: bool = False
+    gate_warnings: list[str] = Field(default_factory=list)
 
 
 class VouchRequest(BaseModel):
@@ -138,6 +140,8 @@ def build_router(
     identity_verifier: IdentityVerifier,
     worker_repository: WorkerRepository | None = None,
     vouch_repository: VouchRepository | None = None,
+    receipt_index_repository=None,
+    eligibility_thresholds=None,
 ) -> APIRouter:
     """Build /accounts router bound to repository instances + verifier."""
 
@@ -301,6 +305,25 @@ def build_router(
         if has_quarantined:
             raise HTTPException(status_code=409, detail="account has quarantined workers")
 
+        gate_warnings: list[str] = []
+        if target == TrustTier.T2_TRUSTED:
+            from auspexai_platform.eligibility import compute_t2_eligibility
+
+            active_vouches = vouch_repository.list_for_target(account_id) if vouch_repository else []
+            elig = compute_t2_eligibility(
+                receipt_count=len(receipt_index_repository.list_for_account(account_id)) if receipt_index_repository else 0,
+                distinct_experiments=len({e.experiment_id for e in receipt_index_repository.list_for_account(account_id)}) if receipt_index_repository else 0,
+                thresholds=eligibility_thresholds,
+                account=account,
+                active_vouches=active_vouches,
+            )
+            if not elig.receipt_threshold_met:
+                gate_warnings.append(f"receipt threshold not met ({elig.actuals['receipts']}/{elig.thresholds['receipts']})")
+            if not elig.distinct_experiments_threshold_met:
+                gate_warnings.append(f"distinct experiments threshold not met ({elig.actuals['distinct_experiments']}/{elig.thresholds['distinct_experiments']})")
+            if not elig.identity_gate.satisfied:
+                gate_warnings.append("identity gate not satisfied (no verification or vouching)")
+
         if body.verification_method is not None:
             account_repository.verify_identity(
                 account_id,
@@ -328,6 +351,8 @@ def build_router(
                 "verification_method": body.verification_method.value if body.verification_method else None,
                 "verification_note": body.verification_note,
                 "affected_worker_ids": affected,
+                "gate_override": bool(gate_warnings),
+                "gate_warnings": gate_warnings,
             },
         )
 
@@ -336,6 +361,8 @@ def build_router(
             trust_tier=int(target),
             trust_tier_name=_tier_name(int(target)),
             affected_worker_ids=affected,
+            gate_override=bool(gate_warnings),
+            gate_warnings=gate_warnings,
         )
 
     @router.post(

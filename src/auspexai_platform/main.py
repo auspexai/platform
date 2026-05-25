@@ -195,6 +195,10 @@ def create_app(
         prefix="/api/v0",
         tags=["experiments"],
     )
+    eligibility_thresholds = EligibilityThresholds(
+        t2_receipt_threshold=config.tier_t2_receipt_threshold,
+        t2_distinct_experiments=config.tier_t2_distinct_experiments,
+    )
     app.include_router(
         account_routes.build_router(
             credential_dep,
@@ -203,6 +207,8 @@ def create_app(
             identity_verifier,
             worker_repository=worker_repository,
             vouch_repository=vouch_repository,
+            receipt_index_repository=receipt_index_repository,
+            eligibility_thresholds=eligibility_thresholds,
         ),
         prefix="/api/v0",
         tags=["accounts"],
@@ -240,13 +246,12 @@ def create_app(
             experiment_repository,
             receipt_signing_key,
             receipt_index_repository,
+            account_repository=account_repository,
+            eligibility_thresholds=eligibility_thresholds,
+            vouch_repository=vouch_repository,
         ),
         prefix="/api/v0",
         tags=["assignments"],
-    )
-    eligibility_thresholds = EligibilityThresholds(
-        t2_receipt_threshold=config.tier_t2_receipt_threshold,
-        t2_distinct_experiments=config.tier_t2_distinct_experiments,
     )
     app.include_router(
         receipt_routes.build_router(

@@ -50,7 +50,7 @@ from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.dependency import require_worker
-from auspexai_platform.db.models import ExperimentStatus, WorkUnitStatus
+from auspexai_platform.db.models import ExperimentStatus, TrustTier, WorkUnitStatus
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AssignmentRepository,
@@ -186,6 +186,9 @@ def build_router(
     experiment_repository: ExperimentRepository,
     receipt_signing_key: SigningKey,
     receipt_index_repository: ReceiptIndexRepository,
+    account_repository=None,
+    eligibility_thresholds=None,
+    vouch_repository=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -449,6 +452,16 @@ def build_router(
                             "issued_receipt_ids": issuance_outcome.issued_receipt_ids,
                         },
                     )
+                    if issuance_outcome.issued_receipt_ids:
+                        _maybe_auto_promote(
+                            worker_id=worker_id,
+                            worker_repository=worker_repository,
+                            account_repository=account_repository,
+                            receipt_index_repository=receipt_index_repository,
+                            eligibility_thresholds=eligibility_thresholds,
+                            vouch_repository=vouch_repository,
+                            audit_repository=audit_repository,
+                        )
             except Exception:
                 import logging
 
@@ -627,4 +640,82 @@ def _maybe_auto_complete(
         resource_type="experiment",
         resource_id=experiment_id,
         payload={"trigger": "all_units_completed_and_finalized"},
+    )
+
+
+def _maybe_auto_promote(
+    *,
+    worker_id: str,
+    worker_repository: WorkerRepository,
+    account_repository,
+    receipt_index_repository: ReceiptIndexRepository,
+    eligibility_thresholds,
+    vouch_repository,
+    audit_repository: AuditRepository,
+) -> None:
+    """Auto-promote T1→T2 when both gates are satisfied after receipt issuance.
+
+    Called from the result-submission path after receipts are issued. No-op
+    when any prerequisite is missing (no account binding, already T2+, gates
+    not met). Logs an audit entry with actor_class=SYSTEM.
+    """
+    if account_repository is None or eligibility_thresholds is None:
+        return
+
+    worker = worker_repository.get_by_id(worker_id)
+    if worker is None or worker.account_id is None:
+        return
+
+    account = account_repository.get_by_id(worker.account_id)
+    if account is None or account.retired_at or account.suspended_at:
+        return
+    if account.trust_tier != int(TrustTier.T1_AUTHENTICATED):
+        return
+
+    from auspexai_platform.eligibility import compute_t2_eligibility
+
+    active_vouches = []
+    if vouch_repository is not None:
+        active_vouches = vouch_repository.list_for_target(worker.account_id)
+
+    entries = receipt_index_repository.list_for_account(worker.account_id)
+    distinct_experiments = len({e.experiment_id for e in entries})
+
+    elig = compute_t2_eligibility(
+        receipt_count=len(entries),
+        distinct_experiments=distinct_experiments,
+        thresholds=eligibility_thresholds,
+        account=account,
+        active_vouches=active_vouches,
+    )
+
+    if not elig.ready_for_human_review:
+        return
+
+    try:
+        account_repository.promote(worker.account_id, target_tier=TrustTier.T2_TRUSTED)
+        worker_repository.update_tier_for_account(
+            worker.account_id, trust_tier=TrustTier.T2_TRUSTED
+        )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "auto-promote failed for account %s", worker.account_id
+        )
+        return
+
+    audit_repository.append(
+        actor_class=CredentialClass.SYSTEM,
+        action="account.auto_promote",
+        resource_type="account",
+        resource_id=worker.account_id,
+        payload={
+            "old_tier": int(TrustTier.T1_AUTHENTICATED),
+            "new_tier": int(TrustTier.T2_TRUSTED),
+            "trigger": "receipt_threshold_and_identity_gate_satisfied",
+            "receipt_count": len(entries),
+            "distinct_experiments": distinct_experiments,
+            "identity_gate_method": elig.identity_gate.method,
+        },
     )
