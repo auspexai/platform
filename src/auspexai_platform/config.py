@@ -78,6 +78,15 @@ class Config:
         return self.state_dir / "jobs"
 
     @property
+    def cors_allowed_origins(self) -> list[str]:
+        """CORS allowed origins. Read from ``CORS_ALLOWED_ORIGINS`` env var
+        (comma-separated). Defaults to ``["https://auspexai.network"]``."""
+        raw = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+        if raw.strip():
+            return [o.strip() for o in raw.split(",") if o.strip()]
+        return ["https://auspexai.network"]
+
+    @property
     def receipt_signing_key_path(self) -> Path:
         """Persistent Ed25519 receipt-signing key (M7b).
 

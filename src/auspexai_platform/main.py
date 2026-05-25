@@ -22,10 +22,12 @@ from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from starlette.middleware.cors import CORSMiddleware
 
 from auspexai_platform import __version__
 from auspexai_platform.api import accounts as account_routes
 from auspexai_platform.api import assignments as assignment_routes
+from auspexai_platform.api import audit as audit_routes
 from auspexai_platform.api import auth as auth_routes
 from auspexai_platform.api import experiments as experiment_routes
 from auspexai_platform.api import health
@@ -101,6 +103,7 @@ def create_app(
     retired_key_repository = RetiredKeyRepository(db)
     receipt_index_repository = ReceiptIndexRepository(db)
     from auspexai_platform.db.repositories.vouches import VouchRepository
+
     vouch_repository = VouchRepository(db)
     per_job_factory = PerJobDatabaseFactory(config.jobs_dir)
 
@@ -132,6 +135,19 @@ def create_app(
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+    )
+
+    # CORS — allow the operator console and any env-configured origins.
+    cors_origins = (
+        config.cors_allowed_origins
+        if hasattr(config, "cors_allowed_origins")
+        else ["https://auspexai.network"]
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type"],
     )
 
     # Per-IP rate limits on anonymous-public endpoints. Decorators are
@@ -245,6 +261,11 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["receipts"],
+    )
+    app.include_router(
+        audit_routes.build_router(credential_dep, audit_repository),
+        prefix="/api/v0",
+        tags=["audit"],
     )
 
     _install_root_and_docs(app, credential_dep)

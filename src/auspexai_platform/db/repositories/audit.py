@@ -74,6 +74,53 @@ class AuditRepository:
             payload=payload,
         )
 
+    def list(
+        self,
+        *,
+        action: str | None = None,
+        actor_class: str | None = None,
+        resource_type: str | None = None,
+        since: str | None = None,
+        limit: int = 50,
+    ) -> tuple[list[AuditEntry], int]:
+        """Return filtered audit entries, most recent first.
+
+        Returns a (entries, total) tuple where *total* is the count of rows
+        matching the filters (before LIMIT) and *entries* is the capped
+        result set ordered by id DESC.
+        """
+        limit = max(1, min(limit, 500))
+
+        clauses: list[str] = []
+        params: list[str | int] = []
+
+        if action is not None:
+            clauses.append("action = ?")
+            params.append(action)
+        if actor_class is not None:
+            clauses.append("actor_class = ?")
+            params.append(actor_class)
+        if resource_type is not None:
+            clauses.append("resource_type = ?")
+            params.append(resource_type)
+        if since is not None:
+            clauses.append("occurred_at > ?")
+            params.append(since)
+
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        count_rows = self.db.execute(
+            f"SELECT COUNT(*) AS cnt FROM audit_log{where}",
+            tuple(params),
+        )
+        total = count_rows[0]["cnt"]
+
+        rows = self.db.execute(
+            f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?",
+            (*params, limit),
+        )
+        return [self._row_to_entry(r) for r in rows], total
+
     def latest(self, *, limit: int = 50) -> list[AuditEntry]:
         """Return the most recent audit entries. M8 replaces this with a
         proper filterable list endpoint; v0 keeps it just for test + debug
