@@ -17,7 +17,7 @@ Composition order (one section per M-milestone):
 
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from slowapi import _rate_limit_exceeded_handler
@@ -36,8 +36,7 @@ from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.api import work_units as work_unit_routes
 from auspexai_platform.api import workers as worker_routes
 from auspexai_platform.auth.bearer import TokenStore
-from auspexai_platform.auth.credential import Credential
-from auspexai_platform.auth.dependency import make_credential_dependency, require_maintainer
+from auspexai_platform.auth.dependency import make_credential_dependency
 from auspexai_platform.auth.resolver import CredentialResolver
 from auspexai_platform.auth.tenant_registry import TenantRegistry
 from auspexai_platform.auth.worker_registry import WorkerRegistry
@@ -311,7 +310,7 @@ _ROOT_HTML = f"""<!doctype html>
   <code class="endpoint"><a href="/api/v0/health/public">GET /api/v0/health/public</a></code>
   <code class="endpoint">POST /api/v0/receipts/verify — <a href="https://auspexai.network/verify.html">web verifier</a></code>
   <code class="endpoint"><a href="/api/v0/receipts/">GET /api/v0/receipts/{{receipt_id}}</a></code>
-  <p>Maintainer endpoints: <code><a href="/api/v0/audit">GET /api/v0/audit</a></code> · <code><a href="/docs">API docs</a></code> (requires auth)</p>
+  <p>Maintainer endpoints: <code><a href="/api/v0/audit">GET /api/v0/audit</a></code> · API docs: <a href="/docs">Swagger</a> · <a href="/redoc">ReDoc</a></p>
   <p>Signing roster: <a href="https://github.com/auspexai/.github/blob/main/security/AUTHORIZED_SIGNERS.md">AUTHORIZED_SIGNERS.md</a></p>
   <p class="meta">Worker installer: <a href="https://getworker.auspexai.network">getworker.auspexai.network</a> · <a href="https://github.com/auspexai/worker/releases">releases</a> · Operator console: <a href="https://ops.auspexai.network">ops.auspexai.network</a></p>
   <p class="meta">Last updated: 2026-05-25</p>
@@ -351,7 +350,8 @@ def _install_root_and_docs(app: FastAPI, credential_dep) -> None:
                 },
                 "maintainer_endpoints": {
                     "audit": "GET /api/v0/audit",
-                    "docs": "GET /docs (requires auth)",
+                    "docs_swagger": "GET /docs",
+                    "docs_redoc": "GET /redoc",
                 },
                 "receipt_verifier": "https://auspexai.network/verify.html",
                 "github_org": "https://github.com/auspexai",
@@ -364,35 +364,19 @@ def _install_root_and_docs(app: FastAPI, credential_dep) -> None:
             }
         )
 
-    # Old-style `Depends(...)` in default (with B008 noqa) rather than the
-    # Annotated[T, Depends(...)] form, because PEP 563 stringification at
-    # the top of this module makes FastAPI eval the annotation against
-    # module globals — `credential_dep` is a local in this enclosing
-    # function and can't be resolved that way. Matches existing routes
-    # (see api/tenants.py).
-
     @app.get("/openapi.json", include_in_schema=False)
-    async def openapi_authed(
-        credential: Credential = Depends(credential_dep),  # noqa: B008
-    ) -> JSONResponse:
-        require_maintainer(credential)
+    async def openapi_public() -> JSONResponse:
         return JSONResponse(app.openapi())
 
     @app.get("/docs", include_in_schema=False)
-    async def docs_authed(
-        credential: Credential = Depends(credential_dep),  # noqa: B008
-    ) -> HTMLResponse:
-        require_maintainer(credential)
+    async def docs_public() -> HTMLResponse:
         return get_swagger_ui_html(
             openapi_url="/openapi.json",
             title=f"{app.title} — Swagger UI",
         )
 
     @app.get("/redoc", include_in_schema=False)
-    async def redoc_authed(
-        credential: Credential = Depends(credential_dep),  # noqa: B008
-    ) -> HTMLResponse:
-        require_maintainer(credential)
+    async def redoc_public() -> HTMLResponse:
         return get_redoc_html(
             openapi_url="/openapi.json",
             title=f"{app.title} — ReDoc",
