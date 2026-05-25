@@ -309,11 +309,12 @@ _ROOT_HTML = f"""<!doctype html>
   <p>Coordinator daemon for the <a href="https://github.com/auspexai">AuspexAI</a> volunteer compute network. Phase 2 closed-beta.</p>
   <p>Public endpoints:</p>
   <code class="endpoint"><a href="/api/v0/health/public">GET /api/v0/health/public</a></code>
-  <code class="endpoint">POST /api/v0/receipts/verify</code>
+  <code class="endpoint">POST /api/v0/receipts/verify — <a href="https://auspexai.network/verify.html">web verifier</a></code>
   <code class="endpoint"><a href="/api/v0/receipts/">GET /api/v0/receipts/{{receipt_id}}</a></code>
+  <p>Maintainer endpoints: <code><a href="/api/v0/audit">GET /api/v0/audit</a></code> · <code><a href="/docs">API docs</a></code> (requires auth)</p>
   <p>Signing roster: <a href="https://github.com/auspexai/.github/blob/main/security/AUTHORIZED_SIGNERS.md">AUTHORIZED_SIGNERS.md</a></p>
-  <p class="meta">Worker installer: <a href="https://github.com/auspexai/worker/releases">github.com/auspexai/worker/releases</a> · Operator console: <a href="https://ops.auspexai.network">ops.auspexai.network</a></p>
-  <p class="meta">Last updated: 2026-05-24</p>
+  <p class="meta">Worker installer: <a href="https://getworker.auspexai.network">getworker.auspexai.network</a> · <a href="https://github.com/auspexai/worker/releases">releases</a> · Operator console: <a href="https://ops.auspexai.network">ops.auspexai.network</a></p>
+  <p class="meta">Last updated: 2026-05-25</p>
 </body>
 </html>
 """
@@ -342,16 +343,22 @@ def _install_root_and_docs(app: FastAPI, credential_dep) -> None:
                 "name": "AuspexAI Coordinator",
                 "version": __version__,
                 "phase": "Phase 2 closed-beta",
-                "last_updated": "2026-05-24",
+                "last_updated": "2026-05-25",
                 "public_endpoints": {
                     "health": "GET /api/v0/health/public",
                     "receipts_verify": "POST /api/v0/receipts/verify",
                     "receipt_by_id": "GET /api/v0/receipts/{receipt_id}",
                 },
+                "maintainer_endpoints": {
+                    "audit": "GET /api/v0/audit",
+                    "docs": "GET /docs (requires auth)",
+                },
+                "receipt_verifier": "https://auspexai.network/verify.html",
                 "github_org": "https://github.com/auspexai",
                 "authorized_signers": (
                     "https://github.com/auspexai/.github/blob/main/security/AUTHORIZED_SIGNERS.md"
                 ),
+                "worker_install": "https://getworker.auspexai.network",
                 "worker_releases": "https://github.com/auspexai/worker/releases",
                 "operator_console": "https://ops.auspexai.network",
             }
