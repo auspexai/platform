@@ -37,6 +37,11 @@ dev = [
     "pytest-cov>=4.1",
     "pytest-asyncio>=0.24",
     "ruff==0.15.15",  # pinned exactly: unbounded ruff drifts CI red as new rules ship
+    # Pinned for the test env: starlette>=1.2 deprecates httpx in TestClient,
+    # which trips filterwarnings=error during test collection. fastapi 0.115.6
+    # pulls a compatible starlette<0.42. Dependabot will propose bumps.
+    "fastapi==0.115.6",
+    "starlette<0.42",
 ]
 
 [project.scripts]

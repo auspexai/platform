@@ -1,0 +1,12 @@
+# Pre-commit hooks for auspexai-platform.
+# Ruff is pinned to the exact version in pyproject.toml's [dev] extra so local
+# hooks, CI, and Dependabot all move in lockstep (unbounded ruff drifts CI red
+# as new lint rules ship). Bump `rev` together with the pyproject pin — the
+# Dependabot pip update will flag the version change.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format

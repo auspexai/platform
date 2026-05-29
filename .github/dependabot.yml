@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Python dependencies (pyproject.toml at repo root). Grouped so a single PR
+  # bumps the dev toolchain (ruff, pytest, …) instead of one PR per package.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+  # GitHub Actions used by the CI / release workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
