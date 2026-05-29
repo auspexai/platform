@@ -129,6 +129,19 @@ class ReceiptIndexRepository:
         )
         return self._row_to_entry(rows[0]) if rows else None
 
+    def list_for_experiment(self, experiment_id: str) -> list[ReceiptIndexEntry]:
+        """All receipts issued for one experiment, newest first.
+
+        Powers the tenant-scoped researcher view (GET /experiments/{id}/
+        receipts). Callers must enforce tenant ownership of the experiment
+        before exposing these; the entries carry worker identity, which is
+        NOT tenant-visible and must be stripped at the API layer."""
+        rows = self.db.execute(
+            "SELECT * FROM receipt_index WHERE experiment_id = ? ORDER BY issued_at DESC",
+            (experiment_id,),
+        )
+        return [self._row_to_entry(r) for r in rows]
+
     def list_for_pubkey(self, pubkey_hex: str) -> list[ReceiptIndexEntry]:
         """All receipts where the contributing worker had this pubkey.
 

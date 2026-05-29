@@ -50,6 +50,7 @@ from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AccountRepository,
+    ExperimentRepository,
     ReceiptIndexRepository,
     WorkerRepository,
 )
@@ -225,6 +226,7 @@ def build_router(
     per_job_factory: PerJobDatabaseFactory | None = None,
     eligibility_thresholds: EligibilityThresholds | None = None,
     vouch_repository=None,
+    experiment_repository: ExperimentRepository | None = None,
 ) -> APIRouter:
     """Build the receipts router.
 
@@ -323,7 +325,10 @@ def build_router(
             import cbor2 as _cbor2
 
             inner = _cbor2.loads(payload_bytes)
-            if isinstance(inner, dict) and inner.get("_type") == "https://www.in-toto.io/Statement/v1":
+            if (
+                isinstance(inner, dict)
+                and inner.get("_type") == "https://www.in-toto.io/Statement/v1"
+            ):
                 receipt_cbor = inner.get("predicate", b"")
                 if isinstance(receipt_cbor, bytes):
                     receipt = decode_cbor(receipt_cbor)
@@ -486,6 +491,48 @@ def build_router(
 
         entries = receipt_index_repository.list_for_worker(worker_id)
         return ReceiptListResponse(receipts=[_entry_to_summary(e) for e in entries])
+
+    # ---- R-D1(b): tenant-scoped experiment receipts ----------------------
+    #
+    # The researcher dashboard's "My Receipts" view: receipts issued for an
+    # experiment, to the researcher who owns that experiment's tenant. Unlike
+    # the account/worker listings above — where the caller owns the worker
+    # identity and may see their own pubkey — the workers here are OTHER
+    # parties (volunteers), so worker_id + worker_pubkey are stripped. Per the
+    # field-exposure model, Worker.pubkey_hex is operator-only and
+    # Receipt.worker_pubkey is account-scoped, never tenant-scoped; a tenant
+    # sees THAT receipts were issued (count, ids, timestamps) for acknowledgment,
+    # not WHICH volunteers earned them (§ acknowledgment doesn't enumerate
+    # individual workers). researcher_dashboard_design.md §7.
+
+    if experiment_repository is not None:
+
+        @router.get(
+            "/experiments/{experiment_id}/receipts",
+            response_model=ReceiptListResponse,
+            response_model_exclude_none=True,
+        )
+        async def list_experiment_receipts(
+            experiment_id: str,
+            credential: Credential = Depends(credential_dep),  # noqa: B008
+        ) -> ReceiptListResponse:
+            """Researcher-own-tenant + maintainer. Receipts issued for one
+            experiment, with worker identity stripped (tenant-scoped view)."""
+            experiment = experiment_repository.get_by_id(experiment_id)
+            if experiment is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={
+                        "error": {
+                            "code": "experiment_not_found",
+                            "message": f"no experiment with id {experiment_id!r}",
+                        }
+                    },
+                )
+            _require_researcher_own_tenant_or_maintainer(credential, experiment.tenant_id)
+
+            entries = receipt_index_repository.list_for_experiment(experiment_id)
+            return ReceiptListResponse(receipts=[_entry_to_tenant_summary(e) for e in entries])
 
     # ---- M7-tail: GET /workers/{id}/results/{result_id}/canonical-receipt ----
 
@@ -672,6 +719,50 @@ def _entry_to_summary(entry) -> ReceiptSummary:
         worker_id=entry.worker_id,
         worker_pubkey=entry.worker_pubkey,
         issued_at=entry.issued_at,
+    )
+
+
+def _entry_to_tenant_summary(entry) -> ReceiptSummary:
+    """Tenant-facing summary: worker identity (worker_id, worker_pubkey)
+    deliberately omitted — they're account-scoped/operator-only, not
+    tenant-scoped. response_model_exclude_none drops the unset fields."""
+    return ReceiptSummary(
+        receipt_id=entry.receipt_id,
+        experiment_id=entry.experiment_id,
+        issued_at=entry.issued_at,
+    )
+
+
+def _require_researcher_own_tenant_or_maintainer(
+    credential: Credential, experiment_tenant_id: str
+) -> None:
+    """403 unless the credential is a researcher scoped to the experiment's
+    tenant, OR a maintainer. Mirrors the experiment lifecycle authz
+    (researcher-own-tenant-or-maintainer, ratified 2026-05-19)."""
+    if credential.kind == CredentialClass.MAINTAINER:
+        return
+    if (
+        credential.is_researcher()
+        and credential.tenant_id is not None
+        and credential.tenant_id == experiment_tenant_id
+    ):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error": {
+                "code": "researcher_own_tenant_or_maintainer_required",
+                "message": (
+                    "this endpoint requires a researcher credential scoped to "
+                    "the experiment's tenant OR a maintainer credential"
+                ),
+                "details": {
+                    "credential_class": credential.kind.value,
+                    "credential_tenant_id": credential.tenant_id,
+                    "experiment_tenant_id": experiment_tenant_id,
+                },
+            }
+        },
     )
 
 

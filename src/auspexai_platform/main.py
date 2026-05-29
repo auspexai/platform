@@ -262,6 +262,7 @@ def create_app(
             per_job_factory=per_job_factory,
             eligibility_thresholds=eligibility_thresholds,
             vouch_repository=vouch_repository,
+            experiment_repository=experiment_repository,
         ),
         prefix="/api/v0",
         tags=["receipts"],
