@@ -1,6 +1,6 @@
 [project]
 name = "auspexai-platform"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Coordinator daemon and platform infrastructure for the AuspexAI volunteer compute network"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -52,8 +52,13 @@ Homepage = "https://auspexai.network"
 Repository = "https://github.com/auspexai/platform"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+# Version is derived from git tags (hatch-vcs), stamped at build time — there is
+# no hand-maintained version string. See version_provenance.md (V-M1).
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/auspexai_platform"]

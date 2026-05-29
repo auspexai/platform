@@ -8,4 +8,8 @@ companion Documentation/ tree) and §5.18 of the Principles & Scope doc for
 the API contract.
 """
 
-__version__ = "0.0.1"
+from importlib.metadata import version as _v
+
+# Git-derived (hatch-vcs), read from installed package metadata — no
+# hand-maintained string. See version_provenance.md.
+__version__ = _v("auspexai-platform")
