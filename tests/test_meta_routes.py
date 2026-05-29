@@ -1,10 +1,13 @@
-"""Tests for the public root-discovery + maintainer-only docs routes.
+"""Tests for the public root-discovery + API-docs routes.
 
 Added 2026-05-23 when the coord went publicly reachable at
-`coord.auspexai.network`. Bare `/` should return a friendly discovery doc
-(HTML to browsers, JSON to programs); `/docs`, `/redoc`, and `/openapi.json`
-must NOT be enumerable by anonymous visitors (Swagger UI / ReDoc / schema
-all auth-gated to maintainer).
+`coord.auspexai.network`. Bare `/` returns a friendly discovery doc (HTML to
+browsers, JSON to programs). `/docs`, `/redoc`, and `/openapi.json` are
+publicly accessible (made public in `3cf45fa`): the OpenAPI document
+describes the API *shape*, not tenant *data* — tenant-private experiment
+data is row-scoped + field-filtered server-side regardless of who reads the
+schema (researcher_dashboard_design.md §3). They remain accessible to the
+maintainer too.
 """
 
 from __future__ import annotations
@@ -44,20 +47,26 @@ def test_root_returns_html_for_browser_accept_with_quality(client: TestClient) -
     assert response.headers["content-type"].startswith("text/html")
 
 
-def test_openapi_rejects_anonymous(client: TestClient) -> None:
-    """The schema must not be anonymously enumerable on a public coord."""
+def test_openapi_public(client: TestClient) -> None:
+    """The OpenAPI schema is public (3cf45fa): it describes API shape, not
+    tenant data, which is scoped server-side regardless."""
     response = client.get("/openapi.json")
-    assert response.status_code == 403
+    assert response.status_code == 200
+    schema = response.json()
+    assert "paths" in schema
+    assert "/api/v0/health/public" in schema["paths"]
 
 
-def test_docs_rejects_anonymous(client: TestClient) -> None:
+def test_docs_public(client: TestClient) -> None:
     response = client.get("/docs")
-    assert response.status_code == 403
+    assert response.status_code == 200
+    assert "swagger" in response.text.lower()
 
 
-def test_redoc_rejects_anonymous(client: TestClient) -> None:
+def test_redoc_public(client: TestClient) -> None:
     response = client.get("/redoc")
-    assert response.status_code == 403
+    assert response.status_code == 200
+    assert "redoc" in response.text.lower()
 
 
 def test_openapi_returns_schema_for_maintainer(client: TestClient, maintainer_token: str) -> None:
