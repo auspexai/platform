@@ -354,9 +354,17 @@ def build_router(
                     status_code=422,
                     detail=f"invalid integrity_policy: {integrity_policy!r}; "
                     f"must be one of: standard, high, trusted",
-                )
+                ) from None
             experiment_repository.set_integrity_policy(experiment_id, policy)
-        if any(v is not None for v in [max_unit_duration_seconds, max_units, max_concurrent_assignments, max_payload_bytes]):
+        if any(
+            v is not None
+            for v in [
+                max_unit_duration_seconds,
+                max_units,
+                max_concurrent_assignments,
+                max_payload_bytes,
+            ]
+        ):
             experiment_repository.set_resource_bounds(
                 experiment_id,
                 max_unit_duration_seconds=max_unit_duration_seconds,

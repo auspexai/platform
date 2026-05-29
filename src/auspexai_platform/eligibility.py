@@ -157,9 +157,7 @@ def compute_t2_eligibility(
         identity_check_pending=account is None or account.identity_verified_at is None,
         vouching_pending=not bool(active_vouches),
         identity_gate=identity_gate,
-        ready_for_human_review=(
-            receipt_met and distinct_met and identity_gate.satisfied
-        ),
+        ready_for_human_review=(receipt_met and distinct_met and identity_gate.satisfied),
     )
 
 

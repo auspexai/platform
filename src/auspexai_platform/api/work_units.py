@@ -338,9 +338,7 @@ def build_router(
                     },
                 )
 
-        replication_target = INTEGRITY_POLICY_REPLICATION.get(
-            experiment.integrity_policy, 3
-        )
+        replication_target = INTEGRITY_POLICY_REPLICATION.get(experiment.integrity_policy, 3)
 
         per_job_db = per_job_factory.get_or_create(experiment_id)
         repo = WorkUnitRepository(per_job_db)

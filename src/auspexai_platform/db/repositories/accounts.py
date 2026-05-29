@@ -362,9 +362,7 @@ class AccountRepository:
             ),
             identity_verification_note=row["identity_verification_note"],
             suspended_at=(
-                datetime.fromisoformat(row["suspended_at"])
-                if row["suspended_at"]
-                else None
+                datetime.fromisoformat(row["suspended_at"]) if row["suspended_at"] else None
             ),
         )
 

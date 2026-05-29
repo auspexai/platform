@@ -262,8 +262,12 @@ def build_router(
                     "created_at": a.created_at.isoformat(),
                     "retired_at": a.retired_at.isoformat() if a.retired_at else None,
                     "suspended_at": a.suspended_at.isoformat() if a.suspended_at else None,
-                    "identity_verified_at": a.identity_verified_at.isoformat() if a.identity_verified_at else None,
-                    "identity_verification_method": a.identity_verification_method.value if a.identity_verification_method else None,
+                    "identity_verified_at": a.identity_verified_at.isoformat()
+                    if a.identity_verified_at
+                    else None,
+                    "identity_verification_method": a.identity_verification_method.value
+                    if a.identity_verification_method
+                    else None,
                 }
                 for a in accounts
             ]
@@ -299,8 +303,7 @@ def build_router(
             )
 
         has_quarantined = any(
-            w.quarantined_at is not None
-            for w in worker_repository.list_for_account(account_id)
+            w.quarantined_at is not None for w in worker_repository.list_for_account(account_id)
         )
         if has_quarantined:
             raise HTTPException(status_code=409, detail="account has quarantined workers")
@@ -309,24 +312,42 @@ def build_router(
         if target == TrustTier.T2_TRUSTED:
             from auspexai_platform.eligibility import compute_t2_eligibility
 
-            active_vouches = vouch_repository.list_for_target(account_id) if vouch_repository else []
+            active_vouches = (
+                vouch_repository.list_for_target(account_id) if vouch_repository else []
+            )
             elig = compute_t2_eligibility(
-                receipt_count=len(receipt_index_repository.list_for_account(account_id)) if receipt_index_repository else 0,
-                distinct_experiments=len({e.experiment_id for e in receipt_index_repository.list_for_account(account_id)}) if receipt_index_repository else 0,
+                receipt_count=len(receipt_index_repository.list_for_account(account_id))
+                if receipt_index_repository
+                else 0,
+                distinct_experiments=len(
+                    {e.experiment_id for e in receipt_index_repository.list_for_account(account_id)}
+                )
+                if receipt_index_repository
+                else 0,
                 thresholds=eligibility_thresholds,
                 account=account,
                 active_vouches=active_vouches,
             )
             if not elig.receipt_threshold_met:
-                gate_warnings.append(f"receipt threshold not met ({elig.actuals['receipts']}/{elig.thresholds['receipts']})")
+                gate_warnings.append(
+                    f"receipt threshold not met ({elig.actuals['receipts']}/{elig.thresholds['receipts']})"
+                )
             if not elig.distinct_experiments_threshold_met:
-                gate_warnings.append(f"distinct experiments threshold not met ({elig.actuals['distinct_experiments']}/{elig.thresholds['distinct_experiments']})")
+                gate_warnings.append(
+                    f"distinct experiments threshold not met ({elig.actuals['distinct_experiments']}/{elig.thresholds['distinct_experiments']})"
+                )
             if not elig.identity_gate.satisfied:
                 gate_warnings.append("identity gate not satisfied (no verification or vouching)")
         elif target == TrustTier.T3_VETTED:
             if account.identity_verified_at is None:
-                gate_warnings.append("identity not formally verified (T3 = personally vetted by Maintainer)")
-            entries = receipt_index_repository.list_for_account(account_id) if receipt_index_repository else []
+                gate_warnings.append(
+                    "identity not formally verified (T3 = personally vetted by Maintainer)"
+                )
+            entries = (
+                receipt_index_repository.list_for_account(account_id)
+                if receipt_index_repository
+                else []
+            )
             if not entries:
                 gate_warnings.append("no receipt history")
 
@@ -341,7 +362,7 @@ def build_router(
         try:
             account = account_repository.promote(account_id, target_tier=target)
         except AccountNotFoundError:
-            raise HTTPException(status_code=404, detail="account not found")
+            raise HTTPException(status_code=404, detail="account not found") from None
 
         affected = worker_repository.update_tier_for_account(account_id, trust_tier=target)
 
@@ -354,7 +375,9 @@ def build_router(
             payload={
                 "old_tier": int(current),
                 "new_tier": int(target),
-                "verification_method": body.verification_method.value if body.verification_method else None,
+                "verification_method": body.verification_method.value
+                if body.verification_method
+                else None,
                 "verification_note": body.verification_note,
                 "affected_worker_ids": affected,
                 "gate_override": bool(gate_warnings),
@@ -399,7 +422,7 @@ def build_router(
         try:
             account = account_repository.demote(account_id, target_tier=target)
         except AccountNotFoundError:
-            raise HTTPException(status_code=404, detail="account not found")
+            raise HTTPException(status_code=404, detail="account not found") from None
 
         affected = worker_repository.update_tier_for_account(account_id, trust_tier=target)
 
@@ -440,7 +463,7 @@ def build_router(
         try:
             account = account_repository.suspend(account_id)
         except AccountNotFoundError:
-            raise HTTPException(status_code=404, detail="account not found")
+            raise HTTPException(status_code=404, detail="account not found") from None
 
         affected = worker_repository.quarantine_for_account(
             account_id, reason=f"account suspended: {body.reason or 'no reason given'}"
@@ -480,7 +503,7 @@ def build_router(
         try:
             account = account_repository.unsuspend(account_id)
         except AccountNotFoundError:
-            raise HTTPException(status_code=404, detail="account not found")
+            raise HTTPException(status_code=404, detail="account not found") from None
 
         affected = worker_repository.unquarantine_for_account(account_id)
 
@@ -515,7 +538,9 @@ def build_router(
         assert vouch_repository is not None
 
         if not credential.is_worker() or credential.account_id is None:
-            raise HTTPException(status_code=403, detail="must be an authenticated worker with account binding")
+            raise HTTPException(
+                status_code=403, detail="must be an authenticated worker with account binding"
+            )
         if credential.trust_tier is None or credential.trust_tier < int(TrustTier.T2_TRUSTED):
             raise HTTPException(status_code=403, detail="voucher must be T2+")
         if credential.account_id == account_id:
@@ -536,7 +561,9 @@ def build_router(
                 rationale=body.rationale,
             )
         except DuplicateVouchError:
-            raise HTTPException(status_code=409, detail="already vouched for this account")
+            raise HTTPException(
+                status_code=409, detail="already vouched for this account"
+            ) from None
 
         audit_repository.append(
             actor_class=CredentialClass.WORKER,
@@ -572,7 +599,9 @@ def build_router(
         assert vouch_repository is not None
 
         if not credential.is_worker() or credential.account_id is None:
-            raise HTTPException(status_code=403, detail="must be an authenticated worker with account binding")
+            raise HTTPException(
+                status_code=403, detail="must be an authenticated worker with account binding"
+            )
 
         from auspexai_platform.db.repositories.vouches import VouchNotFoundError
 
@@ -585,7 +614,7 @@ def build_router(
         try:
             vouch = vouch_repository.revoke(vouch_id)
         except VouchNotFoundError:
-            raise HTTPException(status_code=404, detail="vouch not found")
+            raise HTTPException(status_code=404, detail="vouch not found") from None
 
         audit_repository.append(
             actor_class=CredentialClass.WORKER,

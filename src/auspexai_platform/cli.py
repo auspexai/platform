@@ -182,7 +182,9 @@ def token_issue(state_dir: Path | None, login: str) -> None:
     new_token = store.issue(login=login)
     click.echo(f"Issued token for {login}:")
     click.echo(f"Token: {new_token}")
-    click.echo("Pass via `Authorization: Bearer <token>` — audit trail will attribute actions to this login.")
+    click.echo(
+        "Pass via `Authorization: Bearer <token>` — audit trail will attribute actions to this login."
+    )
 
 
 @token.command("revoke")

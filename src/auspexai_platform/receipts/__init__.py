@@ -37,6 +37,7 @@ field in the wire format — the wire format is immutable per §11 Q20.
 
 from __future__ import annotations
 
+from auspexai_platform.receipts.intoto import unwrap_statement
 from auspexai_platform.receipts.issuance import (
     HASH_AGREEMENT_METHOD,
     AgreementOutcome,
@@ -56,7 +57,6 @@ from auspexai_platform.receipts.repository import (
     ReceiptRecord,
     ReceiptRepository,
 )
-from auspexai_platform.receipts.intoto import unwrap_statement
 from auspexai_platform.receipts.signing import (
     CoseDecodeError,
     CoseVerificationError,
@@ -86,4 +86,5 @@ __all__ = [
     "hash_agreement_reducer",
     "issue_receipts_for_completed_unit",
     "load_or_generate_signing_key",
+    "unwrap_statement",
 ]

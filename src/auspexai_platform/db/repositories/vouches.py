@@ -128,7 +128,5 @@ class VouchRepository:
             target_account_id=row["target_account_id"],
             rationale=row["rationale"],
             created_at=datetime.fromisoformat(row["created_at"]),
-            revoked_at=(
-                datetime.fromisoformat(row["revoked_at"]) if row["revoked_at"] else None
-            ),
+            revoked_at=(datetime.fromisoformat(row["revoked_at"]) if row["revoked_at"] else None),
         )
