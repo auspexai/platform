@@ -53,23 +53,34 @@ from auspexai_platform.exposure import ExposureTag, filter_for_credential
 
 class ExperimentResponse(BaseModel):
     """Wire shape for an experiment. Fields are Optional so the exposure
-    filter can mask non-visible ones."""
+    filter can mask non-visible ones.
 
-    experiment_id: Annotated[str | None, ExposureTag.PUBLIC] = None
-    tenant_id: Annotated[str | None, ExposureTag.PUBLIC] = None
-    status: Annotated[ExperimentStatus | None, ExposureTag.PUBLIC] = None
-    submitted_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
-    started_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
-    completed_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
-    submissions_finalized: Annotated[bool | None, ExposureTag.PUBLIC] = None
-    last_action_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
-    last_action_by_class: Annotated[str | None, ExposureTag.PUBLIC] = None
+    Tenant-private posture (researcher_dashboard_design.md §3): an experiment's
+    operational metadata is visible to its owning tenant and the maintainer
+    only — never anonymously. The maintainer sees everything via the
+    `is_visible` short-circuit; the owning researcher matches TENANT_SCOPED.
+    No field is PUBLIC: experiment rows carry no open-transparency role — that
+    is the receipt/verifier surface's job (the DOI-analogue, §6.8.1). The
+    earlier PUBLIC tags predated the researcher credential class hitting a
+    *list* endpoint, which would have leaked every tenant's experiment
+    existence, ids, status and timeline to anonymous callers.
+    """
+
+    experiment_id: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
+    tenant_id: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
+    status: Annotated[ExperimentStatus | None, ExposureTag.TENANT_SCOPED] = None
+    submitted_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
+    started_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
+    completed_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
+    submissions_finalized: Annotated[bool | None, ExposureTag.TENANT_SCOPED] = None
+    last_action_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
+    last_action_by_class: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
     tenant_experiment_label: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
     manifest_hash: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
     revision: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     error_summary: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
-    integrity_policy: Annotated[str | None, ExposureTag.PUBLIC] = None
-    max_unit_duration_seconds: Annotated[int | None, ExposureTag.PUBLIC] = None
+    integrity_policy: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
+    max_unit_duration_seconds: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     max_units: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     max_concurrent_assignments: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     max_payload_bytes: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
@@ -149,6 +160,29 @@ def _check_action_authz(credential: Credential, experiment, *, allow_researcher:
                 "code": "experiment_action_forbidden",
                 "message": "this credential is not authorized to perform this action",
                 "details": {"experiment_id": experiment.experiment_id},
+            }
+        },
+    )
+
+
+def _can_view(credential: Credential, experiment) -> bool:
+    """True if this credential may view the experiment: maintainer (all) or the
+    owning-tenant researcher. Tenant-private — no anonymous/cross-tenant view."""
+    if credential.is_maintainer():
+        return True
+    return credential.is_researcher() and credential.tenant_id == experiment.tenant_id
+
+
+def _experiment_not_found(experiment_id: str) -> HTTPException:
+    """The 404 used for both genuinely-absent and not-visible-to-you
+    experiments, so a non-owner cannot distinguish existence (§3)."""
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "error": {
+                "code": "experiment_not_found",
+                "message": f"no experiment with id {experiment_id!r}",
+                "details": {"experiment_id": experiment_id},
             }
         },
     )
@@ -291,7 +325,17 @@ def build_router(
     async def list_experiments(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ExperimentListResponse:
-        experiments = experiment_repository.list_all()
+        # Tenant-private row scoping (§3): maintainer sees the whole fleet; a
+        # researcher sees only their own tenant's rows; anyone else (anonymous,
+        # worker) sees none. Field-level filtering still applies on top, but the
+        # row scope is what stops cross-tenant existence/count leaking through a
+        # list endpoint.
+        if credential.is_maintainer():
+            experiments = experiment_repository.list_all()
+        elif credential.is_researcher() and credential.tenant_id is not None:
+            experiments = experiment_repository.list_all(tenant_id=credential.tenant_id)
+        else:
+            experiments = []
         filtered = [
             filter_for_credential(
                 _to_response(e),
@@ -312,17 +356,11 @@ def build_router(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ExperimentResponse:
         experiment = experiment_repository.get_by_id(experiment_id)
-        if experiment is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "error": {
-                        "code": "experiment_not_found",
-                        "message": f"no experiment with id {experiment_id!r}",
-                        "details": {"experiment_id": experiment_id},
-                    }
-                },
-            )
+        # Tenant-private (§3): a non-owning researcher / anonymous caller gets
+        # the same 404 as a genuinely-absent experiment, so detail never
+        # confirms an experiment id exists.
+        if experiment is None or not _can_view(credential, experiment):
+            raise _experiment_not_found(experiment_id)
         return filter_for_credential(
             _to_response(experiment),
             credential,

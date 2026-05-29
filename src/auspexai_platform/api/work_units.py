@@ -123,21 +123,21 @@ def _load_experiment_or_404(
 
 
 def _check_view_authz(credential: Credential, experiment) -> None:
-    """403 if credential can't view this experiment's work units."""
+    """Tenant-private (researcher_dashboard_design.md §3): a non-owning
+    researcher / anonymous caller gets the same `experiment_not_found` 404 as a
+    genuinely-absent experiment, so work-units never confirm an experiment id
+    exists. Maintainer sees all; owning-tenant researcher sees its own."""
     if credential.is_maintainer():
         return
     if credential.is_researcher() and credential.tenant_id == experiment.tenant_id:
         return
     raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
+        status_code=status.HTTP_404_NOT_FOUND,
         detail={
             "error": {
-                "code": "work_units_view_forbidden",
-                "message": "this credential is not authorized to view this experiment's work units",
-                "details": {
-                    "experiment_id": experiment.experiment_id,
-                    "credential_class": credential.kind.value,
-                },
+                "code": "experiment_not_found",
+                "message": f"no experiment with id {experiment.experiment_id!r}",
+                "details": {"experiment_id": experiment.experiment_id},
             }
         },
     )

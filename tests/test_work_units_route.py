@@ -396,6 +396,8 @@ def test_list_rejects_other_tenant_researcher(
     approved_experiment,
     tenant_registry,
 ) -> None:
+    """Tenant-private (§3): a non-owning researcher gets the same 404 as a
+    missing experiment, so work-units never confirm an experiment id exists."""
     _, _, experiment, _ = approved_experiment
     other_priv = Ed25519PrivateKey.generate()
     other_pub = other_priv.public_key().public_bytes_raw().hex()
@@ -406,8 +408,8 @@ def test_list_rejects_other_tenant_researcher(
         pubkey_hex=other_pub,
         path=f"/api/v0/experiments/{experiment.experiment_id}/work-units",
     )
-    assert response.status_code == 403
-    assert response.json()["detail"]["error"]["code"] == "work_units_view_forbidden"
+    assert response.status_code == 404
+    assert response.json()["detail"]["error"]["code"] == "experiment_not_found"
 
 
 # ---- GET detail ---------------------------------------------------------

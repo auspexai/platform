@@ -188,19 +188,13 @@ def submitted_experiment(
     return privkey, binding, response.json()["experiment_id"]
 
 
-def test_list_anonymous_sees_public_fields_only(client: TestClient, submitted_experiment) -> None:
+def test_list_anonymous_sees_nothing(client: TestClient, submitted_experiment) -> None:
+    """Tenant-private (§3): an anonymous caller gets NO experiment rows — not
+    field-filtered ones. The list endpoint must not leak the existence, count,
+    or any field of experiments to non-owners."""
     response = client.get("/api/v0/experiments")
     assert response.status_code == 200
-    items = response.json()["experiments"]
-    assert len(items) == 1
-    item = items[0]
-    assert item["experiment_id"]
-    assert item["tenant_id"]
-    assert item["status"] == "submitted"
-    # tenant-scoped fields hidden from anonymous.
-    assert "tenant_experiment_label" not in item
-    assert "manifest_hash" not in item
-    assert "error_summary" not in item
+    assert response.json().get("experiments") in (None, [])
 
 
 def test_list_maintainer_sees_everything(
@@ -233,6 +227,100 @@ def test_list_researcher_sees_own_tenant_full(client: TestClient, submitted_expe
     assert item["manifest_hash"]
 
 
+# ---- tenant-private row scoping (R-D2-pre) ----------------------------------
+
+
+def _list_as_researcher(client: TestClient, privkey, pubkey_hex: str) -> list[dict]:
+    sig_headers = sign_request(
+        privkey=privkey,
+        pubkey_hex=pubkey_hex,
+        method="GET",
+        path="/api/v0/experiments",
+        authority="testserver",
+        body=b"",
+    )
+    response = client.get("/api/v0/experiments", headers=sig_headers)
+    assert response.status_code == 200, response.text
+    return response.json().get("experiments") or []
+
+
+def _register_and_submit(
+    client: TestClient, maintainer_token: str, tenant_id: str, label: str
+) -> tuple[Ed25519PrivateKey, str, str]:
+    """Register a fresh tenant and submit one experiment for it.
+    Returns (privkey, pubkey_hex, experiment_id)."""
+    priv = Ed25519PrivateKey.generate()
+    pub = priv.public_key().public_bytes_raw().hex()
+    reg = client.post(
+        "/api/v0/tenants",
+        headers={"Authorization": f"Bearer {maintainer_token}"},
+        json={"tenant_id": tenant_id, "maintainer_pubkey": pub},
+    )
+    assert reg.status_code in (200, 201), reg.text
+    sub = _submit_as_researcher(client, priv, pub, _manifest(tenant_id, label))
+    assert sub.status_code == 201, sub.text
+    return priv, pub, sub.json()["experiment_id"]
+
+
+class TestTenantPrivateScoping:
+    """GET /experiments is tenant-private: a researcher sees only their own
+    tenant's rows; cross-tenant detail returns 404 (no existence leak)."""
+
+    def test_researcher_list_excludes_other_tenants(
+        self, client: TestClient, submitted_experiment, maintainer_token: str
+    ) -> None:
+        a_priv, a_binding, a_exp_id = submitted_experiment  # tenant synth-doubler
+        _b_priv, _b_pub, b_exp_id = _register_and_submit(
+            client, maintainer_token, "tenant-b", "b-1"
+        )
+        a_ids = {
+            e["experiment_id"] for e in _list_as_researcher(client, a_priv, a_binding.pubkey_hex)
+        }
+        assert a_ids == {a_exp_id}
+        assert b_exp_id not in a_ids
+
+    def test_each_researcher_sees_only_own(
+        self, client: TestClient, submitted_experiment, maintainer_token: str
+    ) -> None:
+        _a_priv, _a_binding, a_exp_id = submitted_experiment
+        b_priv, b_pub, b_exp_id = _register_and_submit(client, maintainer_token, "tenant-b", "b-1")
+        b_ids = {e["experiment_id"] for e in _list_as_researcher(client, b_priv, b_pub)}
+        assert b_ids == {b_exp_id}
+        assert a_exp_id not in b_ids
+
+    def test_researcher_cannot_get_other_tenant_detail(
+        self, client: TestClient, submitted_experiment, maintainer_token: str
+    ) -> None:
+        _a_priv, _a_binding, a_exp_id = submitted_experiment
+        b_priv, b_pub, _b_exp_id = _register_and_submit(client, maintainer_token, "tenant-b", "b-1")
+        sig_headers = sign_request(
+            privkey=b_priv,
+            pubkey_hex=b_pub,
+            method="GET",
+            path=f"/api/v0/experiments/{a_exp_id}",
+            authority="testserver",
+            body=b"",
+        )
+        response = client.get(f"/api/v0/experiments/{a_exp_id}", headers=sig_headers)
+        assert response.status_code == 404
+        assert response.json()["detail"]["error"]["code"] == "experiment_not_found"
+
+    def test_maintainer_list_sees_all_tenants(
+        self, client: TestClient, submitted_experiment, maintainer_token: str
+    ) -> None:
+        _a_priv, _a_binding, a_exp_id = submitted_experiment
+        _b_priv, _b_pub, b_exp_id = _register_and_submit(
+            client, maintainer_token, "tenant-b", "b-1"
+        )
+        response = client.get(
+            "/api/v0/experiments",
+            headers={"Authorization": f"Bearer {maintainer_token}"},
+        )
+        assert response.status_code == 200
+        ids = {e["experiment_id"] for e in response.json()["experiments"]}
+        assert {a_exp_id, b_exp_id} <= ids
+
+
 # ---- GET /experiments/{id} — detail ----------------------------------------
 
 
@@ -241,14 +329,31 @@ def test_get_experiment_404_when_absent(client: TestClient) -> None:
     assert response.status_code == 404
 
 
-def test_get_experiment_returns_filtered_detail(client: TestClient, submitted_experiment) -> None:
+def test_get_experiment_anonymous_404(client: TestClient, submitted_experiment) -> None:
+    """Tenant-private (§3): a non-owner (here anonymous) gets the SAME 404 as a
+    missing experiment, so detail never confirms an id exists."""
     _, _, experiment_id = submitted_experiment
     response = client.get(f"/api/v0/experiments/{experiment_id}")
+    assert response.status_code == 404
+    assert response.json()["detail"]["error"]["code"] == "experiment_not_found"
+
+
+def test_get_experiment_owner_sees_full_detail(client: TestClient, submitted_experiment) -> None:
+    privkey, binding, experiment_id = submitted_experiment
+    sig_headers = sign_request(
+        privkey=privkey,
+        pubkey_hex=binding.pubkey_hex,
+        method="GET",
+        path=f"/api/v0/experiments/{experiment_id}",
+        authority="testserver",
+        body=b"",
+    )
+    response = client.get(f"/api/v0/experiments/{experiment_id}", headers=sig_headers)
     assert response.status_code == 200
     body = response.json()
     assert body["experiment_id"] == experiment_id
-    # Anonymous-filtered.
-    assert "manifest_hash" not in body
+    assert body["tenant_experiment_label"]
+    assert body["manifest_hash"]
 
 
 # ---- POST /actions/approve — operator only ---------------------------------
