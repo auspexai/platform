@@ -182,7 +182,11 @@ def create_app(
     app.include_router(auth_routes.build_router(credential_dep), prefix="/api/v0", tags=["auth"])
     app.include_router(
         tenant_routes.build_router(
-            credential_dep, tenant_repository, audit_repository, account_repository
+            credential_dep,
+            tenant_repository,
+            audit_repository,
+            account_repository,
+            worker_repository,
         ),
         prefix="/api/v0",
         tags=["tenants"],
