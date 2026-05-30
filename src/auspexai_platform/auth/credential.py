@@ -41,7 +41,8 @@ class Credential:
     `kind` chooses which exposure tags are visible. Scope fields populated
     per credential class:
 
-      - researcher: tenant_id + pubkey_hex
+      - researcher: tenant_id + pubkey_hex; account_id is set iff the tenant
+        is linked to an account (b-lite)
       - worker: worker_id + pubkey_hex; account_id is set iff the worker has
         upgraded from T0 to T1+ by binding to an account; trust_tier is the
         worker's current tier
@@ -65,11 +66,14 @@ class Credential:
         return cls(kind=CredentialClass.MAINTAINER, maintainer_login=maintainer_login)
 
     @classmethod
-    def researcher(cls, tenant_id: str, pubkey_hex: str) -> Credential:
+    def researcher(
+        cls, tenant_id: str, pubkey_hex: str, account_id: str | None = None
+    ) -> Credential:
         return cls(
             kind=CredentialClass.RESEARCHER,
             tenant_id=tenant_id,
             pubkey_hex=pubkey_hex,
+            account_id=account_id,
         )
 
     @classmethod

@@ -107,6 +107,9 @@ class Tenant(BaseModel):
     contact_email: str | None = None
     contact_public: str | None = None
     description: str | None = None
+    # b-lite: operator-set link to an OAuth account (NULL = not linked yet).
+    # Reserved now; the OAuth-onboarding path that writes it lands in Phase 2.
+    account_id: str | None = None
     registered_at: datetime
     revision: int = 1
 

@@ -80,12 +80,17 @@ def is_visible(
         )
 
     if tag is ExposureTag.ACCOUNT_SCOPED:
-        # Phase 2-3: T1+ account credential will pass this check when
-        # credential.account_id (added later) matches resource_account_id.
-        # Phase 1 has no account credential class, so only maintainer sees
-        # these — which is consistent with "everyone except the operator and
-        # the account itself" semantics.
-        return False
+        # b-lite: visible to a credential that proves membership of the account
+        # owning the resource. A researcher credential carries account_id once
+        # its tenant is linked (tenants.account_id); a worker credential carries
+        # it once account-bound. Either passes when the ids match. Credentials
+        # with no linked account (account_id is None) see nothing here — only
+        # the maintainer (short-circuited above) does.
+        return (
+            credential.account_id is not None
+            and resource_account_id is not None
+            and credential.account_id == resource_account_id
+        )
 
     if tag is ExposureTag.OPERATOR_ONLY:
         return False

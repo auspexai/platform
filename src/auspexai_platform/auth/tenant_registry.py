@@ -40,6 +40,7 @@ class TenantBinding:
 
     tenant_id: str
     pubkey_hex: str  # lowercase, 64 hex chars (32-byte Ed25519 pubkey)
+    account_id: str | None = None  # b-lite: linked OAuth account, or None
 
 
 class TenantRegistry:
@@ -73,7 +74,11 @@ class TenantRegistry:
         tenant = self._repo.get_by_pubkey(pubkey_hex)
         if tenant is None:
             return None
-        return TenantBinding(tenant_id=tenant.tenant_id, pubkey_hex=tenant.maintainer_pubkey)
+        return TenantBinding(
+            tenant_id=tenant.tenant_id,
+            pubkey_hex=tenant.maintainer_pubkey,
+            account_id=tenant.account_id,
+        )
 
     def unregister(self, pubkey_hex: str) -> bool:
         tenant = self._repo.get_by_pubkey(pubkey_hex)
