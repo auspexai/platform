@@ -83,6 +83,21 @@ class ResultRepository:
         )
         return [self._row_to_result(r) for r in rows]
 
+    def count_distinct_workers(self) -> int:
+        """Number of distinct workers that have submitted >=1 result.
+
+        Integer only — backs the anonymized active-contributor count; never
+        exposes *which* workers (volunteer-anonymity rule)."""
+        rows = self.db.execute("SELECT COUNT(DISTINCT worker_id) AS n FROM results")
+        return int(rows[0]["n"]) if rows else 0
+
+    def latest_received_at(self) -> datetime | None:
+        """Most recent result `received_at` across the experiment, or None if no
+        results have been submitted yet."""
+        rows = self.db.execute("SELECT MAX(received_at) AS latest FROM results")
+        latest = rows[0]["latest"] if rows else None
+        return datetime.fromisoformat(latest) if latest else None
+
     # ---- helpers ----
 
     @staticmethod

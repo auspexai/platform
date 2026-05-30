@@ -137,6 +137,17 @@ class WorkUnitRepository:
         rows = self.db.execute("SELECT status, COUNT(*) AS n FROM work_units GROUP BY status")
         return {r["status"]: r["n"] for r in rows}
 
+    def replication_totals(self) -> tuple[int, int]:
+        """Return (completions_total, replication_target_total) summed across all
+        work units — the experiment's replication fill."""
+        rows = self.db.execute(
+            "SELECT COALESCE(SUM(completions_so_far), 0) AS compl, "
+            "COALESCE(SUM(replication_target), 0) AS target FROM work_units"
+        )
+        if not rows:
+            return (0, 0)
+        return (int(rows[0]["compl"]), int(rows[0]["target"]))
+
     # ---- helpers ----
 
     @staticmethod

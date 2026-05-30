@@ -26,6 +26,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from auspexai_platform import __version__
 from auspexai_platform.api import accounts as account_routes
+from auspexai_platform.api import activity as activity_routes
 from auspexai_platform.api import assignments as assignment_routes
 from auspexai_platform.api import audit as audit_routes
 from auspexai_platform.api import auth as auth_routes
@@ -234,6 +235,15 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["work-units"],
+    )
+    app.include_router(
+        activity_routes.build_router(
+            credential_dep=credential_dep,
+            experiment_repository=experiment_repository,
+            per_job_factory=per_job_factory,
+        ),
+        prefix="/api/v0",
+        tags=["activity"],
     )
     app.include_router(
         assignment_routes.build_router(
