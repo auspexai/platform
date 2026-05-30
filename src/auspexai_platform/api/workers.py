@@ -25,9 +25,12 @@ worker-self-or-maintainer check at route time rather than introducing a
 new exposure tag — the filter machinery is generic enough that this works
 cleanly. Future Phase 2 work may add an explicit WORKER_SCOPED tag if the
 self-or-maintainer pattern needs reuse.
-"""
 
-from __future__ import annotations
+NOTE: no `from __future__ import annotations` here — the enroll route uses
+slowapi's `@limiter.limit`, whose wrapper globals break stringized-annotation
+resolution for the `body:` param (FastAPI mis-classifies it as Query → 422).
+See the CI-red postmortem 2026-05-30 and the matching note in api/accounts.py.
+"""
 
 import secrets
 from datetime import datetime
