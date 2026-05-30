@@ -243,6 +243,8 @@ def create_app(
             credential_dep=credential_dep,
             experiment_repository=experiment_repository,
             per_job_factory=per_job_factory,
+            tenant_repository=tenant_repository,
+            worker_repository=worker_repository,
         ),
         prefix="/api/v0",
         tags=["activity"],
