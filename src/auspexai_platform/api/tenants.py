@@ -22,7 +22,11 @@ from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.dependency import require_maintainer
-from auspexai_platform.db.repositories import AuditRepository, TenantRepository
+from auspexai_platform.db.repositories import (
+    AccountRepository,
+    AuditRepository,
+    TenantRepository,
+)
 from auspexai_platform.db.repositories.tenants import DuplicateTenantError
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 
@@ -61,6 +65,9 @@ class TenantCreateRequest(BaseModel):
     contact_email: str | None = None
     contact_public: str | None = None
     description: str | None = None
+    # b-lite: optional operator-set link to an existing OAuth account. Validated
+    # for existence in the route; None leaves the tenant unlinked.
+    account_id: str | None = None
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -87,6 +94,7 @@ def build_router(
     credential_dep,
     tenant_repository: TenantRepository,
     audit_repository: AuditRepository,
+    account_repository: AccountRepository,
 ) -> APIRouter:
     """Build /tenants router bound to repository instances + the
     credential dependency."""
@@ -104,6 +112,17 @@ def build_router(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> TenantResponse:
         require_maintainer(credential)
+        if body.account_id is not None and account_repository.get_by_id(body.account_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": {
+                        "code": "unknown_account",
+                        "message": f"no account with id {body.account_id!r}",
+                        "details": {"account_id": body.account_id},
+                    }
+                },
+            )
         try:
             tenant = tenant_repository.register(
                 tenant_id=body.tenant_id,
@@ -112,6 +131,7 @@ def build_router(
                 contact_email=body.contact_email,
                 contact_public=body.contact_public,
                 description=body.description,
+                account_id=body.account_id,
             )
         except DuplicateTenantError as e:
             raise HTTPException(
@@ -133,6 +153,7 @@ def build_router(
             payload={
                 "maintainer_pubkey": tenant.maintainer_pubkey,
                 "display_name": tenant.display_name,
+                "account_id": tenant.account_id,
             },
         )
 

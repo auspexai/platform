@@ -181,7 +181,9 @@ def create_app(
     app.include_router(health.build_router(credential_dep), prefix="/api/v0", tags=["system"])
     app.include_router(auth_routes.build_router(credential_dep), prefix="/api/v0", tags=["auth"])
     app.include_router(
-        tenant_routes.build_router(credential_dep, tenant_repository, audit_repository),
+        tenant_routes.build_router(
+            credential_dep, tenant_repository, audit_repository, account_repository
+        ),
         prefix="/api/v0",
         tags=["tenants"],
     )

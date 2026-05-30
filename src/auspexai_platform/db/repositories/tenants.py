@@ -37,6 +37,7 @@ class TenantRepository:
         contact_email: str | None = None,
         contact_public: str | None = None,
         description: str | None = None,
+        account_id: str | None = None,
     ) -> Tenant:
         """Insert a tenant. Raises DuplicateTenantError on PK or unique-pubkey conflict."""
         maintainer_pubkey = maintainer_pubkey.lower()
@@ -47,8 +48,8 @@ class TenantRepository:
                 INSERT INTO tenants (
                     tenant_id, maintainer_pubkey, display_name,
                     contact_email, contact_public, description,
-                    registered_at, revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                    account_id, registered_at, revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     tenant_id,
@@ -57,6 +58,7 @@ class TenantRepository:
                     contact_email,
                     contact_public,
                     description,
+                    account_id,
                     registered_at,
                 ),
             )
@@ -104,6 +106,7 @@ class TenantRepository:
             contact_email=row["contact_email"],
             contact_public=row["contact_public"],
             description=row["description"],
+            account_id=row["account_id"],
             registered_at=datetime.fromisoformat(row["registered_at"]),
             revision=row["revision"],
         )

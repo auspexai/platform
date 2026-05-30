@@ -41,6 +41,7 @@ class CredentialResolver:
             return Credential.researcher(
                 tenant_id=tenant.tenant_id,
                 pubkey_hex=pubkey_hex,
+                account_id=tenant.account_id,
             )
         worker = self._workers.get_worker_for_pubkey(pubkey_hex)
         if worker is not None:
