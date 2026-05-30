@@ -6,10 +6,17 @@ the researcher dashboard. Returns a distinct active-contributor *count* (no
 worker identities), the work-unit status breakdown, the latest-activity
 timestamp, and replication fill.
 
-Worker identity is never surfaced here: third-party volunteers stay
-aggregate-only per the volunteer-anonymity rule (principles §5.9 / §11), and
-own-account non-anonymized enrichment is a later step that needs the §8.2
-account linkage. Every field is an aggregate count or a timestamp.
+Worker identity is anonymized by default: third-party volunteers stay
+aggregate-only per the volunteer-anonymity rule (principles §5.9 / §11) — the
+active-contributor figure is a COUNT(DISTINCT worker_id), not a list.
+
+The one exception (R-D3 own-worker enrichment) is `own_workers`: workers bound
+to the *experiment's tenant's own account* are listed non-anonymously to that
+tenant, keyed on the b-lite `tenants.account_id` linkage (§8.2 / §6.9) and
+gated by the ACCOUNT_SCOPED exposure tag. A researcher who brought their own
+compute can confirm their resources are backing their work; third-party workers
+never appear there — they stay folded into the anonymized active-contributor
+count. See researcher_dashboard_design.md §11.
 """
 
 from __future__ import annotations
@@ -22,15 +29,33 @@ from pydantic import BaseModel
 
 from auspexai_platform.auth.credential import Credential
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
-from auspexai_platform.db.repositories import ExperimentRepository
+from auspexai_platform.db.repositories import (
+    ExperimentRepository,
+    TenantRepository,
+    WorkerRepository,
+)
 from auspexai_platform.db.repositories.results import ResultRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
-from auspexai_platform.exposure import ExposureTag
+from auspexai_platform.exposure import ExposureTag, is_visible
+
+
+class OwnWorkerActivity(BaseModel):
+    """One of the requesting tenant's own-account workers, shown
+    non-anonymously (R-D3 own-worker enrichment). Only ever populated for
+    workers bound to the experiment's tenant's account; gated as a unit by the
+    parent `own_workers` field's ACCOUNT_SCOPED tag."""
+
+    worker_id: str
+    worker_pubkey_hex: str
+    result_count: int
+    trust_tier: int
+    last_activity_at: datetime | None = None
 
 
 class ExperimentActivityResponse(BaseModel):
-    """Anonymized liveness rollup for one experiment. Every field is an
-    aggregate count or timestamp — no per-worker identity is ever included."""
+    """Liveness rollup for one experiment. The anonymized fields are aggregate
+    counts/timestamps with no per-worker identity; `own_workers` is the single
+    account-scoped exception (see module docstring)."""
 
     experiment_id: Annotated[str | None, ExposureTag.PUBLIC] = None
     # Distinct workers that have submitted >=1 result. Integer only: the
@@ -44,14 +69,56 @@ class ExperimentActivityResponse(BaseModel):
     # Replication fill: total completions vs total target across all units.
     completions_total: Annotated[int | None, ExposureTag.PUBLIC] = None
     replication_target_total: Annotated[int | None, ExposureTag.PUBLIC] = None
+    # R-D3 own-worker enrichment: the tenant's OWN-account workers, listed
+    # non-anonymously. ACCOUNT_SCOPED — visible only to a credential whose
+    # account_id matches the experiment's tenant's account (or the maintainer).
+    # The filter gates the whole list as a unit; the list is also populated
+    # server-side with own-account workers only, so it can never carry a
+    # third-party identity even before filtering (defense in depth).
+    own_workers: Annotated[list[OwnWorkerActivity] | None, ExposureTag.ACCOUNT_SCOPED] = None
 
 
 def build_router(
     credential_dep,
     experiment_repository: ExperimentRepository,
     per_job_factory: PerJobDatabaseFactory,
+    tenant_repository: TenantRepository,
+    worker_repository: WorkerRepository,
 ) -> APIRouter:
     router = APIRouter()
+
+    def _own_workers(experiment, per_job_db) -> tuple[list[OwnWorkerActivity], str | None]:
+        """Build the own-account worker list for `experiment`'s tenant, plus the
+        tenant's account_id (the resource_account_id used to gate the field).
+
+        Returns ([], None) when the tenant isn't account-linked (b-lite
+        `tenants.account_id` is NULL) — nothing to enrich, nothing to gate
+        against. Otherwise returns only workers bound to that account that have
+        contributed to this experiment; third-party contributors are excluded.
+        """
+        tenant = tenant_repository.get_by_id(experiment.tenant_id)
+        account_id = tenant.account_id if tenant is not None else None
+        if account_id is None:
+            return [], None
+        own_ids = {w.worker_id: w for w in worker_repository.list_for_account(account_id)}
+        if not own_ids:
+            return [], account_id
+        own: list[OwnWorkerActivity] = []
+        for c in ResultRepository(per_job_db).per_worker_contributions():
+            worker = own_ids.get(c["worker_id"])
+            if worker is None:
+                continue  # third-party contributor → stays anonymized
+            own.append(
+                OwnWorkerActivity(
+                    worker_id=c["worker_id"],
+                    worker_pubkey_hex=c["worker_pubkey_hex"],
+                    result_count=c["result_count"],
+                    trust_tier=int(worker.trust_tier),
+                    last_activity_at=c["last_received_at"],
+                )
+            )
+        own.sort(key=lambda w: w.worker_id)
+        return own, account_id
 
     def _can_view(credential: Credential, experiment) -> bool:
         if credential.is_maintainer():
@@ -86,6 +153,7 @@ def build_router(
         per_job_db = per_job_factory.get(experiment_id)
         if per_job_db is None:
             # No work units ever submitted for this experiment → empty rollup.
+            # (No contributors yet, so no own-worker enrichment either.)
             return ExperimentActivityResponse(
                 experiment_id=experiment_id,
                 active_contributor_count=0,
@@ -100,6 +168,19 @@ def build_router(
 
         counts = work_units.count_by_status()
         completions_total, target_total = work_units.replication_totals()
+        own_workers, account_id = _own_workers(experiment, per_job_db)
+
+        # Gate `own_workers` (ACCOUNT_SCOPED) via the same decision function the
+        # field-exposure filter uses — but inline, so the typed
+        # OwnWorkerActivity instances survive (filter_for_credential would
+        # round-trip the list through plain dicts, which Pydantic then
+        # re-serializes with a warning under filterwarnings=error). The owning
+        # researcher (whose tenant carries this account) and the maintainer
+        # see the list; everyone else gets it nulled. The PUBLIC aggregate
+        # fields are unaffected.
+        show_own = is_visible(
+            ExposureTag.ACCOUNT_SCOPED, credential, resource_account_id=account_id
+        )
 
         return ExperimentActivityResponse(
             experiment_id=experiment_id,
@@ -109,6 +190,7 @@ def build_router(
             last_activity_at=results.latest_received_at(),
             completions_total=completions_total,
             replication_target_total=target_total,
+            own_workers=(own_workers or None) if show_own else None,
         )
 
     return router

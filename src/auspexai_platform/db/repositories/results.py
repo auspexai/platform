@@ -98,6 +98,32 @@ class ResultRepository:
         latest = rows[0]["latest"] if rows else None
         return datetime.fromisoformat(latest) if latest else None
 
+    def per_worker_contributions(self) -> list[dict[str, Any]]:
+        """One aggregate row per distinct contributing worker: its result count,
+        pubkey, and last submission time.
+
+        This per-job repository has no account knowledge — it returns *every*
+        worker. The caller (the activity rollup) filters to the tenant's own
+        account for R-D3 own-worker enrichment; third-party workers stay folded
+        into the anonymized `active_contributor_count` and never surface here.
+        """
+        rows = self.db.execute(
+            "SELECT worker_id, worker_pubkey_hex, COUNT(*) AS result_count, "
+            "MAX(received_at) AS last_received_at "
+            "FROM results GROUP BY worker_id, worker_pubkey_hex"
+        )
+        return [
+            {
+                "worker_id": r["worker_id"],
+                "worker_pubkey_hex": r["worker_pubkey_hex"],
+                "result_count": int(r["result_count"]),
+                "last_received_at": (
+                    datetime.fromisoformat(r["last_received_at"]) if r["last_received_at"] else None
+                ),
+            }
+            for r in rows
+        ]
+
     # ---- helpers ----
 
     @staticmethod
