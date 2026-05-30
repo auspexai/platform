@@ -32,9 +32,12 @@ the unforgeable proof: bad receipts produce verdicts of "signature
 invalid"; well-formed receipts identify their own signer via the kid.
 No coordinator-side credential is required to interpret a receipt — the
 trust chain lives in the bytes (and, post-§5.16, in Rekor).
-"""
 
-from __future__ import annotations
+NOTE: no `from __future__ import annotations` here — the verify route uses
+slowapi's `@limiter.limit`, whose wrapper globals break stringized-annotation
+resolution for the `body:` param (FastAPI mis-classifies it as Query → 422).
+See the CI-red postmortem 2026-05-30 and the matching note in api/accounts.py.
+"""
 
 import base64
 import binascii

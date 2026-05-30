@@ -25,9 +25,14 @@ Anonymous-public on the call boundary because the IdP access token is itself
 the unforgeable proof — token forgery is the IdP's threat model. Rate
 limiting falls out of the IdP's device-flow code expiry (one access token
 per completed flow).
-"""
 
-from __future__ import annotations
+NOTE: this module deliberately does NOT use `from __future__ import annotations`.
+Its routes are wrapped by slowapi's `@limiter.limit`, whose wrapper carries
+slowapi's module globals; with stringized annotations FastAPI resolves the
+`body:` param against the wrong globals, fails to find the request model, and
+mis-classifies it as a Query param (every POST-body route then 422s). Keeping
+annotations as real objects sidesteps that. See CI-red postmortem 2026-05-30.
+"""
 
 import secrets
 from datetime import datetime
