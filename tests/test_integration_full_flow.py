@@ -250,6 +250,8 @@ def test_full_flow_researcher_to_auto_complete(
         # M7c: on the third result, the unit transitions to completed and
         # the hash_agreement reducer issues receipts.
         "receipts.issue.agreed",
+        # M-Results: agreement also promotes the durable consensus (T-C) copy.
+        "results.consensus_promoted",
         "experiment.auto_complete",
     ]
     assert actions_in_order == expected_subsequence, (

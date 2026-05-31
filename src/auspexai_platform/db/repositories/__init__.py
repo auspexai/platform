@@ -15,6 +15,7 @@ from auspexai_platform.db.repositories.audit import AuditRepository
 from auspexai_platform.db.repositories.experiments import ExperimentRepository
 from auspexai_platform.db.repositories.manifests import ManifestRepository
 from auspexai_platform.db.repositories.receipt_index import ReceiptIndexRepository
+from auspexai_platform.db.repositories.result_transfers import ResultTransferRepository
 from auspexai_platform.db.repositories.results import ResultRepository
 from auspexai_platform.db.repositories.retired_keys import RetiredKeyRepository
 from auspexai_platform.db.repositories.tenants import TenantRepository
@@ -29,6 +30,7 @@ __all__ = [
     "ManifestRepository",
     "ReceiptIndexRepository",
     "ResultRepository",
+    "ResultTransferRepository",
     "RetiredKeyRepository",
     "TenantRepository",
     "WorkUnitRepository",

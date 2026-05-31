@@ -456,6 +456,23 @@ def build_router(
                             "issued_receipt_ids": issuance_outcome.issued_receipt_ids,
                         },
                     )
+                    if issuance_outcome.agreement.agreed and results:
+                        # M-Results: promote one agreed result to the durable T-C
+                        # consensus copy (all agreeing results are byte-identical;
+                        # the rest are T-X replicas that age off first). Deterministic
+                        # pick so re-runs are idempotent.
+                        consensus_result_id = min(r.result_id for r in results)
+                        ResultRepository(per_job_db).promote_consensus(unit_id, consensus_result_id)
+                        audit_repository.append(
+                            actor_class=CredentialClass.SYSTEM,
+                            action="results.consensus_promoted",
+                            resource_type="work_unit",
+                            resource_id=unit_id,
+                            payload={
+                                "experiment_id": experiment_id,
+                                "result_id": consensus_result_id,
+                            },
+                        )
                     if issuance_outcome.issued_receipt_ids:
                         _maybe_auto_promote(
                             worker_id=worker_id,

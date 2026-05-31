@@ -76,11 +76,23 @@ CREATE TABLE IF NOT EXISTS results (
     worker_signature     TEXT    NOT NULL,
     completed_at         TEXT    NOT NULL,
     received_at          TEXT    NOT NULL,
+    -- M-Results: retention + delivery. `semantic_hash` persists the reduce-time
+    -- hash (so an aged-off row still self-describes its content); `is_consensus`
+    -- marks the one durable T-C copy; `delivered_at` is the first tenant fetch;
+    -- `payload_aged_off_at` (set when payload_json is blanked to '') is the
+    -- authoritative aged-off signal — payload_json stays NOT NULL (blanked, not
+    -- nulled), since SQLite can't drop the constraint without a table rebuild.
+    semantic_hash        TEXT,
+    is_consensus         INTEGER NOT NULL DEFAULT 0,
+    delivered_at         TEXT,
+    payload_expires_at   TEXT,
+    payload_aged_off_at  TEXT,
     FOREIGN KEY (unit_id) REFERENCES work_units(unit_id)
 );
 
 CREATE INDEX IF NOT EXISTS results_unit_idx ON results(unit_id);
 CREATE INDEX IF NOT EXISTS results_worker_idx ON results(worker_id);
+CREATE INDEX IF NOT EXISTS results_consensus_idx ON results(is_consensus);
 
 
 -- M7b: receipts table. One row per issued contribution receipt. Stores
@@ -125,6 +137,7 @@ class PerJobDatabaseFactory:
             db = Database(db_path)
             db.executescript(PER_JOB_SCHEMA_SQL)
             _ensure_assignments_refused_columns(db)
+            _ensure_results_retention_columns(db)
             self._cache[experiment_id] = db
             return db
 
@@ -146,6 +159,7 @@ class PerJobDatabaseFactory:
             # additions idempotently so pre-Option-A per-job DBs work.
             db = Database(db_path)
             _ensure_assignments_refused_columns(db)
+            _ensure_results_retention_columns(db)
             self._cache[experiment_id] = db
             return db
 
@@ -178,13 +192,42 @@ def _ensure_assignments_refused_columns(db: Database) -> None:
     per-job DBs were created without them; ALTER TABLE ADD COLUMN is the
     cheap way to converge.
     """
-    for column, sql_type in (
-        ("refused_at", "TEXT"),
-        ("refused_kind", "TEXT"),
-        ("refused_reason", "TEXT"),
-    ):
+    _add_columns_idempotent(
+        db,
+        "assignments",
+        (
+            ("refused_at", "TEXT"),
+            ("refused_kind", "TEXT"),
+            ("refused_reason", "TEXT"),
+        ),
+    )
+
+
+def _ensure_results_retention_columns(db: Database) -> None:
+    """Idempotently add the M-Results retention/delivery columns to the per-job
+    `results` table. Part of PER_JOB_SCHEMA_SQL for new DBs; this converges
+    existing per-job DBs created before M-Results. (Same pattern as the
+    assignments refused-columns bump — per-job DBs have no PRAGMA user_version.)
+    """
+    _add_columns_idempotent(
+        db,
+        "results",
+        (
+            ("semantic_hash", "TEXT"),
+            ("is_consensus", "INTEGER NOT NULL DEFAULT 0"),
+            ("delivered_at", "TEXT"),
+            ("payload_expires_at", "TEXT"),
+            ("payload_aged_off_at", "TEXT"),
+        ),
+    )
+
+
+def _add_columns_idempotent(db: Database, table: str, columns: tuple[tuple[str, str], ...]) -> None:
+    """ALTER TABLE ADD COLUMN for each (name, sql_type), tolerating already-present
+    columns. The cheap per-job 'migration' mechanism (no schema-version table)."""
+    for column, sql_type in columns:
         try:
-            db.executescript(f"ALTER TABLE assignments ADD COLUMN {column} {sql_type};")
+            db.executescript(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type};")
         except sqlite3.OperationalError as exc:
             # "duplicate column name" — column already present, fine.
             if "duplicate column" not in str(exc).lower():

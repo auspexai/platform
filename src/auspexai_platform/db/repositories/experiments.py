@@ -236,6 +236,54 @@ class ExperimentRepository:
             raise ExperimentNotFoundError(experiment_id)
         return got
 
+    def set_ttl_overrides(
+        self,
+        experiment_id: str,
+        *,
+        raw_payload_ttl_days: int | None = None,
+        consensus_ttl_days: int | None = None,
+    ) -> Experiment:
+        """Set per-experiment retention TTL overrides (M-Results). NULL = use the
+        platform default for that tier."""
+        self.db.execute(
+            "UPDATE experiments SET raw_payload_ttl_days = ?, consensus_ttl_days = ? "
+            "WHERE experiment_id = ?",
+            (raw_payload_ttl_days, consensus_ttl_days, experiment_id),
+        )
+        got = self.get_by_id(experiment_id)
+        if got is None:
+            raise ExperimentNotFoundError(experiment_id)
+        return got
+
+    def set_retention_hold(
+        self, experiment_id: str, *, held: bool, reason: str | None
+    ) -> Experiment:
+        """Place or release an audit/legal retention hold. When held, the age-off
+        sweep skips this experiment entirely (the org keeps its own copy)."""
+        self.db.execute(
+            "UPDATE experiments SET retention_hold = ?, retention_hold_reason = ? "
+            "WHERE experiment_id = ?",
+            (1 if held else 0, reason if held else None, experiment_id),
+        )
+        got = self.get_by_id(experiment_id)
+        if got is None:
+            raise ExperimentNotFoundError(experiment_id)
+        return got
+
+    def mark_results_collected(self, experiment_id: str) -> Experiment:
+        """Stamp `results_collected_at = now` on first collection (the offload
+        anchor); never overwrites a prior collection time."""
+        now = datetime.now(UTC).isoformat()
+        self.db.execute(
+            "UPDATE experiments SET results_collected_at = ? "
+            "WHERE experiment_id = ? AND results_collected_at IS NULL",
+            (now, experiment_id),
+        )
+        got = self.get_by_id(experiment_id)
+        if got is None:
+            raise ExperimentNotFoundError(experiment_id)
+        return got
+
     def set_integrity_policy(
         self,
         experiment_id: str,
@@ -315,4 +363,13 @@ class ExperimentRepository:
             max_units=row["max_units"],
             max_concurrent_assignments=row["max_concurrent_assignments"],
             max_payload_bytes=row["max_payload_bytes"],
+            raw_payload_ttl_days=row["raw_payload_ttl_days"],
+            consensus_ttl_days=row["consensus_ttl_days"],
+            retention_hold=bool(row["retention_hold"]),
+            retention_hold_reason=row["retention_hold_reason"],
+            results_collected_at=(
+                datetime.fromisoformat(row["results_collected_at"])
+                if row["results_collected_at"]
+                else None
+            ),
         )

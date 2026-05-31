@@ -84,6 +84,10 @@ class ExperimentResponse(BaseModel):
     max_units: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     max_concurrent_assignments: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     max_payload_bytes: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
+    # M-Results retention state.
+    retention_hold: Annotated[bool | None, ExposureTag.TENANT_SCOPED] = None
+    retention_hold_reason: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
+    results_collected_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
 
 
 class ExperimentListResponse(BaseModel):
@@ -126,6 +130,9 @@ def _to_response(experiment) -> ExperimentResponse:
         max_units=experiment.max_units,
         max_concurrent_assignments=experiment.max_concurrent_assignments,
         max_payload_bytes=experiment.max_payload_bytes,
+        retention_hold=getattr(experiment, "retention_hold", False) or None,
+        retention_hold_reason=getattr(experiment, "retention_hold_reason", None),
+        results_collected_at=getattr(experiment, "results_collected_at", None),
     )
 
 
@@ -555,6 +562,76 @@ def build_router(
             _to_response(updated),
             credential,
             resource_tenant_id=updated.tenant_id,
+        )
+
+    @router.post(
+        "/experiments/{experiment_id}/actions/retention-hold",
+        response_model=ExperimentResponse,
+        response_model_exclude_none=True,
+    )
+    async def place_retention_hold(
+        experiment_id: str,
+        reason: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ExperimentResponse:
+        """Maintainer-only: place an audit/legal retention hold so the age-off
+        sweep keeps this experiment's data regardless of collection. Mandatory
+        reason (mirrors the account-suspension pattern)."""
+        require_maintainer(credential)
+        if not reason.strip():
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": {
+                        "code": "reason_required",
+                        "message": "a reason is required to place a retention hold",
+                    }
+                },
+            )
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None:
+            raise _experiment_not_found(experiment_id)
+        updated = experiment_repository.set_retention_hold(experiment_id, held=True, reason=reason)
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            actor_tenant_id=credential.tenant_id,
+            action="experiment.retention_hold",
+            resource_type="experiment",
+            resource_id=experiment_id,
+            payload={"reason": reason},
+        )
+        return filter_for_credential(
+            _to_response(updated), credential, resource_tenant_id=updated.tenant_id
+        )
+
+    @router.post(
+        "/experiments/{experiment_id}/actions/release-hold",
+        response_model=ExperimentResponse,
+        response_model_exclude_none=True,
+    )
+    async def release_retention_hold(
+        experiment_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ExperimentResponse:
+        """Maintainer-only: release a retention hold (the experiment's data
+        resumes normal age-off)."""
+        require_maintainer(credential)
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None:
+            raise _experiment_not_found(experiment_id)
+        updated = experiment_repository.set_retention_hold(experiment_id, held=False, reason=None)
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            actor_tenant_id=credential.tenant_id,
+            action="experiment.retention_hold_released",
+            resource_type="experiment",
+            resource_id=experiment_id,
+            payload={},
+        )
+        return filter_for_credential(
+            _to_response(updated), credential, resource_tenant_id=updated.tenant_id
         )
 
     return router

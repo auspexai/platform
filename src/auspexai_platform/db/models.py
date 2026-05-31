@@ -173,6 +173,14 @@ class Experiment(BaseModel):
     max_units: int | None = None
     max_concurrent_assignments: int | None = None
     max_payload_bytes: int | None = None
+    # M-Results: per-experiment retention controls (0015). NULL TTLs = platform
+    # defaults; `retention_hold` makes the age-off sweep skip this experiment;
+    # `results_collected_at` is the offload anchor (export-bundle pull).
+    raw_payload_ttl_days: int | None = None
+    consensus_ttl_days: int | None = None
+    retention_hold: bool = False
+    retention_hold_reason: str | None = None
+    results_collected_at: datetime | None = None
 
 
 class IdentityVerificationMethod(StrEnum):
@@ -274,6 +282,15 @@ class Result(BaseModel):
     worker_signature: str  # base64
     completed_at: datetime
     received_at: datetime
+    # M-Results: retention + delivery metadata. `semantic_hash` is the persisted
+    # reduce-time hash; `is_consensus` marks the one durable T-C copy;
+    # `delivered_at` is the first tenant fetch; `payload_aged_off_at` (set when
+    # `payload` was blanked) is the authoritative aged-off signal.
+    semantic_hash: str | None = None
+    is_consensus: bool = False
+    delivered_at: datetime | None = None
+    payload_expires_at: datetime | None = None
+    payload_aged_off_at: datetime | None = None
 
 
 class WorkUnit(BaseModel):

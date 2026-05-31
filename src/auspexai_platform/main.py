@@ -33,6 +33,7 @@ from auspexai_platform.api import auth as auth_routes
 from auspexai_platform.api import experiments as experiment_routes
 from auspexai_platform.api import health
 from auspexai_platform.api import receipts as receipt_routes
+from auspexai_platform.api import results as results_routes
 from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.api import work_units as work_unit_routes
 from auspexai_platform.api import workers as worker_routes
@@ -50,6 +51,7 @@ from auspexai_platform.db.repositories import (
     ExperimentRepository,
     ManifestRepository,
     ReceiptIndexRepository,
+    ResultTransferRepository,
     RetiredKeyRepository,
     TenantRepository,
     WorkerRepository,
@@ -102,6 +104,7 @@ def create_app(
     worker_repository = WorkerRepository(db)
     retired_key_repository = RetiredKeyRepository(db)
     receipt_index_repository = ReceiptIndexRepository(db)
+    result_transfer_repository = ResultTransferRepository(db)
     from auspexai_platform.db.repositories.vouches import VouchRepository
 
     vouch_repository = VouchRepository(db)
@@ -292,6 +295,20 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["receipts"],
+    )
+    app.include_router(
+        results_routes.build_router(
+            credential_dep=credential_dep,
+            experiment_repository=experiment_repository,
+            per_job_factory=per_job_factory,
+            receipt_index_repository=receipt_index_repository,
+            manifest_repository=manifest_repository,
+            result_transfer_repository=result_transfer_repository,
+            signing_key=receipt_signing_key,
+            audit_repository=audit_repository,
+        ),
+        prefix="/api/v0",
+        tags=["results"],
     )
     app.include_router(
         audit_routes.build_router(credential_dep, audit_repository),
