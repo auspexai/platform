@@ -267,6 +267,7 @@ def build_router(
                     "created_at": a.created_at.isoformat(),
                     "retired_at": a.retired_at.isoformat() if a.retired_at else None,
                     "suspended_at": a.suspended_at.isoformat() if a.suspended_at else None,
+                    "suspension_reason": a.suspension_reason,
                     "identity_verified_at": a.identity_verified_at.isoformat()
                     if a.identity_verified_at
                     else None,

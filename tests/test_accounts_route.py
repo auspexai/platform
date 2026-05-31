@@ -132,6 +132,27 @@ def test_exchange_returns_422_on_missing_token(client: TestClient) -> None:
     assert response.status_code == 422  # Pydantic min_length validation
 
 
+def test_list_accounts_returns_suspension_reason(
+    client: TestClient,
+    maintainer_token: str,
+    account_repository: AccountRepository,
+) -> None:
+    """The operator accounts list surfaces suspension_reason so the console can
+    display *why* an account was suspended (not just that it was)."""
+    account_repository.create(
+        account_id="acct-listed", idp=IdentityProvider.GITHUB, idp_sub="gh-listed"
+    )
+    account_repository.suspend("acct-listed", reason="abuse review")
+
+    response = client.get(
+        "/api/v0/accounts", headers={"Authorization": f"Bearer {maintainer_token}"}
+    )
+    assert response.status_code == 200, response.text
+    listed = {a["account_id"]: a for a in response.json()["accounts"]}
+    assert listed["acct-listed"]["suspended_at"] is not None
+    assert listed["acct-listed"]["suspension_reason"] == "abuse review"
+
+
 def test_exchange_returns_422_on_unknown_idp(client: TestClient) -> None:
     # 'foobar' is not in IdentityProvider; Pydantic rejects the request body.
     response = client.post(
