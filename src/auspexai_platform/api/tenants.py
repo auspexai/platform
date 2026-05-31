@@ -95,6 +95,7 @@ class LinkedAccount(BaseModel):
     trust_tier: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     created_at: Annotated[datetime | None, ExposureTag.OPERATOR_ONLY] = None
     suspended_at: Annotated[datetime | None, ExposureTag.OPERATOR_ONLY] = None
+    suspension_reason: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
 
 
 class LinkedWorker(BaseModel):
@@ -305,6 +306,7 @@ def build_router(
                     trust_tier=int(account.trust_tier),
                     created_at=account.created_at,
                     suspended_at=account.suspended_at,
+                    suspension_reason=account.suspension_reason,
                 )
             # Workers under this account, whether or not the account row resolved
             # (a dangling account_id is itself worth surfacing to the operator).

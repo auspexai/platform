@@ -466,7 +466,7 @@ def build_router(
         assert worker_repository is not None
 
         try:
-            account = account_repository.suspend(account_id)
+            account = account_repository.suspend(account_id, reason=body.reason)
         except AccountNotFoundError:
             raise HTTPException(status_code=404, detail="account not found") from None
 

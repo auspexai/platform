@@ -12,18 +12,20 @@ Useful for:
   - The operator console at startup ("am I correctly configured with a
     maintainer token?")
   - The researcher dashboard at startup ("does the coordinator recognize my
-    Ed25519 keypair?")
+    Ed25519 keypair?" — and "is my account suspended, and why?")
   - Tests covering all three credential paths.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
+from auspexai_platform.db.repositories.accounts import AccountRepository
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 
 
@@ -47,10 +49,26 @@ class WhoamiResponse(BaseModel):
         default=None,
         description="Researcher only: the signing Ed25519 pubkey (hex).",
     )
+    # Account-level suspension surfaced to the account holder (account-scoped):
+    # a researcher whose account the maintainer suspended is entitled to know
+    # that — and why — so the dashboard can show a banner. Mirrors the worker
+    # quarantine_reason exposure (ratified 2026-05-30). Never visible to third
+    # parties; the operator sees all.
+    suspended_at: Annotated[datetime | None, ExposureTag.ACCOUNT_SCOPED] = Field(
+        default=None,
+        description="Account holder only: when the account was suspended, if it is.",
+    )
+    suspension_reason: Annotated[str | None, ExposureTag.ACCOUNT_SCOPED] = Field(
+        default=None,
+        description="Account holder only: the maintainer's reason for the suspension.",
+    )
 
 
-def build_router(credential_dep) -> APIRouter:
-    """Build the /auth router bound to a credential dependency."""
+def build_router(credential_dep, account_repository: AccountRepository | None = None) -> APIRouter:
+    """Build the /auth router bound to a credential dependency.
+
+    `account_repository` is used to surface the caller's own account-suspension
+    state; when omitted (e.g. minimal test apps) suspension fields stay None."""
 
     router = APIRouter()
 
@@ -62,15 +80,26 @@ def build_router(credential_dep) -> APIRouter:
     async def whoami(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> WhoamiResponse:
+        suspended_at = None
+        suspension_reason = None
+        if account_repository is not None and credential.account_id is not None:
+            account = account_repository.get_by_id(credential.account_id)
+            if account is not None:
+                suspended_at = account.suspended_at
+                suspension_reason = account.suspension_reason
+
         payload = WhoamiResponse(
             credential_class=credential.kind,
             tenant_id=credential.tenant_id,
             pubkey_hex=credential.pubkey_hex,
+            suspended_at=suspended_at,
+            suspension_reason=suspension_reason,
         )
         return filter_for_credential(
             payload,
             credential,
             resource_tenant_id=credential.tenant_id,
+            resource_account_id=credential.account_id,
         )
 
     return router

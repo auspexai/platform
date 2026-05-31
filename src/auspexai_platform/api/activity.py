@@ -14,14 +14,21 @@ The one exception (R-D3 own-worker enrichment) is `own_workers`: workers bound
 to the *experiment's tenant's own account* are listed non-anonymously to that
 tenant, keyed on the b-lite `tenants.account_id` linkage (§8.2 / §6.9) and
 gated by the ACCOUNT_SCOPED exposure tag. A researcher who brought their own
-compute can confirm their resources are backing their work; third-party workers
-never appear there — they stay folded into the anonymized active-contributor
-count. See researcher_dashboard_design.md §11.
+compute can confirm their resources are backing their work — including each
+own-worker's derived **status** and, when quarantined, the maintainer's
+**reason** (status follows the worker wherever it surfaces; reason is no longer
+operator-only because the researcher only ever sees their own account's
+workers). Third-party workers never appear there — they stay folded into the
+anonymized active-contributor count. See researcher_dashboard_design.md §11.
+
+`network_active_workers` is a PUBLIC count of all workers active network-wide
+(heartbeat-fresh, not retired, not quarantined) — the "how big is the collective
+my experiment draws on" signal; identity-free, so safe for any caller.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -37,6 +44,7 @@ from auspexai_platform.db.repositories import (
 from auspexai_platform.db.repositories.results import ResultRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.exposure import ExposureTag, is_visible
+from auspexai_platform.worker_status import derive_worker_status, heartbeat_cutoff
 
 
 class OwnWorkerActivity(BaseModel):
@@ -50,6 +58,14 @@ class OwnWorkerActivity(BaseModel):
     result_count: int
     trust_tier: int
     last_activity_at: datetime | None = None
+    # Derived status (active / offline / quarantined / retired) + the
+    # maintainer's quarantine reason when quarantined. These follow the worker
+    # to its own-account researcher; reason is intentionally surfaced here (not
+    # operator-only) because this list only ever holds the researcher's own
+    # account's workers.
+    status: str | None = None
+    quarantine_reason: str | None = None
+    last_heartbeat_at: datetime | None = None
 
 
 class ExperimentActivityResponse(BaseModel):
@@ -69,6 +85,9 @@ class ExperimentActivityResponse(BaseModel):
     # Replication fill: total completions vs total target across all units.
     completions_total: Annotated[int | None, ExposureTag.PUBLIC] = None
     replication_target_total: Annotated[int | None, ExposureTag.PUBLIC] = None
+    # Network size the experiment draws on: total workers active network-wide
+    # (heartbeat-fresh, not retired/quarantined). Identity-free → PUBLIC.
+    network_active_workers: Annotated[int | None, ExposureTag.PUBLIC] = None
     # R-D3 own-worker enrichment: the tenant's OWN-account workers, listed
     # non-anonymously. ACCOUNT_SCOPED — visible only to a credential whose
     # account_id matches the experiment's tenant's account (or the maintainer).
@@ -87,7 +106,9 @@ def build_router(
 ) -> APIRouter:
     router = APIRouter()
 
-    def _own_workers(experiment, per_job_db) -> tuple[list[OwnWorkerActivity], str | None]:
+    def _own_workers(
+        experiment, per_job_db, now: datetime
+    ) -> tuple[list[OwnWorkerActivity], str | None]:
         """Build the own-account worker list for `experiment`'s tenant, plus the
         tenant's account_id (the resource_account_id used to gate the field).
 
@@ -115,6 +136,9 @@ def build_router(
                     result_count=c["result_count"],
                     trust_tier=int(worker.trust_tier),
                     last_activity_at=c["last_received_at"],
+                    status=derive_worker_status(worker, now).value,
+                    quarantine_reason=worker.quarantine_reason,
+                    last_heartbeat_at=worker.last_heartbeat_at,
                 )
             )
         own.sort(key=lambda w: w.worker_id)
@@ -150,6 +174,9 @@ def build_router(
                 },
             )
 
+        now = datetime.now(UTC)
+        network_active = worker_repository.count_active(heartbeat_cutoff=heartbeat_cutoff(now))
+
         per_job_db = per_job_factory.get(experiment_id)
         if per_job_db is None:
             # No work units ever submitted for this experiment → empty rollup.
@@ -161,6 +188,7 @@ def build_router(
                 work_unit_counts={},
                 completions_total=0,
                 replication_target_total=0,
+                network_active_workers=network_active,
             )
 
         work_units = WorkUnitRepository(per_job_db)
@@ -168,7 +196,7 @@ def build_router(
 
         counts = work_units.count_by_status()
         completions_total, target_total = work_units.replication_totals()
-        own_workers, account_id = _own_workers(experiment, per_job_db)
+        own_workers, account_id = _own_workers(experiment, per_job_db, now)
 
         # Gate `own_workers` (ACCOUNT_SCOPED) via the same decision function the
         # field-exposure filter uses — but inline, so the typed
@@ -190,6 +218,7 @@ def build_router(
             last_activity_at=results.latest_received_at(),
             completions_total=completions_total,
             replication_target_total=target_total,
+            network_active_workers=network_active,
             own_workers=(own_workers or None) if show_own else None,
         )
 

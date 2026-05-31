@@ -96,6 +96,22 @@ class WorkUnitStatus(StrEnum):
     FAILED = "failed"
 
 
+class WorkerStatus(StrEnum):
+    """Derived, display-facing worker status (not a stored column).
+
+    Computed from a Worker's flags + heartbeat recency by
+    `worker_status.derive_worker_status`. Precedence (first match wins):
+    retired > quarantined > offline (no recent heartbeat) > active. Surfaced
+    to the worker itself and to the worker's own-account researcher; the
+    quarantine *reason* travels alongside it (no longer operator-only).
+    """
+
+    ACTIVE = "active"
+    OFFLINE = "offline"
+    QUARANTINED = "quarantined"
+    RETIRED = "retired"
+
+
 class Tenant(BaseModel):
     """A row in the `tenants` table."""
 
@@ -185,6 +201,11 @@ class Account(BaseModel):
     identity_verification_method: IdentityVerificationMethod | None = None
     identity_verification_note: str | None = None
     suspended_at: datetime | None = None
+    # Maintainer's reason for the suspension. Set on suspend(), cleared on
+    # unsuspend(). Account-scoped: surfaced to the account holder (whoami /
+    # account self-view), never to third parties — mirrors worker
+    # quarantine_reason.
+    suspension_reason: str | None = None
 
 
 class Vouch(BaseModel):

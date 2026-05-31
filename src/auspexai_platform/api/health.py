@@ -11,6 +11,11 @@ which subset each credential class sees:
 For M3 all health fields are `public` (the network being up and its server
 clock are not sensitive). Later milestones add operator-only fields like
 `db_status`, `scheduler_queue_depth`, `pending_alerts`.
+
+`network_active_workers` is a PUBLIC count of workers active network-wide
+(heartbeat-fresh, not retired/quarantined). It's the same identity-free
+network-size signal the activity rollup carries, surfaced here so a worker
+(or anyone) can see "how big is the collective" without an experiment context.
 """
 
 from __future__ import annotations
@@ -23,7 +28,9 @@ from pydantic import BaseModel
 
 from auspexai_platform import __version__
 from auspexai_platform.auth.credential import Credential
+from auspexai_platform.db.repositories.workers import WorkerRepository
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
+from auspexai_platform.worker_status import heartbeat_cutoff
 
 
 class HealthResponse(BaseModel):
@@ -38,17 +45,22 @@ class HealthResponse(BaseModel):
     status: Annotated[str | None, ExposureTag.PUBLIC] = None
     version: Annotated[str | None, ExposureTag.PUBLIC] = None
     server_time: Annotated[datetime | None, ExposureTag.PUBLIC] = None
+    network_active_workers: Annotated[int | None, ExposureTag.PUBLIC] = None
 
 
-def _full_payload() -> HealthResponse:
+def _full_payload(worker_repository: WorkerRepository) -> HealthResponse:
+    now = datetime.now(UTC)
     return HealthResponse(
         status="ok",
         version=__version__,
-        server_time=datetime.now(UTC),
+        server_time=now,
+        network_active_workers=worker_repository.count_active(
+            heartbeat_cutoff=heartbeat_cutoff(now)
+        ),
     )
 
 
-def build_router(credential_dep) -> APIRouter:
+def build_router(credential_dep, worker_repository: WorkerRepository) -> APIRouter:
     """Build the /health router bound to a credential dependency.
 
     Same factory pattern as the auth router so each app instance carries
@@ -64,7 +76,7 @@ def build_router(credential_dep) -> APIRouter:
     async def health(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> HealthResponse:
-        return filter_for_credential(_full_payload(), credential)
+        return filter_for_credential(_full_payload(worker_repository), credential)
 
     @router.get(
         "/health/public",
@@ -75,6 +87,6 @@ def build_router(credential_dep) -> APIRouter:
         """Anonymous-public liveness. No credential dependency; filter for the
         anonymous class so the response shape matches what an anonymous caller
         would see on the operator endpoint."""
-        return filter_for_credential(_full_payload(), Credential.anonymous())
+        return filter_for_credential(_full_payload(worker_repository), Credential.anonymous())
 
     return router

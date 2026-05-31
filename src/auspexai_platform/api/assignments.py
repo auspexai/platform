@@ -222,9 +222,12 @@ def build_router(
             # still heartbeat); we just don't dispatch work to it. Return
             # 423 Locked so the worker's `auspexai-worker status` can
             # surface the state honestly instead of looking like an idle
-            # network with no assignments. Reason text intentionally NOT
-            # included in the response — that's operator-only per the
-            # WorkerResponse exposure-tag config.
+            # network with no assignments. The quarantine *reason* IS included
+            # now: a worker (the volunteer running it) is entitled to know why
+            # its own machine was paused — the same reason the maintainer
+            # entered. (Reason is no longer operator-only; it travels with the
+            # status to the worker itself and to the worker's own-account
+            # researcher.)
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
                 detail={
@@ -236,6 +239,7 @@ def build_router(
                         ),
                         "details": {
                             "quarantined_at": worker.quarantined_at.isoformat(),
+                            "quarantine_reason": worker.quarantine_reason,
                         },
                     }
                 },

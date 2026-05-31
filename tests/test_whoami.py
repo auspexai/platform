@@ -15,6 +15,35 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from auspexai_platform.auth.signature import sign_request
+from auspexai_platform.db.models import IdentityProvider
+from auspexai_platform.db.repositories import AccountRepository, TenantRepository
+
+
+def _linked_researcher_headers(
+    *,
+    account_repository: AccountRepository,
+    tenant_repository: TenantRepository,
+    tenant_keypair: tuple[Ed25519PrivateKey, str],
+    account_id: str,
+    tenant_id: str,
+) -> dict[str, str]:
+    """Create an account, link a tenant to it, and return signed whoami headers
+    for the tenant's key. The caller suspends the account as needed."""
+    priv, pubkey_hex = tenant_keypair
+    account_repository.create(
+        account_id=account_id, idp=IdentityProvider.GITHUB, idp_sub=account_id
+    )
+    tenant_repository.register(
+        tenant_id=tenant_id, maintainer_pubkey=pubkey_hex, account_id=account_id
+    )
+    return sign_request(
+        privkey=priv,
+        pubkey_hex=pubkey_hex,
+        method="GET",
+        path="/api/v0/auth/whoami",
+        authority="testserver",
+        body=b"",
+    )
 
 
 def test_whoami_anonymous_returns_only_credential_class(client: TestClient) -> None:
@@ -65,6 +94,59 @@ def test_whoami_researcher_sees_own_binding(
     assert body["credential_class"] == "researcher"
     assert body["tenant_id"] == binding.tenant_id
     assert body["pubkey_hex"] == binding.pubkey_hex
+    # An unsuspended account exposes no suspension fields (None → exclude_none).
+    assert "suspended_at" not in body
+    assert "suspension_reason" not in body
+
+
+def test_whoami_researcher_sees_own_account_suspension(
+    client: TestClient,
+    account_repository: AccountRepository,
+    tenant_repository: TenantRepository,
+    tenant_keypair: tuple[Ed25519PrivateKey, str],
+) -> None:
+    """A suspended account's researcher sees their own suspension + the
+    maintainer's reason via whoami (account-scoped, ratified 2026-05-30)."""
+    reason = "policy review: unverified bulk experiment submissions"
+    headers = _linked_researcher_headers(
+        account_repository=account_repository,
+        tenant_repository=tenant_repository,
+        tenant_keypair=tenant_keypair,
+        account_id="acct-susp01",
+        tenant_id="t-susp01",
+    )
+    account_repository.suspend("acct-susp01", reason=reason)
+
+    response = client.get("/api/v0/auth/whoami", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["credential_class"] == "researcher"
+    assert body["suspension_reason"] == reason
+    assert body["suspended_at"] is not None
+
+
+def test_whoami_unsuspended_account_clears_suspension_fields(
+    client: TestClient,
+    account_repository: AccountRepository,
+    tenant_repository: TenantRepository,
+    tenant_keypair: tuple[Ed25519PrivateKey, str],
+) -> None:
+    """unsuspend clears both the timestamp and the reason — whoami drops them."""
+    headers = _linked_researcher_headers(
+        account_repository=account_repository,
+        tenant_repository=tenant_repository,
+        tenant_keypair=tenant_keypair,
+        account_id="acct-susp02",
+        tenant_id="t-susp02",
+    )
+    account_repository.suspend("acct-susp02", reason="temporary hold")
+    account_repository.unsuspend("acct-susp02")
+
+    response = client.get("/api/v0/auth/whoami", headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "suspended_at" not in body
+    assert "suspension_reason" not in body
 
 
 def test_invalid_bearer_token_returns_401(client: TestClient) -> None:

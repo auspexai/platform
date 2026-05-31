@@ -182,9 +182,13 @@ class TestAssignmentBlockedWhileQuarantined:
         assert r.status_code == 423, r.text
         body = r.json()
         assert body["detail"]["error"]["code"] == "worker_quarantined"
-        # Operator-secret reason MUST NOT leak through the worker-facing
-        # error envelope.
-        assert "test" not in r.text
+        # Quarantine reason IS surfaced to the worker itself: a volunteer is
+        # entitled to know why its own machine was paused (trust-boundary
+        # transparency). The reason travels with the status wherever the worker
+        # surfaces — here in the worker-facing 423 envelope, and to the worker's
+        # own-account researcher in the activity API. It is never shown to third
+        # parties (other tenants / anonymous callers).
+        assert body["detail"]["error"]["details"]["quarantine_reason"] == "test"
 
         # Unquarantine, then the same fetch should succeed (200, work_unit=null
         # because no experiments registered).

@@ -291,6 +291,21 @@ class WorkerRepository:
         rows = self.db.execute("SELECT * FROM workers ORDER BY registered_at")
         return [self._row_to_worker(r) for r in rows]
 
+    def count_active(self, *, heartbeat_cutoff: datetime) -> int:
+        """Count workers that are 'active' network-wide: enrolled, not retired,
+        not quarantined, and heartbeating since `heartbeat_cutoff`.
+
+        Backs the network-size signal shown to researchers (activity rollup) and
+        workers (health). The cutoff is supplied by the caller so the freshness
+        window (`worker_status.STALE_HEARTBEAT_MINUTES`) stays in one place."""
+        rows = self.db.execute(
+            "SELECT COUNT(*) AS n FROM workers "
+            "WHERE retired_at IS NULL AND quarantined_at IS NULL "
+            "AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?",
+            (heartbeat_cutoff.isoformat(),),
+        )
+        return int(rows[0]["n"]) if rows else 0
+
     # ---- helpers ----
 
     @staticmethod

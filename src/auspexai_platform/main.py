@@ -178,8 +178,16 @@ def create_app(
 
     credential_dep = make_credential_dependency(token_store, credential_resolver)
 
-    app.include_router(health.build_router(credential_dep), prefix="/api/v0", tags=["system"])
-    app.include_router(auth_routes.build_router(credential_dep), prefix="/api/v0", tags=["auth"])
+    app.include_router(
+        health.build_router(credential_dep, worker_repository),
+        prefix="/api/v0",
+        tags=["system"],
+    )
+    app.include_router(
+        auth_routes.build_router(credential_dep, account_repository),
+        prefix="/api/v0",
+        tags=["auth"],
+    )
     app.include_router(
         tenant_routes.build_router(
             credential_dep,

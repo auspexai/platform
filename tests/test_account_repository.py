@@ -16,6 +16,30 @@ from auspexai_platform.db.repositories.accounts import (
     DuplicateAccountError,
 )
 
+# ---- suspension reason -----------------------------------------------------
+
+
+def test_suspend_stores_reason_and_unsuspend_clears_it(
+    account_repository: AccountRepository,
+) -> None:
+    account_repository.create(account_id="acct-susp", idp=IdentityProvider.GITHUB, idp_sub="s-1")
+
+    suspended = account_repository.suspend("acct-susp", reason="abuse: synthetic-result flooding")
+    assert suspended.suspended_at is not None
+    assert suspended.suspension_reason == "abuse: synthetic-result flooding"
+
+    # Re-suspend preserves the timestamp but can update the reason (mirrors
+    # worker quarantine semantics).
+    first_ts = suspended.suspended_at
+    resuspended = account_repository.suspend("acct-susp", reason="updated: under appeal")
+    assert resuspended.suspended_at == first_ts
+    assert resuspended.suspension_reason == "updated: under appeal"
+
+    cleared = account_repository.unsuspend("acct-susp")
+    assert cleared.suspended_at is None
+    assert cleared.suspension_reason is None
+
+
 # ---- account writes / reads ------------------------------------------------
 
 

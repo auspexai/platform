@@ -156,17 +156,19 @@ class AccountRepository:
         assert got is not None
         return got
 
-    def suspend(self, account_id: str) -> Account:
+    def suspend(self, account_id: str, reason: str | None = None) -> Account:
         """Freeze account. Raises AccountNotFoundError if unknown/retired.
-        Idempotent on re-suspend (timestamp preserved)."""
+        Idempotent on re-suspend (timestamp preserved on first call; reason
+        can be updated on subsequent calls — mirrors worker quarantine)."""
         now = datetime.now(UTC).isoformat()
         with self.db.transaction() as cur:
             cur.execute(
                 """
-                UPDATE accounts SET suspended_at = COALESCE(suspended_at, ?)
+                UPDATE accounts SET suspended_at = COALESCE(suspended_at, ?),
+                    suspension_reason = ?
                 WHERE account_id = ? AND retired_at IS NULL
                 """,
-                (now, account_id),
+                (now, reason, account_id),
             )
             if cur.rowcount == 0:
                 raise AccountNotFoundError(account_id)
@@ -179,7 +181,7 @@ class AccountRepository:
         with self.db.transaction() as cur:
             cur.execute(
                 """
-                UPDATE accounts SET suspended_at = NULL
+                UPDATE accounts SET suspended_at = NULL, suspension_reason = NULL
                 WHERE account_id = ?
                 """,
                 (account_id,),
@@ -364,6 +366,7 @@ class AccountRepository:
             suspended_at=(
                 datetime.fromisoformat(row["suspended_at"]) if row["suspended_at"] else None
             ),
+            suspension_reason=row["suspension_reason"],
         )
 
     @staticmethod
