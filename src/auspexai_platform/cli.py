@@ -87,6 +87,45 @@ def serve(host: str, port: int, reload: bool) -> None:
 
 
 # ----------------------------------------------------------------------------
+# age-off (M-Results retention sweep)
+# ----------------------------------------------------------------------------
+
+
+@main.command("age-off")
+@_state_dir_option
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Actually blank expired result payloads. Default is a dry-run report.",
+)
+def age_off(state_dir: Path | None, apply_changes: bool) -> None:
+    """Age off expired result payloads (M-Results retention).
+
+    DRY-RUN by default — prints what *would* be aged off without mutating; pass
+    `--apply` to blank the payloads (rows, signatures, hashes, and receipts are
+    preserved). Experiments under a retention hold are skipped. Intended to run
+    from a systemd timer for periodic retention, or on demand by an operator.
+    """
+    from datetime import UTC, datetime
+
+    from auspexai_platform.db.database import Database
+    from auspexai_platform.db.migrations import MigrationRunner
+    from auspexai_platform.maintenance import age_off_sweep
+
+    config = _resolve_config(state_dir)
+    db = Database(config.control_db_path)
+    try:
+        MigrationRunner(db).apply_all()  # idempotent; ensures retention columns exist
+        report = age_off_sweep(config.jobs_dir, db, apply=apply_changes, now=datetime.now(UTC))
+    finally:
+        db.close()
+    click.echo(report.summary())
+    if not apply_changes and report.total_aged:
+        click.echo("\nRe-run with --apply to blank these payloads.")
+
+
+# ----------------------------------------------------------------------------
 # token group
 # ----------------------------------------------------------------------------
 

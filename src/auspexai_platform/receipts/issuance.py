@@ -38,6 +38,7 @@ from hashlib import sha256
 
 from auspexai_platform.db.models import Experiment, Result, WorkUnit
 from auspexai_platform.db.repositories import ReceiptIndexRepository
+from auspexai_platform.hashing import semantic_hash
 from auspexai_platform.receipts.intoto import build_statement
 from auspexai_platform.receipts.models import (
     QuorumAgreement,
@@ -76,13 +77,10 @@ class ReceiptIssuanceOutcome:
 
 def _semantic_hash(result: Result) -> str:
     """SHA-256 of the canonical `{exit_code, payload}`. Used by the agreement
-    reducer to compare results from different workers."""
-    canonical = json.dumps(
-        {"exit_code": result.exit_code, "payload": result.payload},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return sha256(canonical.encode("utf-8")).hexdigest()
+    reducer to compare results from different workers. Delegates to the shared
+    `auspexai_platform.hashing.semantic_hash` so the result store (M-Results)
+    persists byte-identical hashes."""
+    return semantic_hash(result.exit_code, result.payload)
 
 
 def _result_hash(result: Result) -> str:
