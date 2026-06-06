@@ -19,6 +19,7 @@ Allowed transitions:
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 from datetime import UTC, datetime
@@ -73,18 +74,27 @@ class ExperimentRepository:
         tenant_id: str,
         tenant_experiment_label: str,
         manifest_hash: str,
+        required_capabilities: dict[str, list[str]] | None = None,
     ) -> Experiment:
         """Insert a new experiment in `submitted` state. Raises
-        DuplicateExperimentLabelError if (tenant_id, label) already exists."""
+        DuplicateExperimentLabelError if (tenant_id, label) already exists.
+
+        `required_capabilities` (#30, M1) is the models/capabilities a worker
+        must locally hold to be eligible; stored as JSON, NULL when empty (no
+        requirement → every worker eligible)."""
         experiment_id = _generate_experiment_id()
         submitted_at = datetime.now(UTC).isoformat()
+        caps_json = (
+            json.dumps(required_capabilities, sort_keys=True) if required_capabilities else None
+        )
         try:
             self.db.execute(
                 """
                 INSERT INTO experiments (
                     experiment_id, tenant_id, tenant_experiment_label,
-                    manifest_hash, status, submitted_at, revision
-                ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                    manifest_hash, status, submitted_at, revision,
+                    required_capabilities_json
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
                 """,
                 (
                     experiment_id,
@@ -93,6 +103,7 @@ class ExperimentRepository:
                     manifest_hash,
                     ExperimentStatus.SUBMITTED.value,
                     submitted_at,
+                    caps_json,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -363,6 +374,11 @@ class ExperimentRepository:
             max_units=row["max_units"],
             max_concurrent_assignments=row["max_concurrent_assignments"],
             max_payload_bytes=row["max_payload_bytes"],
+            required_capabilities=(
+                json.loads(row["required_capabilities_json"])
+                if row["required_capabilities_json"]
+                else {}
+            ),
             raw_payload_ttl_days=row["raw_payload_ttl_days"],
             consensus_ttl_days=row["consensus_ttl_days"],
             retention_hold=bool(row["retention_hold"]),

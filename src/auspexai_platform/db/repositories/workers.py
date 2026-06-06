@@ -306,6 +306,29 @@ class WorkerRepository:
         )
         return int(rows[0]["n"]) if rows else 0
 
+    def count_capable(self, *, required_models: list[str], heartbeat_cutoff: datetime) -> int:
+        """Count active workers (same set as `count_active`) whose declared model
+        inventory holds EVERY model in `required_models` (#30 / M1). Empty
+        `required_models` ⇒ identical to `count_active`. The active-set SQL filter
+        keeps it cheap; the capability check is in Python because `capabilities`
+        is an opaque JSON blob. Backs the activity rollup's 'empty pool' signal."""
+        need = set(required_models)
+        rows = self.db.execute(
+            "SELECT capabilities_json FROM workers "
+            "WHERE retired_at IS NULL AND quarantined_at IS NULL "
+            "AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?",
+            (heartbeat_cutoff.isoformat(),),
+        )
+        if not need:
+            return len(rows)
+        n = 0
+        for r in rows:
+            caps = json.loads(r["capabilities_json"] or "{}")
+            have = caps.get("models", [])
+            if isinstance(have, list) and need <= set(have):
+                n += 1
+        return n
+
     # ---- helpers ----
 
     @staticmethod

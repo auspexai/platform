@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from auspexai_platform.db.models import ExperimentStatus
+from datetime import UTC, datetime
+
+from auspexai_platform.db.models import ExperimentStatus, TrustTier, Worker
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AssignmentRepository,
@@ -10,7 +12,7 @@ from auspexai_platform.db.repositories import (
     ManifestRepository,
     WorkUnitRepository,
 )
-from auspexai_platform.scheduler import Scheduler
+from auspexai_platform.scheduler import Scheduler, worker_satisfies
 
 
 def _make_experiment(
@@ -20,6 +22,7 @@ def _make_experiment(
     tenant_id: str,
     label: str,
     approved: bool = True,
+    required_capabilities: dict[str, list[str]] | None = None,
 ):
     manifest = manifest_repository.insert(
         tenant_id=tenant_id,
@@ -30,11 +33,86 @@ def _make_experiment(
         tenant_id=tenant_id,
         tenant_experiment_label=label,
         manifest_hash=manifest.manifest_hash,
+        required_capabilities=required_capabilities,
     )
     if approved:
         experiment_repository.update_status(experiment.experiment_id, ExperimentStatus.APPROVED)
         experiment = experiment_repository.get_by_id(experiment.experiment_id)
     return experiment
+
+
+def _worker(*, worker_id: str, models: list[str] | None, tier: TrustTier = TrustTier.T2_TRUSTED):
+    caps: dict = {"os": "linux"}
+    if models is not None:
+        caps["models"] = models
+    return Worker(
+        worker_id=worker_id,
+        pubkey_hex="a" * 64,
+        trust_tier=tier,
+        capabilities=caps,
+        registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+
+
+# ---- #30 (M1) capability matching -----------------------------------------
+
+
+def test_worker_satisfies_empty_requirement_is_always_true():
+    assert worker_satisfies(_worker(worker_id="w", models=[]), {}) is True
+    assert worker_satisfies(_worker(worker_id="w", models=None), {"models": []}) is True
+
+
+def test_worker_satisfies_requires_all_models():
+    assert worker_satisfies(_worker(worker_id="w", models=["m-a", "m-b"]), {"models": ["m-a"]})
+    assert not worker_satisfies(_worker(worker_id="w", models=["m-a"]), {"models": ["m-a", "m-b"]})
+    assert not worker_satisfies(_worker(worker_id="w", models=None), {"models": ["m-a"]})
+
+
+def test_scheduler_routes_only_to_capable_workers(
+    registered_tenant,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+    manifest_repository: ManifestRepository,
+) -> None:
+    _, binding = registered_tenant
+    exp = _make_experiment(
+        manifest_repository=manifest_repository,
+        experiment_repository=experiment_repository,
+        tenant_id=binding.tenant_id,
+        label="cap-1",
+        required_capabilities={"models": ["m-x"]},
+    )
+    db = per_job_factory.get_or_create(exp.experiment_id)
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+
+    # Worker that holds m-x is offered the unit; one that doesn't is skipped
+    # (the requirement is experiment-level — pick_for_worker is read-only, so the
+    # two calls are independent).
+    assert scheduler.pick_for_worker(_worker(worker_id="wkr-has", models=["m-x"])) is not None
+    assert scheduler.pick_for_worker(_worker(worker_id="wkr-not", models=["m-y"])) is None
+    assert scheduler.pick_for_worker(_worker(worker_id="wkr-bare", models=None)) is None
+
+
+def test_scheduler_no_requirement_is_open_to_all(
+    registered_tenant,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+    manifest_repository: ManifestRepository,
+) -> None:
+    # Backward-compat: an experiment with no required_capabilities behaves exactly
+    # as pre-M1 — every worker (with no models declared) is eligible.
+    _, binding = registered_tenant
+    exp = _make_experiment(
+        manifest_repository=manifest_repository,
+        experiment_repository=experiment_repository,
+        tenant_id=binding.tenant_id,
+        label="open-1",
+    )
+    db = per_job_factory.get_or_create(exp.experiment_id)
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+    assert scheduler.pick_for_worker(_worker(worker_id="wkr-any", models=None)) is not None
 
 
 def test_picks_pending_unit_for_eligible_worker(

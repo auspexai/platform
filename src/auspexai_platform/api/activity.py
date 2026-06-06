@@ -88,6 +88,11 @@ class ExperimentActivityResponse(BaseModel):
     # Network size the experiment draws on: total workers active network-wide
     # (heartbeat-fresh, not retired/quarantined). Identity-free → PUBLIC.
     network_active_workers: Annotated[int | None, ExposureTag.PUBLIC] = None
+    # M1 (#30): the models this experiment requires workers to locally hold, and
+    # how many active workers currently satisfy that (the 'empty pool' signal
+    # feeding #32 / the M2 demand-board). Omitted when there's no requirement.
+    required_capabilities: Annotated[dict[str, list[str]] | None, ExposureTag.TENANT_SCOPED] = None
+    capable_worker_count: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     # R-D3 own-worker enrichment: the tenant's OWN-account workers, listed
     # non-anonymously. ACCOUNT_SCOPED — visible only to a credential whose
     # account_id matches the experiment's tenant's account (or the maintainer).
@@ -177,6 +182,19 @@ def build_router(
         now = datetime.now(UTC)
         network_active = worker_repository.count_active(heartbeat_cutoff=heartbeat_cutoff(now))
 
+        # M1 (#30): how many active workers can actually run this experiment given
+        # its model requirement. Only meaningful when there IS a requirement;
+        # capable==0 with pending units is the empty-pool signal (#32 / M2).
+        required_caps = experiment.required_capabilities or {}
+        required_models = required_caps.get("models", [])
+        capable_worker_count = (
+            worker_repository.count_capable(
+                required_models=required_models, heartbeat_cutoff=heartbeat_cutoff(now)
+            )
+            if required_models
+            else None
+        )
+
         per_job_db = per_job_factory.get(experiment_id)
         if per_job_db is None:
             # No work units ever submitted for this experiment → empty rollup.
@@ -189,6 +207,8 @@ def build_router(
                 completions_total=0,
                 replication_target_total=0,
                 network_active_workers=network_active,
+                required_capabilities=required_caps or None,
+                capable_worker_count=capable_worker_count,
             )
 
         work_units = WorkUnitRepository(per_job_db)
@@ -219,6 +239,8 @@ def build_router(
             completions_total=completions_total,
             replication_target_total=target_total,
             network_active_workers=network_active,
+            required_capabilities=required_caps or None,
+            capable_worker_count=capable_worker_count,
             own_workers=(own_workers or None) if show_own else None,
         )
 

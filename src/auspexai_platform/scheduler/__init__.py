@@ -20,17 +20,20 @@ Eligibility:
     their tier floor. T0 requires N≥3, T1 N≥2, T2+ N≥1. A T0 worker
     is skipped for units with replication_target < 3.
 
-**Capability matching is deferred to M6d-polish or M7.** Per §5.8 the
-scheduler should match worker capabilities (OS, GPU, locally-installed
-models) to work-unit requirements. v0 ignores this — every worker is
-eligible for every unit. The infrastructure (`Worker.capabilities` dict)
-is in place; the matching logic is left for when there's a concrete
-tenant whose units carry capability requirements.
+**Capability matching (#30, M1):** per §5.8 the scheduler matches a worker's
+locally-held models against the experiment's `required_capabilities` (derived at
+submit from the manifest's `local_weights_required` models, keyed by store
+model_id). A worker is skipped for an experiment whose required models it
+doesn't hold (`worker_satisfies`). An experiment with no requirement is open to
+every worker (the pre-M1 behavior). Broader capability dimensions (OS/GPU) and
+the full heterogeneous-pool routing remain Phase-2; M1 ships the model-inventory
+thin slice that makes BYOM routing real.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 from auspexai_platform.db.models import ExperimentStatus, TrustTier, Worker, WorkUnit
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
@@ -50,6 +53,33 @@ _TIER_REPLICATION_FLOOR = {
 
 def replication_floor_for_tier(tier: TrustTier) -> int:
     return _TIER_REPLICATION_FLOOR.get(tier, 3)
+
+
+class SkipReason(StrEnum):
+    """Why the scheduler passed over a unit/experiment for a given worker. The
+    shared vocabulary the M4 scheduler-ops console surfaces as 'why a unit isn't
+    being assigned'. (M1 introduces it + uses MISSING_CAPABILITY; M4 wires the
+    per-unit reasons into the observability endpoint.)"""
+
+    BELOW_TIER_FLOOR = "below_tier_floor"
+    ALREADY_ASSIGNED = "already_assigned"
+    AT_REPLICATION = "at_replication"
+    MISSING_CAPABILITY = "missing_capability"
+
+
+def worker_satisfies(worker: Worker, required_capabilities: dict[str, list[str]]) -> bool:
+    """True if the worker locally holds every model the experiment requires
+    (#30, M1). `required_capabilities` is keyed by dimension; Phase-1 matches the
+    "models" key against the worker's declared `capabilities["models"]` inventory
+    by EXACT store model_id (hash-agreement consensus needs identical quants).
+    Empty requirement ⇒ always satisfied (the pre-M1 behavior — every worker
+    eligible). Unknown capability dimensions are ignored in Phase-1."""
+    required_models = set(required_capabilities.get("models", []))
+    if not required_models:
+        return True
+    have = worker.capabilities.get("models", [])
+    have_models = set(have) if isinstance(have, list) else set()
+    return required_models <= have_models
 
 
 @dataclass(frozen=True)
@@ -79,6 +109,11 @@ class Scheduler:
         tier_floor = replication_floor_for_tier(worker.trust_tier)
 
         for experiment in self._experiments.list_all(status=ExperimentStatus.APPROVED):
+            # #30 (M1): skip the whole experiment when this worker lacks a model
+            # it requires (the requirement is experiment-level, derived from the
+            # manifest at submit). Empty requirement ⇒ satisfied (pre-M1 behavior).
+            if not worker_satisfies(worker, experiment.required_capabilities):
+                continue
             per_job_db = self._per_job_factory.get(experiment.experiment_id)
             if per_job_db is None:
                 continue

@@ -173,6 +173,11 @@ class Experiment(BaseModel):
     max_units: int | None = None
     max_concurrent_assignments: int | None = None
     max_payload_bytes: int | None = None
+    # M1 (#30 capability-matching): models/capabilities a worker must locally hold
+    # to be eligible for this experiment's units — derived at submit from the
+    # manifest's `local_weights_required` models, keyed by worker store model_id
+    # (<repo-slug>-<quant>). Empty = no requirement (every worker eligible; pre-M1).
+    required_capabilities: dict[str, list[str]] = Field(default_factory=dict)
     # M-Results: per-experiment retention controls (0015). NULL TTLs = platform
     # defaults; `retention_hold` makes the age-off sweep skip this experiment;
     # `results_collected_at` is the offload anchor (export-bundle pull).

@@ -86,6 +86,8 @@ class ExperimentResponse(BaseModel):
     max_units: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     max_concurrent_assignments: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     max_payload_bytes: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
+    # M1 (#30): models a worker must locally hold to be eligible (empty = none).
+    required_capabilities: Annotated[dict[str, list[str]] | None, ExposureTag.TENANT_SCOPED] = None
     # M-Results retention state.
     retention_hold: Annotated[bool | None, ExposureTag.TENANT_SCOPED] = None
     retention_hold_reason: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
@@ -137,6 +139,7 @@ def _to_response(experiment) -> ExperimentResponse:
         max_units=experiment.max_units,
         max_concurrent_assignments=experiment.max_concurrent_assignments,
         max_payload_bytes=experiment.max_payload_bytes,
+        required_capabilities=getattr(experiment, "required_capabilities", None) or None,
         retention_hold=getattr(experiment, "retention_hold", False) or None,
         retention_hold_reason=getattr(experiment, "retention_hold_reason", None),
         results_collected_at=getattr(experiment, "results_collected_at", None),
@@ -156,6 +159,23 @@ def _extract_manifest_identity(manifest: dict[str, Any]) -> tuple[str, str]:
     if not isinstance(experiment_id, str) or not experiment_id:
         raise ValueError("manifest must include `experiment_id` (non-empty string)")
     return tenant_id, experiment_id
+
+
+def _derive_required_capabilities(manifest: dict[str, Any]) -> dict[str, list[str]]:
+    """M1 (#30): a worker must locally hold every model the manifest marks
+    `local_weights_required` (BYOM, §5.8). Keyed by the worker store model_id
+    (`<repo-slug>-<quant>`, exact match for hash-agreement consensus). Empty ⇒ no
+    requirement (every worker eligible). Phase-1 emits only the "models" key; the
+    manifest stays opaque otherwise."""
+    models = manifest.get("models")
+    if not isinstance(models, list):
+        return {}
+    required = [
+        m["id"]
+        for m in models
+        if isinstance(m, dict) and m.get("local_weights_required") and m.get("id")
+    ]
+    return {"models": required} if required else {}
 
 
 def _check_action_authz(credential: Credential, experiment, *, allow_researcher: bool) -> None:
@@ -298,6 +318,7 @@ def build_router(
                 tenant_id=manifest_tenant,
                 tenant_experiment_label=manifest_label,
                 manifest_hash=manifest.manifest_hash,
+                required_capabilities=_derive_required_capabilities(body.manifest),
             )
         except DuplicateExperimentLabelError as e:
             raise HTTPException(

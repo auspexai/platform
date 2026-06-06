@@ -97,6 +97,32 @@ def test_submit_creates_experiment(
     assert body["manifest_hash"]
 
 
+def test_submit_derives_required_capabilities(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    # #30 (M1): models flagged local_weights_required become the experiment's
+    # required_capabilities; non-required models do not.
+    privkey, binding = registered_tenant
+    manifest = _manifest(
+        binding.tenant_id,
+        "cap-exp",
+        models=[
+            {"id": "qwen3-q4", "version": "1", "local_weights_required": True},
+            {"id": "noop", "version": "1", "local_weights_required": False},
+        ],
+    )
+    r = _submit_as_researcher(client, privkey, binding.pubkey_hex, manifest)
+    assert r.status_code == 201, r.text
+    assert r.json()["required_capabilities"] == {"models": ["qwen3-q4"]}
+
+    # No local_weights_required models → no requirement surfaced (backward-compat).
+    r2 = _submit_as_researcher(
+        client, privkey, binding.pubkey_hex, _manifest(binding.tenant_id, "open-exp")
+    )
+    assert r2.status_code == 201, r2.text
+    assert not r2.json().get("required_capabilities")
+
+
 def test_submit_rejects_manifest_for_other_tenant(
     client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
 ) -> None:

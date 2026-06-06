@@ -94,3 +94,25 @@ def test_count_active_only_counts_fresh_unflagged(worker_repository) -> None:
     assert a.worker_id == "w-active"
     cutoff = heartbeat_cutoff(datetime.now(UTC))
     assert worker_repository.count_active(heartbeat_cutoff=cutoff) == 1
+
+
+# ---- count_capable (#30 / M1) ----------------------------------------------
+
+
+def test_count_capable_requires_all_models_and_active(worker_repository) -> None:
+    cutoff = heartbeat_cutoff(datetime.now(UTC))
+    # capable: fresh + holds m-x
+    worker_repository.enroll(worker_id="w-has", pubkey_hex="1" * 64)
+    worker_repository.record_heartbeat("w-has", capabilities={"models": ["m-x", "m-y"]})
+    # active but lacks m-x
+    worker_repository.enroll(worker_id="w-lacks", pubkey_hex="2" * 64)
+    worker_repository.record_heartbeat("w-lacks", capabilities={"models": ["m-y"]})
+    # holds m-x but quarantined → not active → excluded
+    worker_repository.enroll(worker_id="w-quar", pubkey_hex="3" * 64)
+    worker_repository.record_heartbeat("w-quar", capabilities={"models": ["m-x"]})
+    worker_repository.quarantine("w-quar", reason="testing")
+
+    assert worker_repository.count_capable(required_models=["m-x"], heartbeat_cutoff=cutoff) == 1
+    # empty requirement ⇒ same as count_active (the two fresh, unflagged workers)
+    assert worker_repository.count_capable(required_models=[], heartbeat_cutoff=cutoff) == 2
+    assert worker_repository.count_active(heartbeat_cutoff=cutoff) == 2
