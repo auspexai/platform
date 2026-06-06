@@ -189,6 +189,7 @@ def build_router(
     account_repository=None,
     eligibility_thresholds=None,
     vouch_repository=None,
+    event_bus=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -414,6 +415,20 @@ def build_router(
             },
         )
 
+        # M8: live progress event — drives the dashboard/console progress bar
+        # without polling. One per submission (so completions tick up live).
+        if event_bus is not None:
+            event_bus.publish(
+                "unit.progress",
+                experiment_id=experiment_id,
+                data={
+                    "unit_id": unit_id,
+                    "unit_status": updated_unit.status.value,
+                    "completions_so_far": updated_unit.completions_so_far,
+                    "replication_target": updated_unit.replication_target,
+                },
+            )
+
         # M6e auto-complete: if this result completed the unit AND the
         # experiment was finalized AND no other non-completed units remain,
         # auto-transition the experiment to 'completed'. Only fires on
@@ -456,6 +471,19 @@ def build_router(
                             "issued_receipt_ids": issuance_outcome.issued_receipt_ids,
                         },
                     )
+                    if event_bus is not None and issuance_outcome.issued_receipt_ids:
+                        # M8: live receipt event — the experiment's verifiable
+                        # work record just grew; dashboards update the count.
+                        event_bus.publish(
+                            "receipt.issued",
+                            experiment_id=experiment_id,
+                            data={
+                                "unit_id": unit_id,
+                                "agreed": issuance_outcome.agreement.agreed,
+                                "agreeing_workers": issuance_outcome.agreement.agreeing_workers,
+                                "issued_receipt_ids": issuance_outcome.issued_receipt_ids,
+                            },
+                        )
                     if issuance_outcome.agreement.agreed and results:
                         # M-Results: promote one agreed result to the durable T-C
                         # consensus copy (all agreeing results are byte-identical;
@@ -497,6 +525,7 @@ def build_router(
                 per_job_db=per_job_db,
                 experiment_repository=experiment_repository,
                 audit_repository=audit_repository,
+                event_bus=event_bus,
             )
 
         return ResultSubmissionResponse(
@@ -621,6 +650,7 @@ def _maybe_auto_complete(
     per_job_db,
     experiment_repository: ExperimentRepository,
     audit_repository: AuditRepository,
+    event_bus=None,
 ) -> None:
     """Auto-transition an experiment to COMPLETED iff:
 
@@ -662,6 +692,19 @@ def _maybe_auto_complete(
         resource_id=experiment_id,
         payload={"trigger": "all_units_completed_and_finalized"},
     )
+    if event_bus is not None:
+        # M8: surface the coordinator-driven completion live, same shape as the
+        # operator-driven `experiment.status` events from `_transition`.
+        event_bus.publish(
+            "experiment.status",
+            experiment_id=experiment_id,
+            data={
+                "status": ExperimentStatus.COMPLETED.value,
+                "from_status": ExperimentStatus.APPROVED.value,
+                "actor_class": CredentialClass.SYSTEM.value,
+                "trigger": "auto_complete",
+            },
+        )
 
 
 def _maybe_auto_promote(

@@ -37,6 +37,25 @@ DEFAULT_RAW_TTL_DAYS = 30
 DEFAULT_GRACE_DAYS = 14
 
 
+def projected_raw_age_off(experiment: Experiment) -> datetime | None:
+    """When the sweep will start aging off this experiment's raw (T-X) payloads,
+    or `None` if there is no experiment-level projection yet.
+
+    Collection is the anchor: until the researcher collects the export bundle
+    (`results_collected_at` is set) each result ages on its own per-result clock
+    (`delivered_at + raw_ttl`, or `completed_at + grace` if never delivered), so
+    there is no single experiment-wide date to project. Once collected, every
+    raw payload ages at `results_collected_at + raw_ttl` — matching the collected
+    branch of `_horizon_for` exactly (no extra grace; grace is only the
+    never-collected fallback). Single source of truth for the O-M8 operator
+    projection so the console never re-derives retention math.
+    """
+    if experiment.results_collected_at is None:
+        return None
+    raw_ttl = experiment.raw_payload_ttl_days or DEFAULT_RAW_TTL_DAYS
+    return experiment.results_collected_at + timedelta(days=raw_ttl)
+
+
 @dataclass
 class ExperimentSweep:
     experiment_id: str

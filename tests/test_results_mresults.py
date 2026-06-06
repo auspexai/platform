@@ -351,6 +351,96 @@ class TestRetentionHoldAction:
         assert resp.status_code == 403
 
 
+# ---- O-M8: retention policy exposure + age-off projection ------------------
+
+
+def test_projected_raw_age_off_math():
+    """Unit: collection-anchored, no extra grace; default TTL when unset."""
+    from types import SimpleNamespace
+
+    from auspexai_platform.maintenance import (
+        DEFAULT_RAW_TTL_DAYS,
+        projected_raw_age_off,
+    )
+
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    # Not collected yet → no experiment-level projection.
+    assert (
+        projected_raw_age_off(SimpleNamespace(results_collected_at=None, raw_payload_ttl_days=7))
+        is None
+    )
+    # Collected + override TTL → collected + ttl (no grace).
+    assert projected_raw_age_off(
+        SimpleNamespace(results_collected_at=now, raw_payload_ttl_days=7)
+    ) == now + timedelta(days=7)
+    # Collected + no override → default raw TTL.
+    assert projected_raw_age_off(
+        SimpleNamespace(results_collected_at=now, raw_payload_ttl_days=None)
+    ) == now + timedelta(days=DEFAULT_RAW_TTL_DAYS)
+
+
+class TestRetentionExposure:
+    def _maintainer_get(self, client, maintainer_token, eid):
+        return client.get(
+            f"/api/v0/experiments/{eid}",
+            headers={"Authorization": f"Bearer {maintainer_token}"},
+        )
+
+    def test_operator_sees_ttls_and_projection(
+        self, client, maintainer_token, approved_experiment, experiment_repository
+    ):
+        _p, _b, experiment, _h = approved_experiment
+        eid = experiment.experiment_id
+        experiment_repository.set_ttl_overrides(eid, raw_payload_ttl_days=7, consensus_ttl_days=90)
+        experiment_repository.mark_results_collected(eid)
+        resp = self._maintainer_get(client, maintainer_token, eid)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["raw_payload_ttl_days"] == 7
+        assert body["consensus_ttl_days"] == 90
+        collected = experiment_repository.get_by_id(eid).results_collected_at
+        assert datetime.fromisoformat(body["raw_payload_age_off_at"]) == collected + timedelta(
+            days=7
+        )
+
+    def test_tenant_does_not_see_policy_fields(
+        self, client, approved_experiment, experiment_repository
+    ):
+        privkey, binding, experiment, _h = approved_experiment
+        eid = experiment.experiment_id
+        experiment_repository.set_ttl_overrides(eid, raw_payload_ttl_days=7, consensus_ttl_days=90)
+        experiment_repository.mark_results_collected(eid)
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{eid}",
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # OPERATOR_ONLY policy fields are stripped for the tenant...
+        assert "raw_payload_ttl_days" not in body
+        assert "consensus_ttl_days" not in body
+        assert "raw_payload_age_off_at" not in body
+        # ...but the tenant-scoped *effect* (collection anchor) stays visible.
+        assert "results_collected_at" in body
+
+    def test_projection_absent_until_collected(
+        self, client, maintainer_token, approved_experiment, experiment_repository
+    ):
+        _p, _b, experiment, _h = approved_experiment
+        eid = experiment.experiment_id
+        experiment_repository.set_ttl_overrides(
+            eid, raw_payload_ttl_days=7, consensus_ttl_days=None
+        )
+        resp = self._maintainer_get(client, maintainer_token, eid)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["raw_payload_ttl_days"] == 7
+        # None → excluded by response_model_exclude_none.
+        assert "raw_payload_age_off_at" not in body
+
+
 # ---- repository units ------------------------------------------------------
 
 

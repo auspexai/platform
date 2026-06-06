@@ -30,6 +30,7 @@ from auspexai_platform.api import activity as activity_routes
 from auspexai_platform.api import assignments as assignment_routes
 from auspexai_platform.api import audit as audit_routes
 from auspexai_platform.api import auth as auth_routes
+from auspexai_platform.api import events as event_routes
 from auspexai_platform.api import experiments as experiment_routes
 from auspexai_platform.api import health
 from auspexai_platform.api import receipts as receipt_routes
@@ -57,6 +58,7 @@ from auspexai_platform.db.repositories import (
     WorkerRepository,
 )
 from auspexai_platform.eligibility import EligibilityThresholds
+from auspexai_platform.events import EventBus
 from auspexai_platform.oauth import IdentityVerifier, build_default_verifier
 from auspexai_platform.rate_limit import limiter
 from auspexai_platform.receipts import load_or_generate_signing_key
@@ -121,6 +123,9 @@ def create_app(
     worker_registry = WorkerRegistry(worker_repository)
     credential_resolver = CredentialResolver(tenant_registry, worker_registry)
     scheduler = Scheduler(experiment_repository, per_job_factory)
+    # M8: in-process live-event bus. SSE endpoints subscribe; lifecycle /
+    # result-submission routes publish. Process-local (single-process coord).
+    event_bus = EventBus()
 
     app = FastAPI(
         title="AuspexAI Coordinator",
@@ -178,6 +183,7 @@ def create_app(
     app.state.identity_verifier = identity_verifier
     app.state.receipt_signing_key = receipt_signing_key
     app.state.receipt_index_repository = receipt_index_repository
+    app.state.event_bus = event_bus
 
     credential_dep = make_credential_dependency(token_store, credential_resolver)
 
@@ -208,6 +214,7 @@ def create_app(
             manifest_repository,
             experiment_repository,
             audit_repository,
+            event_bus=event_bus,
         ),
         prefix="/api/v0",
         tags=["experiments"],
@@ -277,6 +284,7 @@ def create_app(
             account_repository=account_repository,
             eligibility_thresholds=eligibility_thresholds,
             vouch_repository=vouch_repository,
+            event_bus=event_bus,
         ),
         prefix="/api/v0",
         tags=["assignments"],
@@ -314,6 +322,15 @@ def create_app(
         audit_routes.build_router(credential_dep, audit_repository),
         prefix="/api/v0",
         tags=["audit"],
+    )
+    app.include_router(
+        event_routes.build_router(
+            credential_dep=credential_dep,
+            experiment_repository=experiment_repository,
+            event_bus=event_bus,
+        ),
+        prefix="/api/v0",
+        tags=["events"],
     )
 
     _install_root_and_docs(app, credential_dep)

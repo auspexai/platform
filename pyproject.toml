@@ -36,6 +36,12 @@ dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
     "pytest-asyncio>=0.24",
+    # Hard per-test wall-clock cap so a wedged test fails fast instead of
+    # hanging the run. An unconsumed infinite SSE body parks the server
+    # generator in its keepalive `wait_for` under Starlette's TestClient (no
+    # broken-pipe/http.disconnect over the in-memory transport) — see
+    # sse_event_bus_design.md. The timeout converts that wedge into a failure.
+    "pytest-timeout>=2.3",
     "ruff==0.15.15",  # pinned exactly: unbounded ruff drifts CI red as new rules ship
     # Test env pinned to current fastapi/starlette. starlette 1.x's TestClient
     # emits a DeprecationWarning that filterwarnings=error would escalate to a
@@ -100,6 +106,11 @@ ignore = [
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 asyncio_mode = "auto"
+# Per-test wall-clock cap (pytest-timeout). Generous for the slowest real test
+# (~a couple seconds) but well under a hang. `thread` method works without
+# signal support and interrupts blocked C/await calls.
+timeout = 60
+timeout_method = "thread"
 filterwarnings = [
     "error",
     # starlette 1.x's TestClient deprecates the `httpx` transport in favour of

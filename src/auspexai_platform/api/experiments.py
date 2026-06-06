@@ -46,7 +46,9 @@ from auspexai_platform.db.repositories.experiments import (
     InvalidStatusTransitionError,
 )
 from auspexai_platform.db.repositories.manifests import DuplicateManifestError
+from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
+from auspexai_platform.maintenance import projected_raw_age_off
 
 # ---- response models -------------------------------------------------------
 
@@ -88,6 +90,11 @@ class ExperimentResponse(BaseModel):
     retention_hold: Annotated[bool | None, ExposureTag.TENANT_SCOPED] = None
     retention_hold_reason: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     results_collected_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
+    # Retention policy + projected age-off (O-M8): operators set/own the policy;
+    # researchers see only its effects (hold + collected_at + aged-off badges).
+    raw_payload_ttl_days: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
+    consensus_ttl_days: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
+    raw_payload_age_off_at: Annotated[datetime | None, ExposureTag.OPERATOR_ONLY] = None
 
 
 class ExperimentListResponse(BaseModel):
@@ -133,6 +140,9 @@ def _to_response(experiment) -> ExperimentResponse:
         retention_hold=getattr(experiment, "retention_hold", False) or None,
         retention_hold_reason=getattr(experiment, "retention_hold_reason", None),
         results_collected_at=getattr(experiment, "results_collected_at", None),
+        raw_payload_ttl_days=getattr(experiment, "raw_payload_ttl_days", None),
+        consensus_ttl_days=getattr(experiment, "consensus_ttl_days", None),
+        raw_payload_age_off_at=projected_raw_age_off(experiment),
     )
 
 
@@ -203,6 +213,8 @@ def build_router(
     manifest_repository: ManifestRepository,
     experiment_repository: ExperimentRepository,
     audit_repository: AuditRepository,
+    *,
+    event_bus: EventBus | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -425,6 +437,7 @@ def build_router(
             action="experiment.approve",
             experiment_repository=experiment_repository,
             audit_repository=audit_repository,
+            event_bus=event_bus,
         )
 
     @router.post(
@@ -444,6 +457,7 @@ def build_router(
             action="experiment.abort",
             experiment_repository=experiment_repository,
             audit_repository=audit_repository,
+            event_bus=event_bus,
         )
 
     @router.post(
@@ -464,6 +478,7 @@ def build_router(
             action="experiment.archive",
             experiment_repository=experiment_repository,
             audit_repository=audit_repository,
+            event_bus=event_bus,
         )
 
     @router.post(
@@ -483,6 +498,7 @@ def build_router(
             action="experiment.pause",
             experiment_repository=experiment_repository,
             audit_repository=audit_repository,
+            event_bus=event_bus,
         )
 
     @router.post(
@@ -502,6 +518,7 @@ def build_router(
             action="experiment.resume",
             experiment_repository=experiment_repository,
             audit_repository=audit_repository,
+            event_bus=event_bus,
         )
 
     @router.post(
@@ -646,6 +663,7 @@ def _transition(
     action: str,
     experiment_repository: ExperimentRepository,
     audit_repository: AuditRepository,
+    event_bus: EventBus | None = None,
 ) -> ExperimentResponse:
     """Common path for the action endpoints. Authorization + transition +
     audit + response filter."""
@@ -690,6 +708,17 @@ def _transition(
         resource_id=experiment_id,
         payload={"from_status": experiment.status.value, "to_status": new_status.value},
     )
+    if event_bus is not None:
+        event_bus.publish(
+            "experiment.status",
+            experiment_id=experiment_id,
+            data={
+                "status": new_status.value,
+                "from_status": experiment.status.value,
+                "revision": updated.revision,
+                "actor_class": credential.kind.value,
+            },
+        )
     return filter_for_credential(
         _to_response(updated),
         credential,
