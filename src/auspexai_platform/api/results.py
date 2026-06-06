@@ -29,7 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
-from auspexai_platform.db.models import Result
+from auspexai_platform.db.models import ExperimentStatus, Result
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     ExperimentRepository,
@@ -39,6 +39,11 @@ from auspexai_platform.db.repositories import (
     ResultTransferRepository,
 )
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
+from auspexai_platform.receipts.attestation import (
+    RESULT_SET_ALGORITHM,
+    ResultSetEntry,
+    build_result_set_attestation,
+)
 from auspexai_platform.receipts.repository import ReceiptRepository
 from auspexai_platform.receipts.signing import SigningKey
 
@@ -70,6 +75,33 @@ class ResultListResponse(BaseModel):
     next_cursor: Annotated[str | None, ExposureTag.PUBLIC] = None
 
 
+class AttestationUnit(BaseModel):
+    unit_id: str
+    consensus_result_hash: str
+    receipt_id: str
+
+
+class ResultSetAttestationResponse(BaseModel):
+    """#34 §6.3 result-set completion attestation. The endpoint is already
+    tenant-gated (own-tenant researcher or maintainer), and the attestation is
+    designed to be *published* by the tenant, so the fields are PUBLIC within
+    that gate. `cose_b64` is the canonical artifact; `units` lets a verifier
+    recompute `merkle_root` without re-pulling (though re-pulling + recomputing
+    is the stronger check)."""
+
+    attestation_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    experiment_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    tenant_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    merkle_root: Annotated[str | None, ExposureTag.PUBLIC] = None
+    algorithm: Annotated[str | None, ExposureTag.PUBLIC] = None
+    unit_count: Annotated[int | None, ExposureTag.PUBLIC] = None
+    units: Annotated[list[AttestationUnit] | None, ExposureTag.PUBLIC] = None
+    cose_b64: Annotated[str | None, ExposureTag.PUBLIC] = None
+    signing_key_pubkey_hex: Annotated[str | None, ExposureTag.PUBLIC] = None
+    rekor_log_index: Annotated[int | None, ExposureTag.PUBLIC] = None
+    rekor_entry_uuid: Annotated[str | None, ExposureTag.PUBLIC] = None
+
+
 def _require_researcher_own_tenant_or_maintainer(
     credential: Credential, experiment_tenant_id: str
 ) -> None:
@@ -95,6 +127,10 @@ def _require_researcher_own_tenant_or_maintainer(
             }
         },
     )
+
+
+def _generate_attestation_id() -> str:
+    return f"att-{secrets.token_urlsafe(9)}"
 
 
 def _experiment_not_found(experiment_id: str) -> HTTPException:
@@ -213,6 +249,112 @@ def build_router(
             else None
         )
         return ResultListResponse(results=items, next_cursor=next_cursor)
+
+    @router.get(
+        "/experiments/{experiment_id}/attestation",
+        response_model=ResultSetAttestationResponse,
+        response_model_exclude_none=True,
+    )
+    async def get_attestation(
+        experiment_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ResultSetAttestationResponse:
+        """#34 §6.3 — the model-blind result-set completion attestation: a COSE-
+        signed in-toto statement over the Merkle root of the experiment's
+        per-unit consensus set, so a tenant-side reduce has a reproducible,
+        tamper-evident input. Available only once the experiment is COMPLETED
+        (the set is final). Built on demand — deterministic from the stored
+        consensus hashes, so no storage and re-callable. The coordinator never
+        reads a payload; it hashes/orders the per-unit consensus hashes it holds."""
+        experiment = _load_experiment_authz(experiment_id, credential)
+        if experiment.status is not ExperimentStatus.COMPLETED:
+            raise HTTPException(
+                status_code=status.HTTP_425_TOO_EARLY,
+                detail={
+                    "error": {
+                        "code": "experiment_not_completed",
+                        "message": (
+                            "result-set attestation is available only once the experiment "
+                            "is COMPLETED (the set is final)"
+                        ),
+                        "details": {"status": experiment.status.value},
+                    }
+                },
+            )
+
+        # Page through ALL consensus units (no silent cap): only units that
+        # reached consensus (have a semantic_hash) AND have an issued receipt
+        # are attested — a disagreed unit produced neither and is excluded.
+        entries: list[ResultSetEntry] = []
+        per_job_db = per_job_factory.get(experiment_id)
+        if per_job_db is not None:
+            repo = ResultRepository(per_job_db)
+            rmap = _receipt_map(experiment_id)
+            after_completed_at: str | None = None
+            after_result_id: str | None = None
+            while True:
+                rows = repo.list_consensus(
+                    limit=MAX_PAGE_SIZE,
+                    after_completed_at=after_completed_at,
+                    after_result_id=after_result_id,
+                )
+                for r in rows:
+                    receipt_id = rmap.get(r.result_id)
+                    if receipt_id is None or r.semantic_hash is None:
+                        continue
+                    entries.append(
+                        ResultSetEntry(
+                            unit_id=r.unit_id,
+                            consensus_result_hash=r.semantic_hash,
+                            receipt_id=receipt_id,
+                        )
+                    )
+                if len(rows) < MAX_PAGE_SIZE:
+                    break
+                after_completed_at = rows[-1].completed_at.isoformat()
+                after_result_id = rows[-1].result_id
+
+        attestation = build_result_set_attestation(
+            attestation_id=_generate_attestation_id(),
+            tenant_experiment_label=experiment.tenant_experiment_label,
+            tenant_id=experiment.tenant_id,
+            entries=entries,
+            signing_key=signing_key,
+            rekor_client=None,
+        )
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            action="attestation.issue",
+            resource_type="experiment",
+            resource_id=experiment_id,
+            payload={
+                "attestation_id": attestation.attestation_id,
+                "merkle_root": attestation.merkle_root,
+                "unit_count": attestation.unit_count,
+                "algorithm": RESULT_SET_ALGORITHM,
+            },
+        )
+        return ResultSetAttestationResponse(
+            attestation_id=attestation.attestation_id,
+            experiment_id=attestation.experiment_id,
+            tenant_id=attestation.tenant_id,
+            merkle_root=attestation.merkle_root,
+            algorithm=attestation.algorithm,
+            unit_count=attestation.unit_count,
+            units=[
+                AttestationUnit(
+                    unit_id=e.unit_id,
+                    consensus_result_hash=e.consensus_result_hash,
+                    receipt_id=e.receipt_id,
+                )
+                for e in attestation.entries
+            ],
+            cose_b64=b64encode(attestation.cose_signed_blob).decode(),
+            signing_key_pubkey_hex=attestation.signing_key_pubkey_hex,
+            rekor_log_index=attestation.rekor_log_index,
+            rekor_entry_uuid=attestation.rekor_entry_uuid,
+        )
 
     @router.get(
         "/experiments/{experiment_id}/results/export",

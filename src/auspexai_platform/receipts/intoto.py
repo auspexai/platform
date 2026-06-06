@@ -19,6 +19,8 @@ import cbor2
 
 INTOTO_STATEMENT_TYPE = "https://www.in-toto.io/Statement/v1"
 AUSPEXAI_RECEIPT_PREDICATE_TYPE = "https://auspexai.network/receipt/v0"
+# #34 §6.3 — experiment-level result-set completion attestation.
+AUSPEXAI_RESULT_SET_PREDICATE_TYPE = "https://auspexai.network/result-set/v0"
 
 
 def build_statement(
@@ -44,6 +46,30 @@ def build_statement(
         ],
         "predicateType": AUSPEXAI_RECEIPT_PREDICATE_TYPE,
         "predicate": receipt_cbor,
+    }
+    return cbor2.dumps(statement, canonical=True)
+
+
+def build_result_set_statement(
+    *,
+    predicate_cbor: bytes,
+    attestation_id: str,
+) -> bytes:
+    """Build an in-toto v1 Statement wrapping a CBOR-encoded result-set
+    attestation predicate (#34 §6.3). Mirrors `build_statement` but with the
+    result-set predicate type; the subject binds the attestation id + a SHA-256
+    digest of the predicate body. Returns canonical CBOR ready for COSE signing."""
+    predicate_digest = hashlib.sha256(predicate_cbor).hexdigest()
+    statement = {
+        "_type": INTOTO_STATEMENT_TYPE,
+        "subject": [
+            {
+                "name": f"auspexai:result-set/{attestation_id}",
+                "digest": {"sha256": predicate_digest},
+            }
+        ],
+        "predicateType": AUSPEXAI_RESULT_SET_PREDICATE_TYPE,
+        "predicate": predicate_cbor,
     }
     return cbor2.dumps(statement, canonical=True)
 
