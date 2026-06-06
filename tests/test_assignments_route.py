@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from auspexai_platform.auth.signature import sign_request
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
+from auspexai_platform.db.repositories.assignments import AssignmentRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 
 AUTHORITY = "testserver"
@@ -614,3 +615,93 @@ def test_refuse_then_other_worker_can_pick_up_unit(
     assert pulled2.status_code == 200
     assert pulled2.json()["work_unit"] is not None
     assert pulled2.json()["work_unit"]["unit_id"] == unit_id
+
+
+def test_retryable_refusal_reoffers_same_worker_via_get(
+    client: TestClient,
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+) -> None:
+    """§2.1 #8 dispatch-retry: a worker that refused for an environmental
+    reason (runner crash) is re-offered the same unit on its next poll — the
+    assignment row is reactivated (attempt_count bumped), not duplicated."""
+    privkey, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    _seed_units(per_job_factory, experiment.experiment_id, ["u1"])
+
+    pulled = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    )
+    unit_id = pulled.json()["work_unit"]["unit_id"]
+    refused = _refuse(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        worker_id=worker.worker_id,
+        unit_id=unit_id,
+        kind="runner_failed",
+        reason="sandbox runner crashed",
+    )
+    assert refused.status_code == 200
+
+    # Same worker polls again → re-offered the same unit.
+    repulled = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    )
+    assert repulled.status_code == 200
+    assert repulled.json()["work_unit"] is not None
+    assert repulled.json()["work_unit"]["unit_id"] == unit_id
+
+    # The row was reactivated in place (single row, refusal cleared, attempt 2).
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    rows = AssignmentRepository(db).list_for_unit(unit_id)
+    assert len(rows) == 1
+    assert rows[0].refused_at is None
+    assert rows[0].attempt_count == 2
+
+
+def test_terminal_refusal_not_reoffered_to_same_worker_via_get(
+    client: TestClient,
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+) -> None:
+    """A policy refusal (tenant deny) keeps the refusing worker excluded — its
+    next poll gets no work (re-offering would just refuse again)."""
+    privkey, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    _seed_units(per_job_factory, experiment.experiment_id, ["u1"])
+
+    pulled = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    )
+    unit_id = pulled.json()["work_unit"]["unit_id"]
+    refused = _refuse(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        worker_id=worker.worker_id,
+        unit_id=unit_id,
+        kind="refused_tenant_deny",
+        reason="this worker denies this tenant",
+    )
+    assert refused.status_code == 200
+
+    repulled = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    )
+    assert repulled.status_code == 200
+    assert repulled.json()["work_unit"] is None

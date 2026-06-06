@@ -8,6 +8,7 @@ import pytest
 
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories.assignments import (
+    AssignmentAlreadyResolvedError,
     AssignmentRepository,
     DuplicateAssignmentError,
 )
@@ -103,6 +104,46 @@ def test_already_assigned_reports_correctly(
         assignment_id="asg-1", unit_id="u1", worker_id="wkr-a", worker_pubkey_hex="a" * 64
     )
     assert assignments_repo.already_assigned("u1", "wkr-a") is True
+
+
+def test_create_starts_attempt_count_at_one(
+    seeded_unit, assignments_repo: AssignmentRepository
+) -> None:
+    a = assignments_repo.create(
+        assignment_id="asg-1", unit_id="u1", worker_id="wkr-a", worker_pubkey_hex="a" * 64
+    )
+    assert a.attempt_count == 1
+
+
+def test_reactivate_clears_refusal_and_bumps_attempt(
+    seeded_unit, assignments_repo: AssignmentRepository
+) -> None:
+    """§2.1 #8 dispatch-retry: reactivate re-arms a refused assignment so the
+    unit can be re-offered to the same worker, bumping the attempt counter and
+    freeing the active-replication slot again."""
+    assignments_repo.create(
+        assignment_id="asg-1", unit_id="u1", worker_id="wkr-a", worker_pubkey_hex="a" * 64
+    )
+    assignments_repo.mark_refused(assignment_id="asg-1", kind="runner_failed", reason="boom")
+    assert assignments_repo.count_active_for_unit("u1") == 0  # refused frees the slot
+
+    updated = assignments_repo.reactivate("asg-1")
+    assert updated.refused_at is None
+    assert updated.refused_kind is None
+    assert updated.refused_reason is None
+    assert updated.attempt_count == 2
+    assert assignments_repo.count_active_for_unit("u1") == 1  # active again
+
+
+def test_reactivate_on_completed_assignment_raises(
+    seeded_unit, assignments_repo: AssignmentRepository
+) -> None:
+    assignments_repo.create(
+        assignment_id="asg-1", unit_id="u1", worker_id="wkr-a", worker_pubkey_hex="a" * 64
+    )
+    assignments_repo.attach_result("asg-1", "res-x")
+    with pytest.raises(AssignmentAlreadyResolvedError):
+        assignments_repo.reactivate("asg-1")
 
 
 # ---- ResultRepository ---------------------------------------------------

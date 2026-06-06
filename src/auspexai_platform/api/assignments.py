@@ -74,7 +74,7 @@ from auspexai_platform.receipts import (
     SigningKey,
     issue_receipts_for_completed_unit,
 )
-from auspexai_platform.scheduler import Scheduler
+from auspexai_platform.scheduler import Scheduler, reoffer_eligible
 
 # ---- response models ------------------------------------------------------
 
@@ -254,17 +254,35 @@ def build_router(
         assignments_repo = AssignmentRepository(per_job_db)
         work_units_repo = WorkUnitRepository(per_job_db)
 
-        try:
-            assignment = assignments_repo.create(
-                assignment_id=_generate_assignment_id(),
-                unit_id=pick.work_unit.unit_id,
-                worker_id=worker.worker_id,
-                worker_pubkey_hex=worker.pubkey_hex,
-            )
-        except DuplicateAssignmentError:
-            # Race: another scheduler call already assigned this unit to
-            # this worker between the eligibility check and the insert.
-            # Return no-work; the next poll will pick a different unit.
+        # §2.1 #8 (dispatch-retry): the scheduler may pick a unit this worker
+        # previously refused for a *retryable* reason (env/transient failure
+        # under the attempt cap). In that case an assignment row already exists
+        # (refused) — re-arm it rather than INSERT into the UNIQUE (unit,worker)
+        # slot. A fresh pairing has no row and takes the create path.
+        existing = assignments_repo.get_for_unit_and_worker(
+            pick.work_unit.unit_id, worker.worker_id
+        )
+        reoffer = False
+        if existing is None:
+            try:
+                assignment = assignments_repo.create(
+                    assignment_id=_generate_assignment_id(),
+                    unit_id=pick.work_unit.unit_id,
+                    worker_id=worker.worker_id,
+                    worker_pubkey_hex=worker.pubkey_hex,
+                )
+            except DuplicateAssignmentError:
+                # Race: another scheduler call already assigned this unit to
+                # this worker between the eligibility check and the insert.
+                # Return no-work; the next poll will pick a different unit.
+                return AssignmentResponse(work_unit=None)
+        elif reoffer_eligible(existing):
+            assignment = assignments_repo.reactivate(existing.assignment_id)
+            reoffer = True
+        else:
+            # Active assignment, or a terminal/exhausted refusal — not
+            # offerable to this worker. (The scheduler normally filters these
+            # out; this guards a race where state changed after the pick.)
             return AssignmentResponse(work_unit=None)
 
         work_units_repo.mark_in_progress(pick.work_unit.unit_id)
@@ -272,13 +290,14 @@ def build_router(
         audit_repository.append(
             actor_class=CredentialClass.WORKER,
             actor_identifier=credential.pubkey_hex,
-            action="assignment.create",
+            action="assignment.reoffer" if reoffer else "assignment.create",
             resource_type="assignment",
             resource_id=assignment.assignment_id,
             payload={
                 "experiment_id": pick.experiment_id,
                 "unit_id": pick.work_unit.unit_id,
                 "worker_id": worker.worker_id,
+                "attempt": assignment.attempt_count,
             },
         )
 

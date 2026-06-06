@@ -35,7 +35,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from auspexai_platform.db.models import ExperimentStatus, TrustTier, Worker, WorkUnit
+from auspexai_platform.db.models import Assignment, ExperimentStatus, TrustTier, Worker, WorkUnit
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AssignmentRepository,
@@ -55,6 +55,63 @@ def replication_floor_for_tier(tier: TrustTier) -> int:
     return _TIER_REPLICATION_FLOOR.get(tier, 3)
 
 
+# §2.1 #8 (dispatch-retry): a refused assignment used to permanently bar the
+# worker from the unit (`already_assigned` skip), which on a small fleet
+# stranded the unit when every worker refused — exactly what M0 hit (the
+# sandbox runner-not-found + runner-crash failures were environmental, not the
+# worker declining the work). Refusals split into two classes by `refused_kind`:
+#
+#   - RETRYABLE: environmental / transient failures that may succeed on a retry,
+#     possibly on the *same* worker once the condition clears (a fixed sandbox,
+#     a cooled GPU). The unit is re-offered (the row is reactivated) up to
+#     MAX_ASSIGNMENT_ATTEMPTS times per worker.
+#   - TERMINAL: policy / capability / integrity refusals that won't change
+#     without operator or capability action (tenant deny/allow-list, sensitive
+#     gate, manifest-hash mismatch, executor refused, explicit manual). The
+#     worker stays excluded — re-offering would just refuse again.
+#
+# The kind strings are exactly what the worker daemon sends to /refuse
+# (DispatchOutcomeKind for post-acceptance failures, DecisionKind for
+# pre-dispatch gate refusals). Unknown kinds default to TERMINAL — a surprise
+# refusal shouldn't silently spin in a retry loop.
+_RETRYABLE_REFUSAL_KINDS = frozenset(
+    {
+        "runner_failed",  # DispatchOutcomeKind.RUNNER_CRASH — runner subprocess crashed
+        "sandbox_unavailable",  # bwrap / sandbox couldn't start (the M0 case)
+        "thermal_critical",  # W-H refuse-when-hot; retry once cooled
+        "submit_failed_transient",  # result submission failed transiently
+    }
+)
+
+# Per-(unit, worker) attempt ceiling: the initial offer + retries. A retryable
+# refusal that keeps recurring is bounded so a genuinely-broken pairing can't
+# loop forever; once exhausted the worker is excluded like a terminal refusal.
+MAX_ASSIGNMENT_ATTEMPTS = 3
+
+
+def is_retryable_refusal(kind: str | None) -> bool:
+    """True if a refusal of this `kind` should re-offer the unit (incl. to the
+    same worker). Unknown / None kinds are treated as terminal."""
+    return kind in _RETRYABLE_REFUSAL_KINDS
+
+
+def reoffer_eligible(
+    assignment: Assignment, *, max_attempts: int = MAX_ASSIGNMENT_ATTEMPTS
+) -> bool:
+    """True if an existing (refused) assignment row can be re-offered to the
+    same worker. Requires: the row is refused (not active, not result-bearing),
+    the refusal kind is retryable, and the attempt cap isn't exhausted. The
+    scheduler uses this to decide eligibility; the assignment route uses it to
+    decide create-vs-reactivate, so the policy lives in one place."""
+    if assignment.result_id is not None:
+        return False
+    if assignment.refused_at is None:
+        return False
+    if not is_retryable_refusal(assignment.refused_kind):
+        return False
+    return assignment.attempt_count < max_attempts
+
+
 class SkipReason(StrEnum):
     """Why the scheduler passed over a unit/experiment for a given worker. The
     shared vocabulary the M4 scheduler-ops console surfaces as 'why a unit isn't
@@ -65,6 +122,8 @@ class SkipReason(StrEnum):
     ALREADY_ASSIGNED = "already_assigned"
     AT_REPLICATION = "at_replication"
     MISSING_CAPABILITY = "missing_capability"
+    TERMINALLY_REFUSED = "terminally_refused"  # §2.1 #8 — refused, not retryable
+    RETRIES_EXHAUSTED = "retries_exhausted"  # §2.1 #8 — retryable but at cap
 
 
 def worker_satisfies(worker: Worker, required_capabilities: dict[str, list[str]]) -> bool:
@@ -139,7 +198,12 @@ class Scheduler:
             for unit in candidates:
                 if unit.replication_target < tier_floor:
                     continue
-                if assignments.already_assigned(unit.unit_id, worker.worker_id):
+                # §2.1 #8 (dispatch-retry): an existing assignment row only
+                # blocks re-offer when it's active (still working / completed)
+                # or terminally/exhaustedly refused. A retryable refusal under
+                # the attempt cap stays eligible — the route reactivates the row.
+                existing = assignments.get_for_unit_and_worker(unit.unit_id, worker.worker_id)
+                if existing is not None and not reoffer_eligible(existing):
                     continue
                 if assignments.count_active_for_unit(unit.unit_id) >= unit.replication_target:
                     continue

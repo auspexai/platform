@@ -254,7 +254,10 @@ class Assignment(BaseModel):
     Result for this assignment. `refused_at` is non-null when the worker
     explicitly refused the assignment via the M3 refuse endpoint
     (manifest-swap defense, sensitive-content gate, tenant deny/allow).
-    A row may not have both `result_id` and `refused_at` set."""
+    A row may not have both `result_id` and `refused_at` set. `attempt_count`
+    starts at 1 and is bumped each time the unit is re-offered to this worker
+    after a retryable refusal (§2.1 #8 dispatch-retry); a re-offer clears the
+    refusal fields, so a refused row always reflects its latest attempt."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -267,6 +270,7 @@ class Assignment(BaseModel):
     refused_at: datetime | None = None
     refused_kind: str | None = None
     refused_reason: str | None = None
+    attempt_count: int = 1
 
 
 class Result(BaseModel):

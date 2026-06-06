@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS assignments (
     refused_at           TEXT,
     refused_kind         TEXT,
     refused_reason       TEXT,
+    attempt_count        INTEGER NOT NULL DEFAULT 1,
     UNIQUE (unit_id, worker_id),
     FOREIGN KEY (unit_id) REFERENCES work_units(unit_id)
 );
@@ -186,11 +187,14 @@ class PerJobDatabaseFactory:
 
 
 def _ensure_assignments_refused_columns(db: Database) -> None:
-    """Idempotently add refused_at / refused_kind / refused_reason columns to
-    the per-job `assignments` table. The columns are part of
-    PER_JOB_SCHEMA_SQL for newly-created DBs, but existing pre-Option-A
-    per-job DBs were created without them; ALTER TABLE ADD COLUMN is the
-    cheap way to converge.
+    """Idempotently add the Option-A assignment-lifecycle columns to the
+    per-job `assignments` table: refused_at / refused_kind / refused_reason
+    (M3 refuse) + attempt_count (§2.1 #8 dispatch-retry — bumped each time a
+    retryable refusal re-offers the unit to the same worker). The columns are
+    part of PER_JOB_SCHEMA_SQL for newly-created DBs, but existing per-job DBs
+    were created without them; ALTER TABLE ADD COLUMN is the cheap way to
+    converge. attempt_count defaults to 1 so pre-existing rows read as their
+    single original attempt.
     """
     _add_columns_idempotent(
         db,
@@ -199,6 +203,7 @@ def _ensure_assignments_refused_columns(db: Database) -> None:
             ("refused_at", "TEXT"),
             ("refused_kind", "TEXT"),
             ("refused_reason", "TEXT"),
+            ("attempt_count", "INTEGER NOT NULL DEFAULT 1"),
         ),
     )
 

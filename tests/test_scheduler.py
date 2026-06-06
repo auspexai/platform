@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from auspexai_platform.db.models import ExperimentStatus, TrustTier, Worker
+from auspexai_platform.db.models import Assignment, ExperimentStatus, TrustTier, Worker
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AssignmentRepository,
@@ -12,7 +12,13 @@ from auspexai_platform.db.repositories import (
     ManifestRepository,
     WorkUnitRepository,
 )
-from auspexai_platform.scheduler import Scheduler, worker_satisfies
+from auspexai_platform.scheduler import (
+    MAX_ASSIGNMENT_ATTEMPTS,
+    Scheduler,
+    is_retryable_refusal,
+    reoffer_eligible,
+    worker_satisfies,
+)
 
 
 def _make_experiment(
@@ -270,6 +276,161 @@ def test_picks_in_progress_unit_that_still_needs_replicas(
     pick = scheduler.pick_for_worker(worker)
     assert pick is not None
     assert pick.work_unit.unit_id == "u1"
+
+
+# ---- §2.1 #8 dispatch-retry: refusal classification + re-offer ------------
+
+
+def _refused_assignment(*, kind: str | None, attempt_count: int = 1, result_id=None) -> Assignment:
+    return Assignment(
+        assignment_id="asg-x",
+        unit_id="u1",
+        worker_id="wkr-a",
+        worker_pubkey_hex="a" * 64,
+        assigned_at=datetime(2026, 6, 1, tzinfo=UTC),
+        result_id=result_id,
+        refused_at=(None if kind is None and result_id else datetime(2026, 6, 1, tzinfo=UTC)),
+        refused_kind=kind,
+        attempt_count=attempt_count,
+    )
+
+
+def test_is_retryable_refusal_classification():
+    # Environmental / transient → retryable (the M0 failure classes).
+    for kind in (
+        "runner_failed",
+        "sandbox_unavailable",
+        "thermal_critical",
+        "submit_failed_transient",
+    ):
+        assert is_retryable_refusal(kind) is True, kind
+    # Policy / capability / integrity → terminal.
+    for kind in (
+        "refused_tenant_deny",
+        "refused_tenant_allow_list_miss",
+        "refused_sensitive",
+        "refused_manifest_swap",
+        "executor_refused",
+        "submit_failed_terminal",
+        "manual",
+    ):
+        assert is_retryable_refusal(kind) is False, kind
+    # Unknown / None default to terminal (no surprise retry loops).
+    assert is_retryable_refusal("something_new") is False
+    assert is_retryable_refusal(None) is False
+
+
+def test_reoffer_eligible_logic():
+    # Retryable + under cap → re-offerable.
+    assert reoffer_eligible(_refused_assignment(kind="runner_failed", attempt_count=1)) is True
+    assert (
+        reoffer_eligible(
+            _refused_assignment(kind="runner_failed", attempt_count=MAX_ASSIGNMENT_ATTEMPTS - 1)
+        )
+        is True
+    )
+    # At the cap → not re-offerable.
+    assert (
+        reoffer_eligible(
+            _refused_assignment(kind="runner_failed", attempt_count=MAX_ASSIGNMENT_ATTEMPTS)
+        )
+        is False
+    )
+    # Terminal kind → never re-offerable, regardless of attempts.
+    assert (
+        reoffer_eligible(_refused_assignment(kind="refused_tenant_deny", attempt_count=1)) is False
+    )
+    # A result-bearing (completed) assignment is never re-offerable.
+    assert reoffer_eligible(_refused_assignment(kind=None, result_id="res-1")) is False
+
+
+def test_retryable_refusal_reoffers_same_worker(
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+) -> None:
+    """The M0 scenario: a worker refuses for an environmental reason
+    (runner crash). On a small fleet it must remain eligible for re-offer
+    rather than being permanently barred from the unit."""
+    _, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    # Default replication_target (3) matches the enrolled_worker's T0 tier floor.
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}])
+    assignments = AssignmentRepository(db)
+    assignments.create(
+        assignment_id="asg-1",
+        unit_id="u1",
+        worker_id=worker.worker_id,
+        worker_pubkey_hex=worker.pubkey_hex,
+    )
+    assignments.mark_refused(assignment_id="asg-1", kind="runner_failed", reason="sandbox boom")
+
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+    pick = scheduler.pick_for_worker(worker)
+    assert pick is not None
+    assert pick.work_unit.unit_id == "u1"
+
+
+def test_terminal_refusal_excludes_worker(
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+) -> None:
+    """A policy refusal (tenant deny) keeps the worker excluded — re-offering
+    would just refuse again."""
+    _, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    # Default replication_target (3) matches the enrolled_worker's T0 tier floor.
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}])
+    assignments = AssignmentRepository(db)
+    assignments.create(
+        assignment_id="asg-1",
+        unit_id="u1",
+        worker_id=worker.worker_id,
+        worker_pubkey_hex=worker.pubkey_hex,
+    )
+    assignments.mark_refused(
+        assignment_id="asg-1", kind="refused_tenant_deny", reason="tenant denied"
+    )
+
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+    assert scheduler.pick_for_worker(worker) is None
+
+
+def test_retryable_refusal_excluded_once_attempts_exhausted(
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+) -> None:
+    """A retryable refusal that keeps recurring is bounded: after
+    MAX_ASSIGNMENT_ATTEMPTS the worker is excluded like a terminal refusal."""
+    _, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    # Default replication_target (3) matches the enrolled_worker's T0 tier floor.
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}])
+    assignments = AssignmentRepository(db)
+    assignments.create(
+        assignment_id="asg-1",
+        unit_id="u1",
+        worker_id=worker.worker_id,
+        worker_pubkey_hex=worker.pubkey_hex,
+    )
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+    # Drive attempts up to the cap: refuse → (scheduler re-offers) → reactivate.
+    for _attempt in range(1, MAX_ASSIGNMENT_ATTEMPTS):
+        assignments.mark_refused(assignment_id="asg-1", kind="runner_failed", reason="boom")
+        assert scheduler.pick_for_worker(worker) is not None  # still eligible
+        assignments.reactivate("asg-1")
+    # Final refusal brings attempt_count to the cap → no more re-offers.
+    assignments.mark_refused(assignment_id="asg-1", kind="runner_failed", reason="boom")
+    assert assignments.get_by_id("asg-1").attempt_count == MAX_ASSIGNMENT_ATTEMPTS
+    assert scheduler.pick_for_worker(worker) is None
 
 
 def test_skips_experiment_with_no_per_job_db(

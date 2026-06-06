@@ -116,6 +116,43 @@ class AssignmentRepository:
         assert got is not None
         return got
 
+    def reactivate(self, assignment_id: str) -> Assignment:
+        """Re-arm a previously-refused assignment so the unit can be re-offered
+        to the same worker (§2.1 #8 dispatch-retry).
+
+        Clears the refusal fields, stamps a fresh `assigned_at`, and bumps
+        `attempt_count`. Used only for *retryable* refusals (environmental /
+        transient failures — runner crash, sandbox unavailable, thermal) that
+        may succeed on a retry; terminal refusals (policy / capability) are
+        never reactivated. Raises AssignmentNotFoundError if the id is unknown
+        and AssignmentAlreadyResolvedError if the assignment has a result (a
+        completed assignment is not re-offerable).
+        """
+        existing = self.get_by_id(assignment_id)
+        if existing is None:
+            raise AssignmentNotFoundError(assignment_id)
+        if existing.result_id is not None:
+            raise AssignmentAlreadyResolvedError(
+                f"assignment {assignment_id} already has result_id={existing.result_id!r}"
+            )
+        reassigned_at = datetime.now(UTC).isoformat()
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE assignments
+                   SET refused_at = NULL,
+                       refused_kind = NULL,
+                       refused_reason = NULL,
+                       assigned_at = ?,
+                       attempt_count = attempt_count + 1
+                 WHERE assignment_id = ?
+                """,
+                (reassigned_at, assignment_id),
+            )
+        got = self.get_by_id(assignment_id)
+        assert got is not None
+        return got
+
     # ---- reads ----
 
     def get_by_id(self, assignment_id: str) -> Assignment | None:
@@ -182,6 +219,7 @@ class AssignmentRepository:
     def _row_to_assignment(row: sqlite3.Row) -> Assignment:
         keys = row.keys()
         refused_at_raw = row["refused_at"] if "refused_at" in keys else None
+        attempt_count_raw = row["attempt_count"] if "attempt_count" in keys else None
         return Assignment(
             assignment_id=row["assignment_id"],
             unit_id=row["unit_id"],
@@ -192,4 +230,5 @@ class AssignmentRepository:
             refused_at=(datetime.fromisoformat(refused_at_raw) if refused_at_raw else None),
             refused_kind=row["refused_kind"] if "refused_kind" in keys else None,
             refused_reason=row["refused_reason"] if "refused_reason" in keys else None,
+            attempt_count=int(attempt_count_raw) if attempt_count_raw is not None else 1,
         )
