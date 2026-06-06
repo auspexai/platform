@@ -74,6 +74,22 @@ def test_worker_satisfies_requires_all_models():
     assert not worker_satisfies(_worker(worker_id="w", models=None), {"models": ["m-a"]})
 
 
+def test_worker_satisfies_auto_acquire_matches_any_model():
+    """M3 lazy auto-acquire: an auto_acquire worker satisfies a model
+    requirement it doesn't yet hold (it'll pull on assignment); a worker without
+    the model and without auto_acquire does not."""
+    aa = Worker(
+        worker_id="wkr-aa",
+        pubkey_hex="a" * 64,
+        trust_tier=TrustTier.T2_TRUSTED,
+        capabilities={"os": "linux", "auto_acquire": True},
+        registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    assert worker_satisfies(aa, {"models": ["m-x"]}) is True
+    # auto_acquire must be exactly True, not just any truthy junk in the dict.
+    assert worker_satisfies(_worker(worker_id="w", models=["m-y"]), {"models": ["m-x"]}) is False
+
+
 def test_scheduler_routes_only_to_capable_workers(
     registered_tenant,
     per_job_factory: PerJobDatabaseFactory,

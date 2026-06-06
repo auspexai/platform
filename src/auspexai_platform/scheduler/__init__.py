@@ -132,9 +132,20 @@ def worker_satisfies(worker: Worker, required_capabilities: dict[str, list[str]]
     "models" key against the worker's declared `capabilities["models"]` inventory
     by EXACT store model_id (hash-agreement consensus needs identical quants).
     Empty requirement ⇒ always satisfied (the pre-M1 behavior — every worker
-    eligible). Unknown capability dimensions are ignored in Phase-1."""
+    eligible). Unknown capability dimensions are ignored in Phase-1.
+
+    M3 (lazy auto-acquire): a worker that declares `capabilities["auto_acquire"]`
+    satisfies any model requirement — on assignment it pulls a missing
+    locally-required model (reading coords from the staged manifest) and then
+    runs, rather than refusing. The scheduler's replication bound still caps how
+    many such workers ever get the unit, so the acquisition fan-out is naturally
+    sized (≤ replication_target pull). If the manifest carries no acquisition
+    coords, the worker refuses on assignment (model_not_acquirable) — surfaced as
+    demand, not a silent stall."""
     required_models = set(required_capabilities.get("models", []))
     if not required_models:
+        return True
+    if worker.capabilities.get("auto_acquire") is True:
         return True
     have = worker.capabilities.get("models", [])
     have_models = set(have) if isinstance(have, list) else set()
