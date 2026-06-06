@@ -77,6 +77,10 @@ class SchedulerWorker(BaseModel):
     paused: bool
     degraded: bool = False  # M5: heartbeat thermal state == critical (routed around)
     self_paused: bool = False  # §2.1 #11: volunteer self-pause (owner hold)
+    # M9 leg 4: the worker's declared code-execution mode (synthetic/provisioned/off).
+    # Explains real-execution eligibility — a synthetic worker is excluded from
+    # model-gated experiments (it would echo). Absent declaration ⇒ "synthetic".
+    execute_tenant_code: str = "synthetic"
     eligible_experiment_count: int  # approved experiments w/ outstanding work this worker can take
 
 
@@ -220,6 +224,7 @@ def build_router(
                 paused=w.paused_at is not None,
                 degraded=worker_is_degraded(w),
                 self_paused=worker_is_self_paused(w),
+                execute_tenant_code=(w.capabilities.get("execute_tenant_code") or "synthetic"),
                 eligible_experiment_count=elig_count.get(w.worker_id, 0),
             )
             for w in on_network

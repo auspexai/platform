@@ -252,6 +252,8 @@ def create_app(
             retired_key_repository,
             tenant_registry,
             worker_registry,
+            experiment_repository,
+            per_job_factory,
         ),
         prefix="/api/v0",
         tags=["workers"],

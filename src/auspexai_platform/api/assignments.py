@@ -50,7 +50,7 @@ from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.dependency import require_worker
-from auspexai_platform.db.models import ExperimentStatus, TrustTier, WorkUnitStatus
+from auspexai_platform.db.models import ExperimentStatus, TrustTier
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AssignmentRepository,
@@ -460,7 +460,7 @@ def build_router(
             completed_at=body.completed_at,
         )
         assignments_repo.attach_result(assignment.assignment_id, result.result_id)
-        updated_unit = work_units_repo.increment_completions(unit_id)
+        updated_unit, just_completed = work_units_repo.increment_completions(unit_id)
 
         audit_repository.append(
             actor_class=CredentialClass.WORKER,
@@ -497,7 +497,10 @@ def build_router(
         # auto-transition the experiment to 'completed'. Only fires on
         # status=approved — paused experiments stay paused until resumed,
         # and the resume action re-checks.
-        if updated_unit.status is WorkUnitStatus.COMPLETED:
+        # M9 leg 3: gate on `just_completed` (the FIRST transition), not on the
+        # completed status — so a late/extra result from a rejoined worker doesn't
+        # re-issue receipts / re-promote consensus / re-emit the attestation.
+        if just_completed:
             # M7c: hash_agreement reducer + receipt issuance. Best-effort
             # from the route's perspective — if it fails, the unit stays
             # `completed` (it really is done from a scheduling standpoint)

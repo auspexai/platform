@@ -33,7 +33,7 @@ See the CI-red postmortem 2026-05-30 and the matching note in api/accounts.py.
 """
 
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -44,9 +44,11 @@ from auspexai_platform.auth.dependency import require_maintainer, require_worker
 from auspexai_platform.auth.tenant_registry import TenantRegistry
 from auspexai_platform.auth.worker_registry import WorkerRegistry
 from auspexai_platform.db.models import TrustTier
+from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AccountRepository,
     AuditRepository,
+    ExperimentRepository,
     RetiredKeyRepository,
     WorkerRepository,
 )
@@ -61,6 +63,7 @@ from auspexai_platform.db.repositories.workers import (
 )
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.rate_limit import limiter
+from auspexai_platform.scheduler.capacity import experiments_collapsed_by_removing
 
 # ---- request / response models --------------------------------------------
 
@@ -81,6 +84,24 @@ class WorkerResponse(BaseModel):
     pubkey_hex: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     account_id: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     capabilities: Annotated[dict[str, Any] | None, ExposureTag.OPERATOR_ONLY] = None
+
+
+class CapacityWarning(BaseModel):
+    """M9 leg 1: an active experiment whose eligible-worker pool collapses to zero
+    because of a pause (warn-but-allow — the pause still happens)."""
+
+    experiment_id: str
+    tenant_id: str
+    tenant_experiment_label: str | None = None
+    needs_work: int
+
+
+class WorkerPauseResponse(WorkerResponse):
+    """The pause response — a WorkerResponse plus the M9 capacity warning. The
+    list is present (possibly empty) for a maintainer; omitted entirely when no
+    experiment is affected (`response_model_exclude_none` + None)."""
+
+    capacity_warning: Annotated[list[CapacityWarning] | None, ExposureTag.OPERATOR_ONLY] = None
 
 
 class WorkerListResponse(BaseModel):
@@ -202,6 +223,8 @@ def build_router(
     retired_key_repository: RetiredKeyRepository,
     tenant_registry: TenantRegistry,
     worker_registry: WorkerRegistry,
+    experiment_repository: ExperimentRepository,
+    per_job_factory: PerJobDatabaseFactory,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -620,15 +643,26 @@ def build_router(
 
     @router.post(
         "/workers/{worker_id}/actions/pause",
-        response_model=WorkerResponse,
+        response_model=WorkerPauseResponse,
         response_model_exclude_none=True,
     )
     async def pause_worker(
         worker_id: str,
         body: WorkerPauseRequest,
         credential: Credential = Depends(credential_dep),  # noqa: B008
-    ) -> WorkerResponse:
+    ) -> WorkerPauseResponse:
         require_maintainer(credential)
+        # M9 leg 1 (warn-but-allow): compute the capacity impact BEFORE pausing,
+        # while the worker is still in the schedulable set — afterwards it's
+        # excluded and the before/after comparison would be a no-op. The pause
+        # proceeds regardless; we only surface + audit the collapse.
+        collapsed = experiments_collapsed_by_removing(
+            worker_id,
+            worker_repository=worker_repository,
+            experiment_repository=experiment_repository,
+            per_job_factory=per_job_factory,
+            now=datetime.now(UTC),
+        )
         try:
             worker = worker_repository.pause(worker_id, body.reason)
         except WorkerNotFoundError as e:
@@ -643,15 +677,33 @@ def build_router(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"error": {"code": "worker_retired", "message": str(e)}},
             ) from e
+        warnings = [
+            CapacityWarning(
+                experiment_id=c.experiment_id,
+                tenant_id=c.tenant_id,
+                tenant_experiment_label=c.tenant_experiment_label,
+                needs_work=c.needs_work,
+            )
+            for c in collapsed
+        ]
         audit_repository.append(
             actor_class=credential.kind,
             actor_identifier=credential.pubkey_hex,
             action="worker.pause",
             resource_type="worker",
             resource_id=worker.worker_id,
-            payload={"reason": body.reason},
+            payload={
+                "reason": body.reason,
+                # Record the collapse so a later "why did exp X stall?" has the
+                # audit trail; empty when the pause blocked nothing.
+                "experiments_blocked": [c.experiment_id for c in collapsed],
+            },
         )
-        return filter_for_credential(_worker_to_response(worker), credential)
+        filtered = filter_for_credential(_worker_to_response(worker), credential)
+        return WorkerPauseResponse(
+            **filtered.model_dump(),
+            capacity_warning=warnings or None,
+        )
 
     @router.post(
         "/workers/{worker_id}/actions/unpause",

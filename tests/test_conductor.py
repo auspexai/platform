@@ -21,7 +21,11 @@ _COORDS_MODEL = {
 def _approved_exp_requiring_mx(manifest_repository, experiment_repository, *, tenant_id):
     manifest = manifest_repository.insert(
         tenant_id=tenant_id,
-        manifest_json={"tenant_id": tenant_id, "experiment_id": "exp-label", "models": [_COORDS_MODEL]},
+        manifest_json={
+            "tenant_id": tenant_id,
+            "experiment_id": "exp-label",
+            "models": [_COORDS_MODEL],
+        },
         signature_json={},
     )
     exp = experiment_repository.create(
@@ -62,23 +66,31 @@ def test_conductor_directs_eligible_auto_acquire_worker(
     db, manifest_repository, experiment_repository, worker_repository, registered_tenant
 ):
     _, binding = registered_tenant
-    _approved_exp_requiring_mx(manifest_repository, experiment_repository, tenant_id=binding.tenant_id)
+    _approved_exp_requiring_mx(
+        manifest_repository, experiment_repository, tenant_id=binding.tenant_id
+    )
     w = _enroll(
         worker_repository,
         worker_id="wkr-aa",
         caps={"os": "linux", "auto_acquire": True},  # eligible, lacks m-x
     )
     directives = _plan(
-        w, db=db, experiment_repository=experiment_repository,
-        manifest_repository=manifest_repository, worker_repository=worker_repository,
+        w,
+        db=db,
+        experiment_repository=experiment_repository,
+        manifest_repository=manifest_repository,
+        worker_repository=worker_repository,
     )
     assert [d.model_id for d in directives] == ["m-x"]
     assert directives[0].hf_repo == "Org/M-GGUF"
     assert directives[0].hf_filename == "M-Q4.gguf"
     # Idempotent: a second poll doesn't create a duplicate.
     again = _plan(
-        w, db=db, experiment_repository=experiment_repository,
-        manifest_repository=manifest_repository, worker_repository=worker_repository,
+        w,
+        db=db,
+        experiment_repository=experiment_repository,
+        manifest_repository=manifest_repository,
+        worker_repository=worker_repository,
     )
     assert len(again) == 1
 
@@ -87,23 +99,36 @@ def test_conductor_skips_non_auto_acquire_worker(
     db, manifest_repository, experiment_repository, worker_repository, registered_tenant
 ):
     _, binding = registered_tenant
-    _approved_exp_requiring_mx(manifest_repository, experiment_repository, tenant_id=binding.tenant_id)
+    _approved_exp_requiring_mx(
+        manifest_repository, experiment_repository, tenant_id=binding.tenant_id
+    )
     w = _enroll(worker_repository, worker_id="wkr-no", caps={"os": "linux"})  # no auto_acquire
-    assert _plan(
-        w, db=db, experiment_repository=experiment_repository,
-        manifest_repository=manifest_repository, worker_repository=worker_repository,
-    ) == []
+    assert (
+        _plan(
+            w,
+            db=db,
+            experiment_repository=experiment_repository,
+            manifest_repository=manifest_repository,
+            worker_repository=worker_repository,
+        )
+        == []
+    )
 
 
 def test_conductor_marks_acquired_when_model_appears(
     db, manifest_repository, experiment_repository, worker_repository, registered_tenant
 ):
     _, binding = registered_tenant
-    _approved_exp_requiring_mx(manifest_repository, experiment_repository, tenant_id=binding.tenant_id)
+    _approved_exp_requiring_mx(
+        manifest_repository, experiment_repository, tenant_id=binding.tenant_id
+    )
     w = _enroll(worker_repository, worker_id="wkr-aa", caps={"os": "linux", "auto_acquire": True})
     _plan(  # creates the directive
-        w, db=db, experiment_repository=experiment_repository,
-        manifest_repository=manifest_repository, worker_repository=worker_repository,
+        w,
+        db=db,
+        experiment_repository=experiment_repository,
+        manifest_repository=manifest_repository,
+        worker_repository=worker_repository,
     )
     # Worker now reports m-x in inventory → next poll marks it acquired (no open directive left).
     worker_repository.record_heartbeat(
@@ -111,8 +136,11 @@ def test_conductor_marks_acquired_when_model_appears(
     )
     w2 = worker_repository.get_by_id("wkr-aa")
     directives = _plan(
-        w2, db=db, experiment_repository=experiment_repository,
-        manifest_repository=manifest_repository, worker_repository=worker_repository,
+        w2,
+        db=db,
+        experiment_repository=experiment_repository,
+        manifest_repository=manifest_repository,
+        worker_repository=worker_repository,
     )
     assert directives == []
     repo = ModelPrestageRepository(db)
@@ -125,19 +153,35 @@ def test_conductor_bounds_fanout_by_supply(
     # need = replication (3, STANDARD default) + churn_margin (1) = 4. Once 4 open
     # rows exist, a 5th eligible worker is not directed.
     _, binding = registered_tenant
-    _approved_exp_requiring_mx(manifest_repository, experiment_repository, tenant_id=binding.tenant_id)
+    _approved_exp_requiring_mx(
+        manifest_repository, experiment_repository, tenant_id=binding.tenant_id
+    )
     for i in range(4):
         w = _enroll(
             worker_repository, worker_id=f"wkr-{i}", caps={"os": "linux", "auto_acquire": True}
         )
-        assert len(_plan(
-            w, db=db, experiment_repository=experiment_repository,
-            manifest_repository=manifest_repository, worker_repository=worker_repository,
-        )) == 1
+        assert (
+            len(
+                _plan(
+                    w,
+                    db=db,
+                    experiment_repository=experiment_repository,
+                    manifest_repository=manifest_repository,
+                    worker_repository=worker_repository,
+                )
+            )
+            == 1
+        )
     fifth = _enroll(
         worker_repository, worker_id="wkr-5", caps={"os": "linux", "auto_acquire": True}
     )
-    assert _plan(
-        fifth, db=db, experiment_repository=experiment_repository,
-        manifest_repository=manifest_repository, worker_repository=worker_repository,
-    ) == []  # supply (4 in-flight) already meets need
+    assert (
+        _plan(
+            fifth,
+            db=db,
+            experiment_repository=experiment_repository,
+            manifest_repository=manifest_repository,
+            worker_repository=worker_repository,
+        )
+        == []
+    )  # supply (4 in-flight) already meets need

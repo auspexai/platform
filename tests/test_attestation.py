@@ -93,6 +93,40 @@ def test_build_attestation_signature_rejects_wrong_key(tmp_path: Path):
         cose_sign1_decode(att.cose_signed_blob, expected_pubkey=other.public_key)
 
 
+def test_partial_flag_signs_in_predicate_but_does_not_change_root(tmp_path: Path):
+    """M9 leg 2: partial=True is carried in the COSE-signed predicate (tamper-
+    evident) but the Merkle root is purely over entries — so a checkpoint and the
+    eventual completed attestation over the SAME set share a root. partial=False
+    omits the key entirely (completed predicate stays byte-identical to M7)."""
+    key = load_or_generate_signing_key(tmp_path / "sign.key")
+    entries = [_entry("u1", "h1", "rcpt-1"), _entry("u2", "h2", "rcpt-2")]
+    complete = build_result_set_attestation(
+        attestation_id="att-c",
+        tenant_experiment_label="x",
+        tenant_id="t",
+        entries=entries,
+        signing_key=key,
+        partial=False,
+    )
+    chkpt = build_result_set_attestation(
+        attestation_id="att-p",
+        tenant_experiment_label="x",
+        tenant_id="t",
+        entries=entries,
+        signing_key=key,
+        partial=True,
+    )
+    assert complete.merkle_root == chkpt.merkle_root  # root unaffected by partial
+    assert complete.partial is False and chkpt.partial is True
+
+    comp_payload, _ = cose_sign1_decode(complete.cose_signed_blob, expected_pubkey=key.public_key)
+    chk_payload, _ = cose_sign1_decode(chkpt.cose_signed_blob, expected_pubkey=key.public_key)
+    comp_pred = cbor2.loads(cbor2.loads(comp_payload)["predicate"])
+    chk_pred = cbor2.loads(cbor2.loads(chk_payload)["predicate"])
+    assert "partial" not in comp_pred  # omitted when False — byte-stable completed predicate
+    assert chk_pred["partial"] is True
+
+
 # ---- route: GET /experiments/{id}/attestation ------------------------------
 
 from datetime import UTC, datetime  # noqa: E402
@@ -109,7 +143,12 @@ AUTHORITY = "testserver"
 
 def _signed_get(client, *, privkey, pubkey_hex, path):
     headers = sign_request(
-        privkey=privkey, pubkey_hex=pubkey_hex, method="GET", path=path, authority=AUTHORITY, body=b""
+        privkey=privkey,
+        pubkey_hex=pubkey_hex,
+        method="GET",
+        path=path,
+        authority=AUTHORITY,
+        body=b"",
     )
     return client.get(path, headers=headers)
 
@@ -180,12 +219,20 @@ class TestAttestationRoute:
         privkey, binding, experiment, _ = approved_experiment
         _, worker = enrolled_worker
         e1 = _seed_consensus_unit(
-            per_job_factory, receipt_index_repository, experiment.experiment_id,
-            unit_id="u1", payload={"v": 1}, worker_id=worker.worker_id,
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u1",
+            payload={"v": 1},
+            worker_id=worker.worker_id,
         )
         e2 = _seed_consensus_unit(
-            per_job_factory, receipt_index_repository, experiment.experiment_id,
-            unit_id="u2", payload={"v": 2}, worker_id=worker.worker_id,
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u2",
+            payload={"v": 2},
+            worker_id=worker.worker_id,
         )
         experiment_repository.update_status(experiment.experiment_id, ExperimentStatus.COMPLETED)
 
@@ -205,7 +252,92 @@ class TestAttestationRoute:
         from base64 import b64decode
 
         key = client.app.state.receipt_signing_key
-        payload, kid = cose_sign1_decode(b64decode(body["cose_b64"]), expected_pubkey=key.public_key)
+        payload, kid = cose_sign1_decode(
+            b64decode(body["cose_b64"]), expected_pubkey=key.public_key
+        )
         assert kid == key.pubkey_hex
         statement = cbor2.loads(payload)
         assert cbor2.loads(statement["predicate"])["merkle_root"] == expected
+        # A completed attestation is not partial.
+        assert body.get("partial") in (False, None)
+
+    def test_checkpoint_partial_attestation_when_not_completed(
+        self,
+        client: TestClient,
+        approved_experiment,
+        enrolled_worker,
+        per_job_factory: PerJobDatabaseFactory,
+        receipt_index_repository,
+    ):
+        """M9 leg 2: ?checkpoint=true on a still-APPROVED experiment returns a
+        partial attestation over the consensus-so-far set, marked partial both in
+        the response and in the COSE-signed predicate."""
+        privkey, binding, experiment, _ = approved_experiment
+        _, worker = enrolled_worker
+        e1 = _seed_consensus_unit(
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u1",
+            payload={"v": 1},
+            worker_id=worker.worker_id,
+        )
+        # experiment stays APPROVED (not completed) — the stall/partial case.
+        # Sign the bare @path; checkpoint rides as an unsigned query param.
+        bare = f"/api/v0/experiments/{experiment.experiment_id}/attestation"
+        headers = sign_request(
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            method="GET",
+            path=bare,
+            authority=AUTHORITY,
+            body=b"",
+        )
+        resp = client.get(bare, headers=headers, params={"checkpoint": "true"})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["partial"] is True
+        assert body["unit_count"] == 1
+        assert body["merkle_root"] == merkle_root([ResultSetEntry(*e1)])
+        # the partial flag is in the SIGNED predicate, not just the response
+        from base64 import b64decode
+
+        key = client.app.state.receipt_signing_key
+        payload, _ = cose_sign1_decode(b64decode(body["cose_b64"]), expected_pubkey=key.public_key)
+        pred = cbor2.loads(cbor2.loads(payload)["predicate"])
+        assert pred["partial"] is True
+
+    def test_checkpoint_on_completed_is_not_partial(
+        self,
+        client: TestClient,
+        approved_experiment,
+        enrolled_worker,
+        per_job_factory: PerJobDatabaseFactory,
+        receipt_index_repository,
+        experiment_repository,
+    ):
+        """?checkpoint=true on an already-COMPLETED experiment is just the final
+        attestation — partial reflects set-finality, not the caller's flag."""
+        privkey, binding, experiment, _ = approved_experiment
+        _, worker = enrolled_worker
+        _seed_consensus_unit(
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u1",
+            payload={"v": 1},
+            worker_id=worker.worker_id,
+        )
+        experiment_repository.update_status(experiment.experiment_id, ExperimentStatus.COMPLETED)
+        bare = f"/api/v0/experiments/{experiment.experiment_id}/attestation"
+        headers = sign_request(
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            method="GET",
+            path=bare,
+            authority=AUTHORITY,
+            body=b"",
+        )
+        resp = client.get(bare, headers=headers, params={"checkpoint": "true"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["partial"] is False

@@ -49,10 +49,21 @@ def _make_experiment(
     return experiment
 
 
-def _worker(*, worker_id: str, models: list[str] | None, tier: TrustTier = TrustTier.T2_TRUSTED):
+def _worker(
+    *,
+    worker_id: str,
+    models: list[str] | None,
+    tier: TrustTier = TrustTier.T2_TRUSTED,
+    execute_tenant_code: str | None = "provisioned",
+):
+    # M9 leg 4: a model-holding worker that's meant to RUN real units declares
+    # provisioned mode (the default here); pass execute_tenant_code="synthetic"/None
+    # to exercise the consensus-safe exclusion.
     caps: dict = {"os": "linux"}
     if models is not None:
         caps["models"] = models
+    if execute_tenant_code is not None:
+        caps["execute_tenant_code"] = execute_tenant_code
     return Worker(
         worker_id=worker_id,
         pubkey_hex="a" * 64,
@@ -84,12 +95,27 @@ def test_worker_satisfies_auto_acquire_matches_any_model():
         worker_id="wkr-aa",
         pubkey_hex="a" * 64,
         trust_tier=TrustTier.T2_TRUSTED,
-        capabilities={"os": "linux", "auto_acquire": True},
+        # auto_acquire is only meaningful under provisioned (the daemon only
+        # declares it then) — so an auto_acquire worker is provisioned.
+        capabilities={"os": "linux", "auto_acquire": True, "execute_tenant_code": "provisioned"},
         registered_at=datetime(2026, 6, 1, tzinfo=UTC),
     )
     assert worker_satisfies(aa, {"models": ["m-x"]}) is True
     # auto_acquire must be exactly True, not just any truthy junk in the dict.
     assert worker_satisfies(_worker(worker_id="w", models=["m-y"]), {"models": ["m-x"]}) is False
+
+
+def test_worker_satisfies_excludes_synthetic_mode_worker():
+    """M9 leg 4 (consensus-safe routing): a synthetic/off-mode worker is NOT
+    eligible for a model-gated (real-execution) experiment even if it holds the
+    exact model — its echo would pollute consensus. A no-requirement experiment
+    is still open to it (the doubler/test-tenant path)."""
+    synth = _worker(worker_id="w-synth", models=["m-x"], execute_tenant_code="synthetic")
+    off = _worker(worker_id="w-off", models=["m-x"], execute_tenant_code="off")
+    undeclared = _worker(worker_id="w-bare", models=["m-x"], execute_tenant_code=None)
+    for w in (synth, off, undeclared):
+        assert worker_satisfies(w, {"models": ["m-x"]}) is False  # excluded from real work
+        assert worker_satisfies(w, {}) is True  # but still eligible for unrequired work
 
 
 def test_scheduler_routes_only_to_capable_workers(

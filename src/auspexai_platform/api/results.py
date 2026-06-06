@@ -101,6 +101,10 @@ class ResultSetAttestationResponse(BaseModel):
     signing_key_pubkey_hex: Annotated[str | None, ExposureTag.PUBLIC] = None
     rekor_log_index: Annotated[int | None, ExposureTag.PUBLIC] = None
     rekor_entry_uuid: Annotated[str | None, ExposureTag.PUBLIC] = None
+    # M9 leg 2: True when this is a checkpoint over a not-yet-COMPLETED experiment
+    # (consensus-so-far). Always present so the tenant can branch on it; the same
+    # flag lives in the COSE-signed predicate.
+    partial: Annotated[bool | None, ExposureTag.PUBLIC] = None
 
 
 def _require_researcher_own_tenant_or_maintainer(
@@ -258,17 +262,26 @@ def build_router(
     )
     async def get_attestation(
         experiment_id: str,
+        checkpoint: bool = False,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ResultSetAttestationResponse:
-        """#34 §6.3 — the model-blind result-set completion attestation: a COSE-
-        signed in-toto statement over the Merkle root of the experiment's
-        per-unit consensus set, so a tenant-side reduce has a reproducible,
-        tamper-evident input. Available only once the experiment is COMPLETED
-        (the set is final). Built on demand — deterministic from the stored
-        consensus hashes, so no storage and re-callable. The coordinator never
-        reads a payload; it hashes/orders the per-unit consensus hashes it holds."""
+        """#34 §6.3 — the model-blind result-set attestation: a COSE-signed in-toto
+        statement over the Merkle root of the experiment's per-unit consensus set,
+        so a tenant-side reduce has a reproducible, tamper-evident input. Built on
+        demand — deterministic from the stored consensus hashes, so no storage and
+        re-callable. The coordinator never reads a payload; it hashes/orders the
+        per-unit consensus hashes it holds.
+
+        Default: available only once the experiment is COMPLETED (the set is final).
+        **M9 leg 2 — `?checkpoint=true`**: also returns an attestation over a
+        not-yet-complete experiment's consensus-so-far set, marked `partial: true`
+        (in the response AND the signed predicate). This is the integrity anchor
+        for a partial collection when a pause/capacity-collapse stalls an experiment
+        before 100% — the researcher's results are tamper-evident even mid-run, and
+        the M8 `run_until` finalize-on-partial reduces over exactly this set."""
         experiment = _load_experiment_authz(experiment_id, credential)
-        if experiment.status is not ExperimentStatus.COMPLETED:
+        is_complete = experiment.status is ExperimentStatus.COMPLETED
+        if not is_complete and not checkpoint:
             raise HTTPException(
                 status_code=status.HTTP_425_TOO_EARLY,
                 detail={
@@ -276,12 +289,17 @@ def build_router(
                         "code": "experiment_not_completed",
                         "message": (
                             "result-set attestation is available only once the experiment "
-                            "is COMPLETED (the set is final)"
+                            "is COMPLETED (the set is final); pass ?checkpoint=true for a "
+                            "partial consensus-so-far attestation"
                         ),
                         "details": {"status": experiment.status.value},
                     }
                 },
             )
+        # A checkpoint of an already-complete experiment is just the final
+        # attestation (not partial) — `partial` reflects set-finality, not the
+        # caller's flag.
+        partial = not is_complete
 
         # Only units that reached consensus (have a semantic_hash) AND have an
         # issued receipt are attested — a disagreed unit produced neither and is
@@ -300,11 +318,12 @@ def build_router(
             entries=entries,
             signing_key=signing_key,
             rekor_client=None,
+            partial=partial,
         )
         audit_repository.append(
             actor_class=credential.kind,
             actor_identifier=credential.pubkey_hex,
-            action="attestation.issue",
+            action="attestation.checkpoint" if partial else "attestation.issue",
             resource_type="experiment",
             resource_id=experiment_id,
             payload={
@@ -312,6 +331,7 @@ def build_router(
                 "merkle_root": attestation.merkle_root,
                 "unit_count": attestation.unit_count,
                 "algorithm": RESULT_SET_ALGORITHM,
+                "partial": partial,
             },
         )
         return ResultSetAttestationResponse(
@@ -333,6 +353,7 @@ def build_router(
             signing_key_pubkey_hex=attestation.signing_key_pubkey_hex,
             rekor_log_index=attestation.rekor_log_index,
             rekor_entry_uuid=attestation.rekor_entry_uuid,
+            partial=attestation.partial,
         )
 
     @router.get(

@@ -707,6 +707,99 @@ def test_terminal_refusal_not_reoffered_to_same_worker_via_get(
     assert repulled.json()["work_unit"] is None
 
 
+def test_late_result_does_not_refire_completion(
+    client: TestClient,
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    worker_repository,
+) -> None:
+    """M9 leg 3: a unit at replication_target=1 completes on the first result;
+    a SECOND (late, e.g. rejoined-worker) result for the same unit is accepted +
+    stored as a durable replica but must NOT re-fire the completion machinery —
+    receipts are issued exactly once across both submissions."""
+    from auspexai_platform.receipts.repository import ReceiptRepository
+
+    privkey, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+
+    # Warm the APP-side per-job cache: submit_result's `_find_assignment` scans the
+    # app factory's cached DBs, and a GET runs the scheduler (which get_or_creates the
+    # experiment DB) even when it returns no work — here the T0 tier floor (3) refuses
+    # the target=1 unit, so the GET is null but the cache is warmed.
+    warm = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    )
+    assert warm.json()["work_unit"] is None
+
+    # Pre-create worker A's assignment directly — leg 3 exercises the submit-path
+    # idempotency, not scheduling, so we bypass pick_for_worker (whose T0 tier floor
+    # of 3 would refuse a replication_target=1 unit anyway).
+    AssignmentRepository(db).create(
+        assignment_id="asg-a",
+        unit_id="u1",
+        worker_id=worker.worker_id,
+        worker_pubkey_hex=worker.pubkey_hex,
+    )
+    first = _signed_post(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments/u1/result",
+        payload={
+            "unit_id": "u1",
+            "worker_pubkey": worker.pubkey_hex,
+            "completed_at": "2026-06-06T11:00:00+00:00",
+            "exit_code": 0,
+            "payload": {"v": 1},
+            "worker_signature": "Zm9v",
+        },
+    )
+    assert first.status_code == 201, first.text
+    assert first.json()["unit_status_after"] == "completed"
+    receipts_after_first = ReceiptRepository(db).list_for_unit("u1")
+
+    # A late worker B (rejoined after a pause) still holds an open assignment for u1
+    # — the unit completed on A while B was out. Pre-create B's assignment, then it
+    # submits. The 409 guard is per-assignment (B's has no result yet), so the submit
+    # is accepted; but `just_completed` is False, so no re-fire.
+    other_pk = Ed25519PrivateKey.generate()
+    other_pub = other_pk.public_key().public_bytes_raw().hex()
+    other = worker_repository.enroll(worker_id="wkr-late", pubkey_hex=other_pub)
+    AssignmentRepository(db).create(
+        assignment_id="asg-late",
+        unit_id="u1",
+        worker_id=other.worker_id,
+        worker_pubkey_hex=other_pub,
+    )
+    late = _signed_post(
+        client,
+        privkey=other_pk,
+        pubkey_hex=other_pub,
+        path=f"/api/v0/workers/{other.worker_id}/assignments/u1/result",
+        payload={
+            "unit_id": "u1",
+            "worker_pubkey": other_pub,
+            "completed_at": "2026-06-06T12:00:00+00:00",
+            "exit_code": 0,
+            "payload": {"v": 1},
+            "worker_signature": "Zm9v",
+        },
+    )
+    assert late.status_code == 201, late.text
+    # The late result is stored (durable extra replica) and completions ticked up,
+    # but the unit stays completed and the completion machinery did NOT re-fire.
+    final_unit = WorkUnitRepository(db).get_by_unit_id("u1")
+    assert final_unit.status.value == "completed"
+    assert final_unit.completions_so_far == 2  # both replicas counted (durable)
+    assert ReceiptRepository(db).list_for_unit("u1") == receipts_after_first
+
+
 def test_paused_worker_gets_423_with_reason(
     client: TestClient,
     enrolled_worker,

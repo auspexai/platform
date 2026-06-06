@@ -99,10 +99,14 @@ class WorkUnitRepository:
         )
         return self.get_by_unit_id(unit_id)
 
-    def increment_completions(self, unit_id: str) -> WorkUnit:
-        """Bump completions_so_far by 1. If completions_so_far meets or
-        exceeds replication_target, transition to 'completed'. Returns the
-        updated row."""
+    def increment_completions(self, unit_id: str) -> tuple[WorkUnit, bool]:
+        """Bump completions_so_far by 1. If it meets/exceeds replication_target,
+        transition to 'completed'. Returns `(updated_unit, just_completed)` where
+        `just_completed` is True only when THIS call caused the first transition
+        to completed (M9 leg 3): the `status != 'completed'` guard + rowcount makes
+        it race-safe + idempotent, so a late/extra result from a rejoined worker
+        is recorded as a durable replica but does NOT re-fire receipt issuance /
+        consensus promotion / attestation / auto-complete."""
         with self.db.transaction() as cur:
             cur.execute(
                 "UPDATE work_units SET completions_so_far = completions_so_far + 1 "
@@ -111,12 +115,13 @@ class WorkUnitRepository:
             )
             cur.execute(
                 "UPDATE work_units SET status = 'completed' "
-                "WHERE unit_id = ? AND completions_so_far >= replication_target",
+                "WHERE unit_id = ? AND status != 'completed' AND completions_so_far >= replication_target",
                 (unit_id,),
             )
+            just_completed = cur.rowcount == 1
         got = self.get_by_unit_id(unit_id)
         assert got is not None
-        return got
+        return got, just_completed
 
     # ---- reads ----
 

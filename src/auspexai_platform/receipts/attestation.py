@@ -139,6 +139,11 @@ class ResultSetAttestation:
     signing_key_pubkey_hex: str
     rekor_log_index: int
     rekor_entry_uuid: str
+    # M9 leg 2: True for a checkpoint/partial attestation (the experiment had not
+    # COMPLETED — the set is a consensus-so-far snapshot, not the final set). The
+    # flag is part of the COSE-signed predicate (tamper-evident), so a verifier
+    # can never mistake a partial set for the complete one.
+    partial: bool = False
 
 
 def build_result_set_attestation(
@@ -149,10 +154,17 @@ def build_result_set_attestation(
     entries: list[ResultSetEntry],
     signing_key: SigningKey,
     rekor_client: RekorClient | NoOpRekorClient | None = None,
+    partial: bool = False,
 ) -> ResultSetAttestation:
     """Build + COSE-sign (+ Rekor-anchor) the result-set attestation. Pure given
     its inputs — the same set yields a byte-identical root, so the endpoint can
-    build it on demand without storing it."""
+    build it on demand without storing it.
+
+    `partial=True` (M9 leg 2 checkpoint) marks an over-a-non-complete-set snapshot:
+    the Merkle root is unchanged (purely over `entries`), but the signed predicate
+    carries `partial: true`. When False the key is OMITTED entirely so a COMPLETED
+    attestation's predicate (and thus its COSE bytes) stays byte-identical to the
+    M7 format — a checkpoint never silently rewrites the completed attestation."""
     ordered = sorted(entries, key=lambda e: e.unit_id)
     root = merkle_root(ordered)
     predicate = {
@@ -170,6 +182,8 @@ def build_result_set_attestation(
             for e in ordered
         ],
     }
+    if partial:
+        predicate["partial"] = True
     predicate_cbor = cbor2.dumps(predicate, canonical=True)
     statement_cbor = build_result_set_statement(
         predicate_cbor=predicate_cbor, attestation_id=attestation_id
@@ -194,4 +208,5 @@ def build_result_set_attestation(
         signing_key_pubkey_hex=signing_key.pubkey_hex,
         rekor_log_index=entry.log_index,
         rekor_entry_uuid=entry.entry_uuid,
+        partial=partial,
     )

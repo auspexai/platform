@@ -46,9 +46,20 @@ def _approved_exp(
     return experiment_repository.get_by_id(exp.experiment_id)
 
 
-def _active_worker(worker_repository, *, worker_id: str, pubkey: str, models: list[str]):
+def _active_worker(
+    worker_repository,
+    *,
+    worker_id: str,
+    pubkey: str,
+    models: list[str],
+    execute_tenant_code: str = "provisioned",
+):
+    # M9 leg 4: a model-holding worker that should be eligible for real-execution
+    # experiments declares provisioned mode (the default); pass "synthetic" to
+    # exercise the consensus-safe exclusion.
     worker_repository.enroll(worker_id=worker_id, pubkey_hex=pubkey)
-    worker_repository.record_heartbeat(worker_id, capabilities={"os": "linux", "models": models})
+    caps = {"os": "linux", "models": models, "execute_tenant_code": execute_tenant_code}
+    worker_repository.record_heartbeat(worker_id, capabilities=caps)
 
 
 def _exp_state(body: dict, experiment_id: str) -> dict:
@@ -90,6 +101,44 @@ def test_blocked_missing_capability(
     # the worker is shown, idle (eligible for nothing)
     w = next(x for x in r.json()["workers"] if x["worker_id"] == "w-other")
     assert w["eligible_experiment_count"] == 0
+
+
+def test_synthetic_mode_worker_excluded_from_model_gated_experiment(
+    client: TestClient,
+    maintainer_token: str,
+    registered_tenant,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+    worker_repository,
+) -> None:
+    """M9 leg 4: a synthetic-mode worker holding the exact model is NOT eligible
+    for a real-execution (model-gated) experiment — it would echo, polluting
+    consensus. /scheduler/state shows it blocked missing_capability."""
+    _, binding = registered_tenant
+    _active_worker(
+        worker_repository,
+        worker_id="w-synth",
+        pubkey="9" * 64,
+        models=["m-x"],
+        execute_tenant_code="synthetic",
+    )
+    exp = _approved_exp(
+        manifest_repository,
+        experiment_repository,
+        per_job_factory,
+        tenant_id=binding.tenant_id,
+        label="real-mx",
+        required={"models": ["m-x"]},
+    )
+    body = client.get("/api/v0/scheduler/state", headers=_mtnr(maintainer_token)).json()
+    e = _exp_state(body, exp.experiment_id)
+    assert e["blocked"] is True
+    assert e["block_reason"] == "missing_capability"
+    assert e["capable_worker_count"] == 0  # synthetic worker not counted as capable
+    # the worker's mode is surfaced (explains the exclusion to the operator)
+    w = next(x for x in body["workers"] if x["worker_id"] == "w-synth")
+    assert w["execute_tenant_code"] == "synthetic"
 
 
 def test_not_blocked_when_capable_and_tier_eligible(
@@ -258,8 +307,12 @@ def test_self_paused_worker_excluded_and_flagged(
         capabilities={"os": "linux", "models": ["m-x"], "self_paused": True},
     )
     exp = _approved_exp(
-        manifest_repository, experiment_repository, per_job_factory,
-        tenant_id=binding.tenant_id, label="sp-cap", required={"models": ["m-x"]},
+        manifest_repository,
+        experiment_repository,
+        per_job_factory,
+        tenant_id=binding.tenant_id,
+        label="sp-cap",
+        required={"models": ["m-x"]},
     )
     body = client.get("/api/v0/scheduler/state", headers=_mtnr(maintainer_token)).json()
     e = _exp_state(body, exp.experiment_id)
@@ -284,8 +337,12 @@ def test_stalled_unit_surfaced(
 
     _, binding = registered_tenant
     exp = _approved_exp(
-        manifest_repository, experiment_repository, per_job_factory,
-        tenant_id=binding.tenant_id, label="stall", n_units=1,
+        manifest_repository,
+        experiment_repository,
+        per_job_factory,
+        tenant_id=binding.tenant_id,
+        label="stall",
+        n_units=1,
     )
     db = per_job_factory.get_or_create(exp.experiment_id)
     WorkUnitRepository(db).mark_in_progress("u0")
@@ -313,8 +370,12 @@ def test_pin_unit_endpoint(
     _, binding = registered_tenant
     worker_repository.enroll(worker_id="wkr-pin", pubkey_hex="9" * 64)
     exp = _approved_exp(
-        manifest_repository, experiment_repository, per_job_factory,
-        tenant_id=binding.tenant_id, label="pin", n_units=1,
+        manifest_repository,
+        experiment_repository,
+        per_job_factory,
+        tenant_id=binding.tenant_id,
+        label="pin",
+        n_units=1,
     )
     no_reason = client.post(
         f"/api/v0/experiments/{exp.experiment_id}/units/u0/actions/pin",
@@ -442,3 +503,103 @@ def test_set_integrity_policy(
         headers=_mtnr(maintainer_token),
     )
     assert bad.status_code == 422
+
+
+# ---- M9 leg 1: capacity-collapse pause warning (warn-but-allow) -------------
+
+
+def _pause(client, maintainer_token, worker_id, reason="ops"):
+    return client.post(
+        f"/api/v0/workers/{worker_id}/actions/pause",
+        json={"reason": reason},
+        headers=_mtnr(maintainer_token),
+    )
+
+
+def test_pause_warns_when_it_collapses_an_experiment(
+    client: TestClient,
+    maintainer_token: str,
+    registered_tenant,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+    worker_repository,
+) -> None:
+    """The only eligible worker for an active experiment is paused → the pause
+    still succeeds (warn-but-allow) but the response carries a capacity_warning
+    naming the experiment, and the audit records experiments_blocked."""
+    _, binding = registered_tenant
+    _active_worker(worker_repository, worker_id="w-only", pubkey="a" * 64, models=["m-x"])
+    exp = _approved_exp(
+        manifest_repository,
+        experiment_repository,
+        per_job_factory,
+        tenant_id=binding.tenant_id,
+        label="needs-mx",
+        required={"models": ["m-x"]},
+    )
+    r = _pause(client, maintainer_token, "w-only")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["paused_at"] is not None  # the pause still happened
+    warned = body.get("capacity_warning")
+    assert warned is not None
+    assert any(w["experiment_id"] == exp.experiment_id for w in warned)
+    blocked = next(w for w in warned if w["experiment_id"] == exp.experiment_id)
+    assert blocked["tenant_id"] == binding.tenant_id
+    assert blocked["needs_work"] >= 1
+
+
+def test_pause_no_warning_when_another_eligible_worker_remains(
+    client: TestClient,
+    maintainer_token: str,
+    registered_tenant,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+    worker_repository,
+) -> None:
+    """Two workers hold the model; pausing one leaves the experiment covered →
+    no capacity warning (field omitted)."""
+    _, binding = registered_tenant
+    _active_worker(worker_repository, worker_id="w-a", pubkey="b" * 64, models=["m-x"])
+    _active_worker(worker_repository, worker_id="w-b", pubkey="c" * 64, models=["m-x"])
+    _approved_exp(
+        manifest_repository,
+        experiment_repository,
+        per_job_factory,
+        tenant_id=binding.tenant_id,
+        label="covered-mx",
+        required={"models": ["m-x"]},
+    )
+    r = _pause(client, maintainer_token, "w-a")
+    assert r.status_code == 200, r.text
+    # response_model_exclude_none drops the field entirely when nothing collapses
+    assert "capacity_warning" not in r.json()
+
+
+def test_pause_does_not_report_already_blocked_experiment(
+    client: TestClient,
+    maintainer_token: str,
+    registered_tenant,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+    worker_repository,
+) -> None:
+    """An experiment with no eligible worker is ALREADY blocked; pausing an
+    unrelated (non-eligible) worker didn't cause it, so it isn't warned."""
+    _, binding = registered_tenant
+    # w-other holds a different model → not eligible for the m-x experiment.
+    _active_worker(worker_repository, worker_id="w-other", pubkey="d" * 64, models=["m-other"])
+    _approved_exp(
+        manifest_repository,
+        experiment_repository,
+        per_job_factory,
+        tenant_id=binding.tenant_id,
+        label="already-blocked-mx",
+        required={"models": ["m-x"]},
+    )
+    r = _pause(client, maintainer_token, "w-other")
+    assert r.status_code == 200, r.text
+    assert "capacity_warning" not in r.json()

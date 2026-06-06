@@ -149,25 +149,55 @@ class SkipReason(StrEnum):
     RETRIES_EXHAUSTED = "retries_exhausted"  # §2.1 #8 — retryable but at cap
 
 
-def worker_satisfies(worker: Worker, required_capabilities: dict[str, list[str]]) -> bool:
-    """True if the worker locally holds every model the experiment requires
-    (#30, M1). `required_capabilities` is keyed by dimension; Phase-1 matches the
-    "models" key against the worker's declared `capabilities["models"]` inventory
-    by EXACT store model_id (hash-agreement consensus needs identical quants).
-    Empty requirement ⇒ always satisfied (the pre-M1 behavior — every worker
-    eligible). Unknown capability dimensions are ignored in Phase-1.
+def worker_runs_provisioned(worker: Worker) -> bool:
+    """True if the worker's owner consented to running real (provisioned) tenant
+    code — declared via `capabilities["execute_tenant_code"] == "provisioned"`
+    (M9 leg 4). Absent / `synthetic` / `off` ⇒ False.
 
-    M3 (lazy auto-acquire): a worker that declares `capabilities["auto_acquire"]`
-    satisfies any model requirement — on assignment it pulls a missing
-    locally-required model (reading coords from the staged manifest) and then
-    runs, rather than refusing. The scheduler's replication bound still caps how
-    many such workers ever get the unit, so the acquisition fan-out is naturally
-    sized (≤ replication_target pull). If the manifest carries no acquisition
-    coords, the worker refuses on assignment (model_not_acquirable) — surfaced as
-    demand, not a silent stall."""
+    This is the worker→code consent axis (§9 #37), ORTHOGONAL to `trust_tier`
+    (network→worker, which sizes replication). It is consumed by `worker_satisfies`
+    purely for *consensus safety*: a `synthetic`-mode worker echoes every unit
+    (`decide_execution` returns the built-in echo regardless of the manifest), so
+    if it were offered a real, model-gated experiment its echo would diverge from
+    the provisioned replicas and pollute hash-agreement consensus (#33) as a false
+    disagreement. Excluding it is a routing decision, NOT a tier gate — the setter
+    that controls this stays tier-agnostic (the owner's box, the owner's consent)."""
+    return worker.capabilities.get("execute_tenant_code") == "provisioned"
+
+
+def worker_satisfies(worker: Worker, required_capabilities: dict[str, list[str]]) -> bool:
+    """True if the worker is eligible for an experiment with these requirements
+    (#30, M1; + M9 leg 4 execute-mode gate). `required_capabilities` is keyed by
+    dimension; Phase-1 matches the "models" key against the worker's declared
+    `capabilities["models"]` inventory by EXACT store model_id (hash-agreement
+    consensus needs identical quants). Empty requirement ⇒ always satisfied (the
+    pre-M1 behavior — every worker eligible, incl. synthetic-mode workers running
+    the doubler/test tenants). Unknown capability dimensions are ignored in Phase-1.
+
+    **M9 leg 4 — consensus-safe routing.** A `models` requirement marks a
+    *real-execution* experiment (it needs local weights ⇒ the tenant's executor
+    must actually run). Such units route ONLY to `provisioned`-mode workers
+    (`worker_runs_provisioned`); a `synthetic`/`off` worker is excluded even if it
+    happens to hold the model in its store, because it would echo rather than run
+    — polluting consensus. (Limitation: this gates *model-requiring* experiments,
+    the BYOM/Vigiles case; a hypothetical real experiment that needs NO local
+    weights is not yet gated — add an explicit `requires_real_execution` manifest
+    flag if such a tenant appears. Documented, not silently assumed.)
+
+    M3 (lazy auto-acquire): a provisioned worker that declares
+    `capabilities["auto_acquire"]` satisfies any model requirement — on assignment
+    it pulls a missing locally-required model (reading coords from the staged
+    manifest) and then runs, rather than refusing. The scheduler's replication
+    bound still caps how many such workers ever get the unit, so the acquisition
+    fan-out is naturally sized (≤ replication_target pull). If the manifest carries
+    no acquisition coords, the worker refuses on assignment (model_not_acquirable)
+    — surfaced as demand, not a silent stall."""
     required_models = set(required_capabilities.get("models", []))
     if not required_models:
         return True
+    # Real-execution experiment → only provisioned-mode workers (consensus safety).
+    if not worker_runs_provisioned(worker):
+        return False
     if worker.capabilities.get("auto_acquire") is True:
         return True
     have = worker.capabilities.get("models", [])

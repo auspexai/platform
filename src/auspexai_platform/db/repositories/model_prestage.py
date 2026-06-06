@@ -81,9 +81,7 @@ class ModelPrestageRepository:
         return got
 
     def get_by_id(self, prestage_id: str) -> PrestageDirective | None:
-        rows = self.db.execute(
-            "SELECT * FROM model_prestage WHERE prestage_id = ?", (prestage_id,)
-        )
+        rows = self.db.execute("SELECT * FROM model_prestage WHERE prestage_id = ?", (prestage_id,))
         return self._row(rows[0]) if rows else None
 
     def list_open_for_worker(self, worker_id: str) -> list[PrestageDirective]:
