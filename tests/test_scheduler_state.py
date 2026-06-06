@@ -206,6 +206,40 @@ def test_paused_worker_excluded_from_workforce(
     assert w["paused"] is True
 
 
+def test_degraded_worker_excluded_and_flagged(
+    client: TestClient,
+    maintainer_token: str,
+    registered_tenant,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+    worker_repository,
+) -> None:
+    # M5: a thermal-critical worker is routed around — excluded from the
+    # workforce (so the experiment is blocked) and flagged `degraded` on /scheduler.
+    _, binding = registered_tenant
+    worker_repository.enroll(worker_id="w-hot", pubkey_hex="7" * 64)
+    worker_repository.record_heartbeat(
+        "w-hot",
+        capabilities={"os": "linux", "models": ["m-x"], "thermal": {"state": "critical"}},
+    )
+    exp = _approved_exp(
+        manifest_repository,
+        experiment_repository,
+        per_job_factory,
+        tenant_id=binding.tenant_id,
+        label="hot-cap",
+        required={"models": ["m-x"]},
+    )
+    body = client.get("/api/v0/scheduler/state", headers=_mtnr(maintainer_token)).json()
+    e = _exp_state(body, exp.experiment_id)
+    assert e["blocked"] is True
+    assert e["capable_worker_count"] == 0  # degraded worker not counted
+    assert body["active_worker_count"] == 0
+    w = next(x for x in body["workers"] if x["worker_id"] == "w-hot")
+    assert w["degraded"] is True
+
+
 # ---- pause / unpause + set-integrity-policy --------------------------------
 
 

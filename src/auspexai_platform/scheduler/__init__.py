@@ -95,6 +95,19 @@ def is_retryable_refusal(kind: str | None) -> bool:
     return kind in _RETRYABLE_REFUSAL_KINDS
 
 
+def worker_is_degraded(worker: Worker) -> bool:
+    """True if the worker's last heartbeat reports a thermal-critical state (M5,
+    W-H increment 2). The worker declares `capabilities["thermal"]` =
+    `{state, current_temp_c, ...}` (worker `health.ThermalSnapshot.to_dict`);
+    `state == "critical"` means it's throttling/refusing locally, so the
+    scheduler routes around it until it recovers. Absent/unreadable thermal ⇒
+    not degraded (a worker with no sensor is never excluded on this axis)."""
+    thermal = worker.capabilities.get("thermal")
+    if not isinstance(thermal, dict):
+        return False
+    return thermal.get("state") == "critical"
+
+
 def reoffer_eligible(
     assignment: Assignment, *, max_attempts: int = MAX_ASSIGNMENT_ATTEMPTS
 ) -> bool:
@@ -178,8 +191,14 @@ class Scheduler:
         None if no work is available for this worker."""
         # M4: a paused worker is an operational pause — the scheduler offers it
         # nothing until unpaused (distinct from quarantine, which 423s at the
-        # assignment route). Forward-compatible with the M5 `degraded` skip.
+        # assignment route).
         if worker.paused_at is not None:
+            return None
+        # M5 (W-H increment 2): a worker reporting thermal-critical in its last
+        # heartbeat is degraded — its results would diverge from quorum (throttled
+        # host) and it just refused/aborted work locally. Route around it until it
+        # cools and reports OK again. Analogous to the pause/quarantine skips.
+        if worker_is_degraded(worker):
             return None
         tier_floor = replication_floor_for_tier(worker.trust_tier)
 

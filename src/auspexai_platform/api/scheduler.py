@@ -32,7 +32,11 @@ from auspexai_platform.db.repositories import (
     WorkerRepository,
     WorkUnitRepository,
 )
-from auspexai_platform.scheduler import replication_floor_for_tier, worker_satisfies
+from auspexai_platform.scheduler import (
+    replication_floor_for_tier,
+    worker_is_degraded,
+    worker_satisfies,
+)
 from auspexai_platform.worker_status import heartbeat_cutoff
 
 
@@ -55,13 +59,14 @@ class SchedulerWorker(BaseModel):
     trust_tier: int
     model_count: int
     paused: bool
+    degraded: bool = False  # M5: heartbeat thermal state == critical (routed around)
     eligible_experiment_count: int  # approved experiments w/ outstanding work this worker can take
 
 
 class SchedulerStateResponse(BaseModel):
     experiments: list[SchedulerExperiment]
     workers: list[SchedulerWorker]
-    active_worker_count: int  # on-network, available for work (excludes paused)
+    active_worker_count: int  # on-network, available for work (excludes paused + degraded)
 
 
 def _model_count(worker) -> int:
@@ -101,7 +106,9 @@ def build_router(
             and w.last_heartbeat_at is not None
             and w.last_heartbeat_at >= cutoff
         ]
-        workforce = [w for w in on_network if w.paused_at is None]
+        # M5: a degraded (thermal-critical) worker is routed around, like paused —
+        # exclude it from the available workforce so eligibility counts are honest.
+        workforce = [w for w in on_network if w.paused_at is None and not worker_is_degraded(w)]
 
         elig_count: dict[str, int] = {w.worker_id: 0 for w in workforce}
         experiments_out: list[SchedulerExperiment] = []
@@ -150,6 +157,7 @@ def build_router(
                 trust_tier=int(w.trust_tier),
                 model_count=_model_count(w),
                 paused=w.paused_at is not None,
+                degraded=worker_is_degraded(w),
                 eligible_experiment_count=elig_count.get(w.worker_id, 0),
             )
             for w in on_network

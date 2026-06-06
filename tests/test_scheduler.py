@@ -17,6 +17,7 @@ from auspexai_platform.scheduler import (
     Scheduler,
     is_retryable_refusal,
     reoffer_eligible,
+    worker_is_degraded,
     worker_satisfies,
 )
 
@@ -166,6 +167,51 @@ def test_scheduler_skips_paused_worker(
     assert scheduler.pick_for_worker(paused) is None
     # sanity: an identical but un-paused worker is offered the unit
     assert scheduler.pick_for_worker(_worker(worker_id="wkr-live", models=None)) is not None
+
+
+def test_worker_is_degraded_reads_thermal_state():
+    """M5: a worker is degraded iff its heartbeat thermal snapshot is critical."""
+    base = dict(
+        pubkey_hex="a" * 64,
+        trust_tier=TrustTier.T2_TRUSTED,
+        registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    crit = Worker(worker_id="w", capabilities={"thermal": {"state": "critical"}}, **base)
+    warm = Worker(worker_id="w", capabilities={"thermal": {"state": "warm"}}, **base)
+    none = Worker(worker_id="w", capabilities={"os": "linux"}, **base)
+    assert worker_is_degraded(crit) is True
+    assert worker_is_degraded(warm) is False  # warm still works
+    assert worker_is_degraded(none) is False  # no sensor → not excluded
+
+
+def test_scheduler_skips_thermal_critical_worker(
+    registered_tenant,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+    manifest_repository: ManifestRepository,
+) -> None:
+    # M5 (W-H increment 2): the coordinator routes around a degraded worker.
+    _, binding = registered_tenant
+    exp = _make_experiment(
+        manifest_repository=manifest_repository,
+        experiment_repository=experiment_repository,
+        tenant_id=binding.tenant_id,
+        label="therm-1",
+    )
+    db = per_job_factory.get_or_create(exp.experiment_id)
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+
+    hot = Worker(
+        worker_id="wkr-hot",
+        pubkey_hex="h" * 64,
+        trust_tier=TrustTier.T2_TRUSTED,
+        capabilities={"os": "linux", "thermal": {"state": "critical", "current_temp_c": 95.0}},
+        registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    assert scheduler.pick_for_worker(hot) is None
+    # a cool worker (no thermal-critical) is offered the unit
+    assert scheduler.pick_for_worker(_worker(worker_id="wkr-cool", models=None)) is not None
 
 
 def test_picks_pending_unit_for_eligible_worker(
