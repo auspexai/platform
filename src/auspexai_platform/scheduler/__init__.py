@@ -106,6 +106,11 @@ class Scheduler:
     def pick_for_worker(self, worker: Worker) -> SchedulerPick | None:
         """Return the first eligible (experiment_id, work_unit) pair, or
         None if no work is available for this worker."""
+        # M4: a paused worker is an operational pause — the scheduler offers it
+        # nothing until unpaused (distinct from quarantine, which 423s at the
+        # assignment route). Forward-compatible with the M5 `degraded` skip.
+        if worker.paused_at is not None:
+            return None
         tier_floor = replication_floor_for_tier(worker.trust_tier)
 
         for experiment in self._experiments.list_all(status=ExperimentStatus.APPROVED):

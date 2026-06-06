@@ -339,6 +339,10 @@ class Worker(BaseModel):
     retired_at: datetime | None = None
     quarantined_at: datetime | None = None
     quarantine_reason: str | None = None
+    # M4: operator "pause" — an operational pause (stop assigning), distinct from
+    # quarantine (a fault/trust signal). Paused workers are excluded from the
+    # active-and-available set. NULL = not paused.
+    paused_at: datetime | None = None
 
 
 class AuditEntry(BaseModel):

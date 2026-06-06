@@ -76,6 +76,7 @@ class WorkerResponse(BaseModel):
     retired_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
     quarantined_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
     quarantine_reason: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
+    paused_at: Annotated[datetime | None, ExposureTag.OPERATOR_ONLY] = None
     pubkey_hex: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     account_id: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     capabilities: Annotated[dict[str, Any] | None, ExposureTag.OPERATOR_ONLY] = None
@@ -136,6 +137,13 @@ class WorkerQuarantineRequest(BaseModel):
     )
 
 
+class WorkerPauseRequest(BaseModel):
+    # M4: pause is an OPERATIONAL pause (not a fault) — the reason is mandatory
+    # and recorded in the audit log (not stored on the worker row, since pause
+    # carries no volunteer-facing trust signal).
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 # ---- helpers --------------------------------------------------------------
 
 
@@ -153,6 +161,7 @@ def _worker_to_response(worker) -> WorkerResponse:
         retired_at=worker.retired_at,
         quarantined_at=worker.quarantined_at,
         quarantine_reason=worker.quarantine_reason,
+        paused_at=getattr(worker, "paused_at", None),
         pubkey_hex=worker.pubkey_hex,
         account_id=worker.account_id,
         capabilities=worker.capabilities,
@@ -600,6 +609,74 @@ def build_router(
             resource_id=worker.worker_id,
         )
 
+        return filter_for_credential(_worker_to_response(worker), credential)
+
+    # ---- POST /workers/{id}/actions/pause | unpause (maintainer; M4) -----
+    # Operational pause for the scheduler view — distinct from quarantine (a
+    # fault). A paused worker is offered no work + drops out of the
+    # active-and-available set; reversible via unpause.
+
+    @router.post(
+        "/workers/{worker_id}/actions/pause",
+        response_model=WorkerResponse,
+        response_model_exclude_none=True,
+    )
+    async def pause_worker(
+        worker_id: str,
+        body: WorkerPauseRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> WorkerResponse:
+        require_maintainer(credential)
+        try:
+            worker = worker_repository.pause(worker_id)
+        except WorkerNotFoundError as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {"code": "worker_not_found", "message": f"no worker {worker_id!r}"}
+                },
+            ) from e
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"error": {"code": "worker_retired", "message": str(e)}},
+            ) from e
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            action="worker.pause",
+            resource_type="worker",
+            resource_id=worker.worker_id,
+            payload={"reason": body.reason},
+        )
+        return filter_for_credential(_worker_to_response(worker), credential)
+
+    @router.post(
+        "/workers/{worker_id}/actions/unpause",
+        response_model=WorkerResponse,
+        response_model_exclude_none=True,
+    )
+    async def unpause_worker(
+        worker_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> WorkerResponse:
+        require_maintainer(credential)
+        try:
+            worker = worker_repository.unpause(worker_id)
+        except WorkerNotFoundError as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {"code": "worker_not_found", "message": f"no worker {worker_id!r}"}
+                },
+            ) from e
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            action="worker.unpause",
+            resource_type="worker",
+            resource_id=worker.worker_id,
+        )
         return filter_for_credential(_worker_to_response(worker), credential)
 
     return router

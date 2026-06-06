@@ -115,6 +115,37 @@ def test_scheduler_no_requirement_is_open_to_all(
     assert scheduler.pick_for_worker(_worker(worker_id="wkr-any", models=None)) is not None
 
 
+def test_scheduler_skips_paused_worker(
+    registered_tenant,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+    manifest_repository: ManifestRepository,
+) -> None:
+    # M4: a paused worker (operational pause) is offered no work.
+    _, binding = registered_tenant
+    exp = _make_experiment(
+        manifest_repository=manifest_repository,
+        experiment_repository=experiment_repository,
+        tenant_id=binding.tenant_id,
+        label="pause-1",
+    )
+    db = per_job_factory.get_or_create(exp.experiment_id)
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+
+    paused = Worker(
+        worker_id="wkr-paused",
+        pubkey_hex="p" * 64,
+        trust_tier=TrustTier.T2_TRUSTED,
+        capabilities={"os": "linux"},
+        registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+        paused_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    assert scheduler.pick_for_worker(paused) is None
+    # sanity: an identical but un-paused worker is offered the unit
+    assert scheduler.pick_for_worker(_worker(worker_id="wkr-live", models=None)) is not None
+
+
 def test_picks_pending_unit_for_eligible_worker(
     enrolled_worker,
     approved_experiment,

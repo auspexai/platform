@@ -195,6 +195,38 @@ class WorkerRepository:
         assert got is not None
         return got
 
+    def pause(self, worker_id: str) -> Worker:
+        """Mark a worker as paused — an OPERATIONAL pause (stop assigning), not a
+        fault. Reversible via unpause; idempotent (timestamp preserved). Raises
+        WorkerNotFoundError if unknown, ValueError if retired."""
+        now = datetime.now(UTC).isoformat()
+        with self.db.transaction() as cur:
+            cur.execute(
+                "UPDATE workers SET paused_at = COALESCE(paused_at, ?) "
+                "WHERE worker_id = ? AND retired_at IS NULL",
+                (now, worker_id),
+            )
+            if cur.rowcount == 0:
+                if self.get_by_id(worker_id) is None:
+                    raise WorkerNotFoundError(worker_id)
+                raise ValueError(f"worker {worker_id} is retired; pause does not apply")
+        got = self.get_by_id(worker_id)
+        assert got is not None
+        return got
+
+    def unpause(self, worker_id: str) -> Worker:
+        """Clear pause on a worker. Idempotent. Raises WorkerNotFoundError if unknown."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                "UPDATE workers SET paused_at = NULL WHERE worker_id = ?",
+                (worker_id,),
+            )
+            if cur.rowcount == 0:
+                raise WorkerNotFoundError(worker_id)
+        got = self.get_by_id(worker_id)
+        assert got is not None
+        return got
+
     def update_tier_for_account(
         self,
         account_id: str,
@@ -300,7 +332,7 @@ class WorkerRepository:
         window (`worker_status.STALE_HEARTBEAT_MINUTES`) stays in one place."""
         rows = self.db.execute(
             "SELECT COUNT(*) AS n FROM workers "
-            "WHERE retired_at IS NULL AND quarantined_at IS NULL "
+            "WHERE retired_at IS NULL AND quarantined_at IS NULL AND paused_at IS NULL "
             "AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?",
             (heartbeat_cutoff.isoformat(),),
         )
@@ -315,7 +347,7 @@ class WorkerRepository:
         need = set(required_models)
         rows = self.db.execute(
             "SELECT capabilities_json FROM workers "
-            "WHERE retired_at IS NULL AND quarantined_at IS NULL "
+            "WHERE retired_at IS NULL AND quarantined_at IS NULL AND paused_at IS NULL "
             "AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?",
             (heartbeat_cutoff.isoformat(),),
         )
@@ -335,7 +367,7 @@ class WorkerRepository:
         `count_active`). Identity-free — backs `GET /models/catalog`."""
         rows = self.db.execute(
             "SELECT capabilities_json FROM workers "
-            "WHERE retired_at IS NULL AND quarantined_at IS NULL "
+            "WHERE retired_at IS NULL AND quarantined_at IS NULL AND paused_at IS NULL "
             "AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?",
             (heartbeat_cutoff.isoformat(),),
         )
@@ -371,4 +403,5 @@ class WorkerRepository:
                 datetime.fromisoformat(row["quarantined_at"]) if row["quarantined_at"] else None
             ),
             quarantine_reason=row["quarantine_reason"],
+            paused_at=(datetime.fromisoformat(row["paused_at"]) if row["paused_at"] else None),
         )

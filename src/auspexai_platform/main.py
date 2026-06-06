@@ -36,6 +36,7 @@ from auspexai_platform.api import health
 from auspexai_platform.api import model_requests as model_request_routes
 from auspexai_platform.api import receipts as receipt_routes
 from auspexai_platform.api import results as results_routes
+from auspexai_platform.api import scheduler as scheduler_routes
 from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.api import work_units as work_unit_routes
 from auspexai_platform.api import workers as worker_routes
@@ -335,6 +336,16 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["model-requests"],
+    )
+    app.include_router(
+        scheduler_routes.build_router(
+            credential_dep,
+            experiment_repository,
+            per_job_factory,
+            worker_repository,
+        ),
+        prefix="/api/v0",
+        tags=["scheduler"],
     )
     app.include_router(
         event_routes.build_router(

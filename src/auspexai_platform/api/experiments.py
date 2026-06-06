@@ -110,6 +110,14 @@ class ExperimentSubmissionRequest(BaseModel):
     signature: dict[str, Any] = Field(description="SDK ManifestSignature object")
 
 
+class SetIntegrityPolicyRequest(BaseModel):
+    """M4 scheduler override: change an experiment's integrity policy (the
+    replication target). `reason` is mandatory + audited."""
+
+    integrity_policy: str = Field(description="standard | high | trusted")
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 # ---- helpers ---------------------------------------------------------------
 
 
@@ -638,6 +646,54 @@ def build_router(
             resource_type="experiment",
             resource_id=experiment_id,
             payload={"reason": reason},
+        )
+        return filter_for_credential(
+            _to_response(updated), credential, resource_tenant_id=updated.tenant_id
+        )
+
+    @router.post(
+        "/experiments/{experiment_id}/actions/set-integrity-policy",
+        response_model=ExperimentResponse,
+        response_model_exclude_none=True,
+    )
+    async def set_integrity_policy(
+        experiment_id: str,
+        body: SetIntegrityPolicyRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ExperimentResponse:
+        """Maintainer-only M4 scheduler override: change the experiment's
+        integrity policy (replication target). NOTE: units bake `replication_target`
+        at submit, so this changes FUTURE units' target, not units already
+        submitted. Mandatory reason; audited."""
+        require_maintainer(credential)
+        from auspexai_platform.db.models import IntegrityPolicy
+
+        try:
+            policy = IntegrityPolicy(body.integrity_policy)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": {
+                        "code": "invalid_integrity_policy",
+                        "message": f"invalid integrity_policy: {body.integrity_policy!r}; "
+                        "expected standard | high | trusted",
+                    }
+                },
+            ) from e
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None:
+            raise _experiment_not_found(experiment_id)
+        experiment_repository.set_integrity_policy(experiment_id, policy)
+        updated = experiment_repository.get_by_id(experiment_id)
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            actor_tenant_id=credential.tenant_id,
+            action="experiment.set_integrity_policy",
+            resource_type="experiment",
+            resource_id=experiment_id,
+            payload={"integrity_policy": policy.value, "reason": body.reason},
         )
         return filter_for_credential(
             _to_response(updated), credential, resource_tenant_id=updated.tenant_id
