@@ -42,7 +42,7 @@ body chain since receipts are what external verifiers consume.
 from __future__ import annotations
 
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -74,7 +74,13 @@ from auspexai_platform.receipts import (
     SigningKey,
     issue_receipts_for_completed_unit,
 )
+from auspexai_platform.receipts.attestation import (
+    build_result_set_attestation,
+    collect_result_set_entries,
+)
 from auspexai_platform.scheduler import Scheduler, reoffer_eligible
+from auspexai_platform.scheduler.conductor import plan_prestage_for_worker
+from auspexai_platform.worker_status import heartbeat_cutoff
 
 # ---- response models ------------------------------------------------------
 
@@ -137,6 +143,18 @@ class RefuseResponse(BaseModel):
     refused_kind: Annotated[str | None, ExposureTag.PUBLIC] = None
 
 
+class PrestageItem(BaseModel):
+    """One model the worker is asked to pre-stage (pull ahead of assignment)."""
+
+    model_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    hf_repo: Annotated[str | None, ExposureTag.PUBLIC] = None
+    hf_filename: Annotated[str | None, ExposureTag.PUBLIC] = None
+
+
+class PrestageResponse(BaseModel):
+    prestage: Annotated[list[PrestageItem] | None, ExposureTag.PUBLIC] = None
+
+
 class ResultSubmissionResponse(BaseModel):
     result_id: Annotated[str | None, ExposureTag.PUBLIC] = None
     unit_id: Annotated[str | None, ExposureTag.PUBLIC] = None
@@ -190,6 +208,8 @@ def build_router(
     eligibility_thresholds=None,
     vouch_repository=None,
     event_bus=None,
+    manifest_repository=None,  # M3b conductor: read acquisition coords from the manifest
+    prestage_repository=None,  # M3b conductor: the model_prestage table
 ) -> APIRouter:
     router = APIRouter()
 
@@ -546,6 +566,19 @@ def build_router(
                 audit_repository=audit_repository,
                 event_bus=event_bus,
             )
+            # M7-tail: emit the result-set completion attestation when the
+            # experiment just finished — a permanent, model-blind record of the
+            # final set's merkle root at completion (the on-demand GET stays the
+            # canonical fetch; this anchors it without waiting for a caller).
+            _maybe_emit_completion_attestation(
+                experiment_id=experiment_id,
+                per_job_db=per_job_db,
+                experiment_repository=experiment_repository,
+                receipt_index_repository=receipt_index_repository,
+                signing_key=receipt_signing_key,
+                audit_repository=audit_repository,
+                event_bus=event_bus,
+            )
 
         return ResultSubmissionResponse(
             result_id=result.result_id,
@@ -636,6 +669,55 @@ def build_router(
             refused_kind=updated.refused_kind,
         )
 
+    # ---- GET prestage directives (M3b eager conductor) ----------------
+
+    @router.get(
+        "/workers/{worker_id}/prestage",
+        response_model=PrestageResponse,
+        response_model_exclude_none=True,
+    )
+    async def get_prestage(
+        worker_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> PrestageResponse:
+        """Models the conductor wants this worker to pre-stage (pull ahead of
+        assignment), so a model-gated experiment isn't bottlenecked on
+        first-assignment pulls. The worker (auto-acquire on) pulls each via its M3
+        path; the directive is marked acquired once the model appears in the
+        worker's heartbeat inventory. Returns empty when the conductor isn't wired
+        (`prestage_repository`/`manifest_repository` absent), the worker is
+        retired/quarantined/paused, or nothing is under-supplied."""
+        _require_self_worker(credential, worker_id)
+        if prestage_repository is None or manifest_repository is None:
+            return PrestageResponse(prestage=[])
+        worker = worker_repository.get_by_id(worker_id)
+        if worker is None or worker.retired_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "worker_not_found",
+                        "message": f"no active worker with id {worker_id!r}",
+                    }
+                },
+            )
+        if worker.quarantined_at is not None or worker.paused_at is not None:
+            return PrestageResponse(prestage=[])
+        directives = plan_prestage_for_worker(
+            worker,
+            experiment_repository=experiment_repository,
+            manifest_repository=manifest_repository,
+            worker_repository=worker_repository,
+            prestage_repository=prestage_repository,
+            heartbeat_cutoff=heartbeat_cutoff(datetime.now(UTC)),
+        )
+        return PrestageResponse(
+            prestage=[
+                PrestageItem(model_id=d.model_id, hf_repo=d.hf_repo, hf_filename=d.hf_filename)
+                for d in directives
+            ]
+        )
+
     return router
 
 
@@ -661,6 +743,68 @@ def _find_assignment(
         if assignment is not None:
             return experiment_id, db, assignment
     return None, None, None
+
+
+def _maybe_emit_completion_attestation(
+    *,
+    experiment_id: str,
+    per_job_db,
+    experiment_repository: ExperimentRepository,
+    receipt_index_repository: ReceiptIndexRepository,
+    signing_key: SigningKey,
+    audit_repository: AuditRepository,
+    event_bus=None,
+) -> None:
+    """If the experiment is now COMPLETED, build + audit (+ emit) the result-set
+    completion attestation (#34 §6.3, M7-tail). Best-effort — wrapped so it never
+    blocks the result response; the on-demand GET can always rebuild it."""
+    experiment = experiment_repository.get_by_id(experiment_id)
+    if experiment is None or experiment.status is not ExperimentStatus.COMPLETED:
+        return
+    try:
+        receipt_map = {
+            e.result_id: e.receipt_id
+            for e in receipt_index_repository.list_for_experiment(experiment_id)
+            if e.result_id is not None
+        }
+        entries = collect_result_set_entries(per_job_db, receipt_id_by_result=receipt_map)
+        attestation = build_result_set_attestation(
+            attestation_id=f"att-{secrets.token_urlsafe(9)}",
+            tenant_experiment_label=experiment.tenant_experiment_label,
+            tenant_id=experiment.tenant_id,
+            entries=entries,
+            signing_key=signing_key,
+            rekor_client=None,
+        )
+        audit_repository.append(
+            actor_class=CredentialClass.SYSTEM,
+            action="attestation.emitted",
+            resource_type="experiment",
+            resource_id=experiment_id,
+            payload={
+                "attestation_id": attestation.attestation_id,
+                "merkle_root": attestation.merkle_root,
+                "unit_count": attestation.unit_count,
+                "trigger": "auto_complete",
+            },
+        )
+        if event_bus is not None:
+            event_bus.publish(
+                "attestation.issued",
+                experiment_id=experiment_id,
+                data={
+                    "attestation_id": attestation.attestation_id,
+                    "merkle_root": attestation.merkle_root,
+                    "unit_count": attestation.unit_count,
+                },
+            )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "completion attestation emit failed for %s; the on-demand GET can rebuild it",
+            experiment_id,
+        )
 
 
 def _maybe_auto_complete(

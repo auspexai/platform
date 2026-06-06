@@ -81,6 +81,47 @@ def merkle_root(entries: list[ResultSetEntry]) -> str:
     return level[0].hex()
 
 
+def collect_result_set_entries(
+    per_job_db,
+    *,
+    receipt_id_by_result: dict[str, str],
+    page_size: int = 500,
+) -> list[ResultSetEntry]:
+    """Gather the attestable per-unit consensus set from a per-job DB: every
+    consensus result that reached agreement (has a `semantic_hash`) AND has an
+    issued receipt, as (unit_id, consensus_result_hash, receipt_id). Pages
+    through ALL consensus rows — no silent cap. Shared by the on-demand endpoint
+    and the emit-on-complete path so they produce byte-identical roots."""
+    from auspexai_platform.db.repositories import ResultRepository
+
+    repo = ResultRepository(per_job_db)
+    entries: list[ResultSetEntry] = []
+    after_completed_at: str | None = None
+    after_result_id: str | None = None
+    while True:
+        rows = repo.list_consensus(
+            limit=page_size,
+            after_completed_at=after_completed_at,
+            after_result_id=after_result_id,
+        )
+        for r in rows:
+            receipt_id = receipt_id_by_result.get(r.result_id)
+            if receipt_id is None or r.semantic_hash is None:
+                continue
+            entries.append(
+                ResultSetEntry(
+                    unit_id=r.unit_id,
+                    consensus_result_hash=r.semantic_hash,
+                    receipt_id=receipt_id,
+                )
+            )
+        if len(rows) < page_size:
+            break
+        after_completed_at = rows[-1].completed_at.isoformat()
+        after_result_id = rows[-1].result_id
+    return entries
+
+
 @dataclass(frozen=True)
 class ResultSetAttestation:
     """The built attestation, ready for the API response + persistence-free

@@ -89,6 +89,16 @@ class WorkUnitRepository:
             (unit_id,),
         )
 
+    def pin(self, unit_id: str, worker_id: str | None) -> WorkUnit | None:
+        """Set (or clear, with worker_id=None) the unit's pinned worker (M4-tail
+        force-assign). A pinned unit is offered ONLY to that worker by the
+        scheduler. Returns the updated unit, or None if the unit is unknown."""
+        self.db.execute(
+            "UPDATE work_units SET pinned_worker_id = ? WHERE unit_id = ?",
+            (worker_id, unit_id),
+        )
+        return self.get_by_unit_id(unit_id)
+
     def increment_completions(self, unit_id: str) -> WorkUnit:
         """Bump completions_so_far by 1. If completions_so_far meets or
         exceeds replication_target, transition to 'completed'. Returns the
@@ -152,6 +162,8 @@ class WorkUnitRepository:
 
     @staticmethod
     def _row_to_unit(row: sqlite3.Row) -> WorkUnit:
+        keys = row.keys()
+        pinned = row["pinned_worker_id"] if "pinned_worker_id" in keys else None
         return WorkUnit(
             unit_id=row["unit_id"],
             payload=json.loads(row["payload_json"]),
@@ -159,4 +171,5 @@ class WorkUnitRepository:
             replication_target=row["replication_target"],
             completions_so_far=row["completions_so_far"],
             created_at=datetime.fromisoformat(row["created_at"]),
+            pinned_worker_id=pinned,
         )

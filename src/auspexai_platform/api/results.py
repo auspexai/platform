@@ -43,6 +43,7 @@ from auspexai_platform.receipts.attestation import (
     RESULT_SET_ALGORITHM,
     ResultSetEntry,
     build_result_set_attestation,
+    collect_result_set_entries,
 )
 from auspexai_platform.receipts.repository import ReceiptRepository
 from auspexai_platform.receipts.signing import SigningKey
@@ -282,37 +283,15 @@ def build_router(
                 },
             )
 
-        # Page through ALL consensus units (no silent cap): only units that
-        # reached consensus (have a semantic_hash) AND have an issued receipt
-        # are attested — a disagreed unit produced neither and is excluded.
+        # Only units that reached consensus (have a semantic_hash) AND have an
+        # issued receipt are attested — a disagreed unit produced neither and is
+        # excluded. Pages through ALL consensus units (no silent cap).
         entries: list[ResultSetEntry] = []
         per_job_db = per_job_factory.get(experiment_id)
         if per_job_db is not None:
-            repo = ResultRepository(per_job_db)
-            rmap = _receipt_map(experiment_id)
-            after_completed_at: str | None = None
-            after_result_id: str | None = None
-            while True:
-                rows = repo.list_consensus(
-                    limit=MAX_PAGE_SIZE,
-                    after_completed_at=after_completed_at,
-                    after_result_id=after_result_id,
-                )
-                for r in rows:
-                    receipt_id = rmap.get(r.result_id)
-                    if receipt_id is None or r.semantic_hash is None:
-                        continue
-                    entries.append(
-                        ResultSetEntry(
-                            unit_id=r.unit_id,
-                            consensus_result_hash=r.semantic_hash,
-                            receipt_id=receipt_id,
-                        )
-                    )
-                if len(rows) < MAX_PAGE_SIZE:
-                    break
-                after_completed_at = rows[-1].completed_at.isoformat()
-                after_result_id = rows[-1].result_id
+            entries = collect_result_set_entries(
+                per_job_db, receipt_id_by_result=_receipt_map(experiment_id)
+            )
 
         attestation = build_result_set_attestation(
             attestation_id=_generate_attestation_id(),

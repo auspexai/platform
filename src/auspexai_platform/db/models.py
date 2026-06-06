@@ -320,6 +320,9 @@ class WorkUnit(BaseModel):
     replication_target: int = 3
     completions_so_far: int = 0
     created_at: datetime
+    # M4-tail pin / force-assign: when set, the scheduler offers this unit ONLY
+    # to this worker (a maintainer override, audited). NULL = unpinned.
+    pinned_worker_id: str | None = None
 
 
 class Worker(BaseModel):

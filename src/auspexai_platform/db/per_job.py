@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS work_units (
     replication_target   INTEGER NOT NULL DEFAULT 3,
     completions_so_far   INTEGER NOT NULL DEFAULT 0,
     created_at           TEXT    NOT NULL,
+    pinned_worker_id     TEXT,
     CHECK (status IN ('pending', 'in_progress', 'completed', 'failed'))
 );
 
@@ -139,6 +140,7 @@ class PerJobDatabaseFactory:
             db.executescript(PER_JOB_SCHEMA_SQL)
             _ensure_assignments_refused_columns(db)
             _ensure_results_retention_columns(db)
+            _ensure_work_units_pin_column(db)
             self._cache[experiment_id] = db
             return db
 
@@ -161,6 +163,7 @@ class PerJobDatabaseFactory:
             db = Database(db_path)
             _ensure_assignments_refused_columns(db)
             _ensure_results_retention_columns(db)
+            _ensure_work_units_pin_column(db)
             self._cache[experiment_id] = db
             return db
 
@@ -206,6 +209,13 @@ def _ensure_assignments_refused_columns(db: Database) -> None:
             ("attempt_count", "INTEGER NOT NULL DEFAULT 1"),
         ),
     )
+
+
+def _ensure_work_units_pin_column(db: Database) -> None:
+    """Idempotently add `pinned_worker_id` to the per-job `work_units` table
+    (M4-tail pin / force-assign). Part of PER_JOB_SCHEMA_SQL for new DBs; this
+    converges existing per-job DBs. NULL = unpinned (every existing unit)."""
+    _add_columns_idempotent(db, "work_units", (("pinned_worker_id", "TEXT"),))
 
 
 def _ensure_results_retention_columns(db: Database) -> None:

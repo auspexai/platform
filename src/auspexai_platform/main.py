@@ -53,6 +53,7 @@ from auspexai_platform.db.repositories import (
     AuditRepository,
     ExperimentRepository,
     ManifestRepository,
+    ModelPrestageRepository,
     ModelRequestRepository,
     ReceiptIndexRepository,
     ResultTransferRepository,
@@ -111,6 +112,7 @@ def create_app(
     receipt_index_repository = ReceiptIndexRepository(db)
     result_transfer_repository = ResultTransferRepository(db)
     model_request_repository = ModelRequestRepository(db)
+    model_prestage_repository = ModelPrestageRepository(db)
     from auspexai_platform.db.repositories.vouches import VouchRepository
 
     vouch_repository = VouchRepository(db)
@@ -289,6 +291,8 @@ def create_app(
             eligibility_thresholds=eligibility_thresholds,
             vouch_repository=vouch_repository,
             event_bus=event_bus,
+            manifest_repository=manifest_repository,
+            prestage_repository=model_prestage_repository,
         ),
         prefix="/api/v0",
         tags=["assignments"],
@@ -343,6 +347,9 @@ def create_app(
             experiment_repository,
             per_job_factory,
             worker_repository,
+            manifest_repository=manifest_repository,
+            prestage_repository=model_prestage_repository,
+            audit_repository=audit_repository,
         ),
         prefix="/api/v0",
         tags=["scheduler"],

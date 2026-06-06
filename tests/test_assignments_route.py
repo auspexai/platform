@@ -705,3 +705,58 @@ def test_terminal_refusal_not_reoffered_to_same_worker_via_get(
     )
     assert repulled.status_code == 200
     assert repulled.json()["work_unit"] is None
+
+
+def test_prestage_directs_auto_acquire_worker(
+    client: TestClient,
+    enrolled_worker,
+    registered_tenant,
+    manifest_repository,
+    experiment_repository,
+    worker_repository,
+) -> None:
+    """M3b: GET /prestage returns the conductor's directives for an eligible
+    auto-acquire worker (a model-gated approved experiment with manifest coords)."""
+    from auspexai_platform.db.models import ExperimentStatus
+
+    privkey, worker = enrolled_worker
+    _, binding = registered_tenant
+    worker_repository.record_heartbeat(
+        worker.worker_id, capabilities={"os": "linux", "auto_acquire": True}
+    )
+    manifest = manifest_repository.insert(
+        tenant_id=binding.tenant_id,
+        manifest_json={
+            "tenant_id": binding.tenant_id,
+            "experiment_id": "exp-ps",
+            "models": [
+                {
+                    "id": "m-x",
+                    "version": "1",
+                    "local_weights_required": True,
+                    "hf_repo": "Org/M-GGUF",
+                    "hf_filename": "M-Q4.gguf",
+                }
+            ],
+        },
+        signature_json={},
+    )
+    exp = experiment_repository.create(
+        tenant_id=binding.tenant_id,
+        tenant_experiment_label="exp-ps",
+        manifest_hash=manifest.manifest_hash,
+        required_capabilities={"models": ["m-x"]},
+    )
+    experiment_repository.update_status(exp.experiment_id, ExperimentStatus.APPROVED)
+
+    resp = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/prestage",
+    )
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["prestage"]
+    assert [i["model_id"] for i in items] == ["m-x"]
+    assert items[0]["hf_repo"] == "Org/M-GGUF"
+    assert items[0]["hf_filename"] == "M-Q4.gguf"

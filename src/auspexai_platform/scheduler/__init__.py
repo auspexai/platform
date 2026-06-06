@@ -226,6 +226,12 @@ class Scheduler:
             candidates.extend(work_units.list_all(status=WorkUnitStatus.IN_PROGRESS))
 
             for unit in candidates:
+                # M4-tail pin / force-assign: a pinned unit is offered ONLY to
+                # its pinned worker (the maintainer override). Other workers skip
+                # it; the pinned worker takes it through the normal eligibility
+                # path below (it still respects tier-floor + replication).
+                if unit.pinned_worker_id is not None and unit.pinned_worker_id != worker.worker_id:
+                    continue
                 if unit.replication_target < tier_floor:
                     continue
                 # §2.1 #8 (dispatch-retry): an existing assignment row only

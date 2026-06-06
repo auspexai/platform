@@ -495,6 +495,29 @@ def test_retryable_refusal_excluded_once_attempts_exhausted(
     assert scheduler.pick_for_worker(worker) is None
 
 
+def test_pinned_unit_offered_only_to_pinned_worker(
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+) -> None:
+    """M4-tail pin / force-assign: a pinned unit is offered only to its pinned
+    worker; others skip it."""
+    _, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    wu = WorkUnitRepository(db)
+    wu.submit_batch([{"unit_id": "u1", "payload": {}}])
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+
+    wu.pin("u1", "wkr-someone-else")
+    assert scheduler.pick_for_worker(worker) is None  # not the pinned worker
+
+    wu.pin("u1", worker.worker_id)  # pin to this worker
+    pick = scheduler.pick_for_worker(worker)
+    assert pick is not None and pick.work_unit.unit_id == "u1"
+
+
 def test_skips_experiment_with_no_per_job_db(
     enrolled_worker,
     approved_experiment,

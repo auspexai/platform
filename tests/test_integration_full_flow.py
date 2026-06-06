@@ -253,6 +253,8 @@ def test_full_flow_researcher_to_auto_complete(
         # M-Results: agreement also promotes the durable consensus (T-C) copy.
         "results.consensus_promoted",
         "experiment.auto_complete",
+        # M7-tail: completion emits the result-set attestation (merkle root).
+        "attestation.emitted",
     ]
     assert actions_in_order == expected_subsequence, (
         f"audit trace mismatch:\n  expected: {expected_subsequence}\n  got:      {actions_in_order}"

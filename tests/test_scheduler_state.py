@@ -240,6 +240,120 @@ def test_degraded_worker_excluded_and_flagged(
     assert w["degraded"] is True
 
 
+def test_stalled_unit_surfaced(
+    client: TestClient,
+    maintainer_token: str,
+    registered_tenant,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+):
+    """§2.1 #8-tail: an in-progress unit whose only assignment is a terminal
+    refusal shows up as stalled (stranded — no active, none re-offerable)."""
+    from auspexai_platform.db.repositories import AssignmentRepository, WorkUnitRepository
+
+    _, binding = registered_tenant
+    exp = _approved_exp(
+        manifest_repository, experiment_repository, per_job_factory,
+        tenant_id=binding.tenant_id, label="stall", n_units=1,
+    )
+    db = per_job_factory.get_or_create(exp.experiment_id)
+    WorkUnitRepository(db).mark_in_progress("u0")
+    ar = AssignmentRepository(db)
+    ar.create(assignment_id="asg-1", unit_id="u0", worker_id="wkr-x", worker_pubkey_hex="a" * 64)
+    ar.mark_refused(assignment_id="asg-1", kind="refused_tenant_deny", reason="terminal")
+
+    body = client.get("/api/v0/scheduler/state", headers=_mtnr(maintainer_token)).json()
+    assert _exp_state(body, exp.experiment_id)["stalled_units"] == 1
+
+
+def test_pin_unit_endpoint(
+    client: TestClient,
+    maintainer_token: str,
+    registered_tenant,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+    worker_repository,
+):
+    """M4-tail: pin force-assigns a unit to a worker (sets pinned_worker_id);
+    reason is mandatory."""
+    from auspexai_platform.db.repositories import WorkUnitRepository
+
+    _, binding = registered_tenant
+    worker_repository.enroll(worker_id="wkr-pin", pubkey_hex="9" * 64)
+    exp = _approved_exp(
+        manifest_repository, experiment_repository, per_job_factory,
+        tenant_id=binding.tenant_id, label="pin", n_units=1,
+    )
+    no_reason = client.post(
+        f"/api/v0/experiments/{exp.experiment_id}/units/u0/actions/pin",
+        json={"worker_id": "wkr-pin", "reason": ""},
+        headers=_mtnr(maintainer_token),
+    )
+    assert no_reason.status_code == 422
+    ok = client.post(
+        f"/api/v0/experiments/{exp.experiment_id}/units/u0/actions/pin",
+        json={"worker_id": "wkr-pin", "reason": "repro a failure"},
+        headers=_mtnr(maintainer_token),
+    )
+    assert ok.status_code == 200, ok.text
+    db = per_job_factory.get(exp.experiment_id)
+    assert WorkUnitRepository(db).get_by_unit_id("u0").pinned_worker_id == "wkr-pin"
+
+
+def test_trigger_prestage_endpoint(
+    client: TestClient,
+    maintainer_token: str,
+    registered_tenant,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+    worker_repository,
+    db,
+):
+    """M4-tail: trigger-prestage creates prestage rows for an eligible
+    auto-acquire worker that lacks a required (coords-bearing) model."""
+    from auspexai_platform.db.repositories import ModelPrestageRepository
+
+    _, binding = registered_tenant
+    worker_repository.enroll(worker_id="wkr-aa", pubkey_hex="b" * 64)
+    worker_repository.record_heartbeat("wkr-aa", capabilities={"os": "linux", "auto_acquire": True})
+    manifest = manifest_repository.insert(
+        tenant_id=binding.tenant_id,
+        manifest_json={
+            "tenant_id": binding.tenant_id,
+            "experiment_id": "tp",
+            "models": [
+                {
+                    "id": "m-x",
+                    "version": "1",
+                    "local_weights_required": True,
+                    "hf_repo": "Org/M-GGUF",
+                    "hf_filename": "M-Q4.gguf",
+                }
+            ],
+        },
+        signature_json={},
+    )
+    exp = experiment_repository.create(
+        tenant_id=binding.tenant_id,
+        tenant_experiment_label="tp",
+        manifest_hash=manifest.manifest_hash,
+        required_capabilities={"models": ["m-x"]},
+    )
+    experiment_repository.update_status(exp.experiment_id, ExperimentStatus.APPROVED)
+
+    r = client.post(
+        f"/api/v0/experiments/{exp.experiment_id}/actions/trigger-prestage",
+        json={"reason": "warm the fleet"},
+        headers=_mtnr(maintainer_token),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["rows_created"] == 1
+    assert ModelPrestageRepository(db).count_open_for_model("m-x") == 1
+
+
 # ---- pause / unpause + set-integrity-policy --------------------------------
 
 
