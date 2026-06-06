@@ -33,6 +33,7 @@ from auspexai_platform.api import auth as auth_routes
 from auspexai_platform.api import events as event_routes
 from auspexai_platform.api import experiments as experiment_routes
 from auspexai_platform.api import health
+from auspexai_platform.api import model_requests as model_request_routes
 from auspexai_platform.api import receipts as receipt_routes
 from auspexai_platform.api import results as results_routes
 from auspexai_platform.api import tenants as tenant_routes
@@ -51,6 +52,7 @@ from auspexai_platform.db.repositories import (
     AuditRepository,
     ExperimentRepository,
     ManifestRepository,
+    ModelRequestRepository,
     ReceiptIndexRepository,
     ResultTransferRepository,
     RetiredKeyRepository,
@@ -107,6 +109,7 @@ def create_app(
     retired_key_repository = RetiredKeyRepository(db)
     receipt_index_repository = ReceiptIndexRepository(db)
     result_transfer_repository = ResultTransferRepository(db)
+    model_request_repository = ModelRequestRepository(db)
     from auspexai_platform.db.repositories.vouches import VouchRepository
 
     vouch_repository = VouchRepository(db)
@@ -322,6 +325,16 @@ def create_app(
         audit_routes.build_router(credential_dep, audit_repository),
         prefix="/api/v0",
         tags=["audit"],
+    )
+    app.include_router(
+        model_request_routes.build_router(
+            credential_dep,
+            model_request_repository,
+            worker_repository,
+            audit_repository,
+        ),
+        prefix="/api/v0",
+        tags=["model-requests"],
     )
     app.include_router(
         event_routes.build_router(

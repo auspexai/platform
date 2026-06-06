@@ -329,6 +329,27 @@ class WorkerRepository:
                 n += 1
         return n
 
+    def model_inventory_counts(self, *, heartbeat_cutoff: datetime) -> dict[str, int]:
+        """The network's bottom-up model catalog (M2): {model_id: how many active
+        workers declare it}, aggregated across the active set (same predicate as
+        `count_active`). Identity-free — backs `GET /models/catalog`."""
+        rows = self.db.execute(
+            "SELECT capabilities_json FROM workers "
+            "WHERE retired_at IS NULL AND quarantined_at IS NULL "
+            "AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?",
+            (heartbeat_cutoff.isoformat(),),
+        )
+        counts: dict[str, int] = {}
+        for r in rows:
+            caps = json.loads(r["capabilities_json"] or "{}")
+            have = caps.get("models", [])
+            if not isinstance(have, list):
+                continue
+            for mid in have:
+                if isinstance(mid, str):
+                    counts[mid] = counts.get(mid, 0) + 1
+        return counts
+
     # ---- helpers ----
 
     @staticmethod
