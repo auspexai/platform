@@ -240,6 +240,36 @@ def test_degraded_worker_excluded_and_flagged(
     assert w["degraded"] is True
 
 
+def test_self_paused_worker_excluded_and_flagged(
+    client: TestClient,
+    maintainer_token: str,
+    registered_tenant,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+    worker_repository,
+):
+    """§2.1 #11: a volunteer-self-paused worker is excluded from the workforce
+    (so the experiment is blocked) and flagged self_paused on /scheduler."""
+    _, binding = registered_tenant
+    worker_repository.enroll(worker_id="wkr-sp", pubkey_hex="c" * 64)
+    worker_repository.record_heartbeat(
+        "wkr-sp",
+        capabilities={"os": "linux", "models": ["m-x"], "self_paused": True},
+    )
+    exp = _approved_exp(
+        manifest_repository, experiment_repository, per_job_factory,
+        tenant_id=binding.tenant_id, label="sp-cap", required={"models": ["m-x"]},
+    )
+    body = client.get("/api/v0/scheduler/state", headers=_mtnr(maintainer_token)).json()
+    e = _exp_state(body, exp.experiment_id)
+    assert e["blocked"] is True
+    assert e["capable_worker_count"] == 0
+    assert body["active_worker_count"] == 0
+    w = next(x for x in body["workers"] if x["worker_id"] == "wkr-sp")
+    assert w["self_paused"] is True
+
+
 def test_stalled_unit_surfaced(
     client: TestClient,
     maintainer_token: str,

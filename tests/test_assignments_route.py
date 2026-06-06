@@ -707,6 +707,29 @@ def test_terminal_refusal_not_reoffered_to_same_worker_via_get(
     assert repulled.json()["work_unit"] is None
 
 
+def test_paused_worker_gets_423_with_reason(
+    client: TestClient,
+    enrolled_worker,
+    worker_repository,
+) -> None:
+    """§2.1 #11: an operator-paused worker's /assignments poll returns 423
+    worker_paused (no-fault) carrying the maintainer's reason — so the volunteer
+    learns it was paused + why, just like quarantine."""
+    privkey, worker = enrolled_worker
+    worker_repository.pause(worker.worker_id, "rolling upgrade")
+    resp = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    )
+    assert resp.status_code == 423
+    err = resp.json()["detail"]["error"]
+    assert err["code"] == "worker_paused"
+    assert err["details"]["pause_reason"] == "rolling upgrade"
+    assert err["details"]["no_fault"] is True
+
+
 def test_prestage_directs_auto_acquire_worker(
     client: TestClient,
     enrolled_worker,

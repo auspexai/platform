@@ -18,6 +18,7 @@ from auspexai_platform.scheduler import (
     is_retryable_refusal,
     reoffer_eligible,
     worker_is_degraded,
+    worker_is_self_paused,
     worker_satisfies,
 )
 
@@ -212,6 +213,36 @@ def test_scheduler_skips_thermal_critical_worker(
     assert scheduler.pick_for_worker(hot) is None
     # a cool worker (no thermal-critical) is offered the unit
     assert scheduler.pick_for_worker(_worker(worker_id="wkr-cool", models=None)) is not None
+
+
+def test_scheduler_skips_self_paused_worker(
+    registered_tenant,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+    manifest_repository: ManifestRepository,
+) -> None:
+    # §2.1 #11: a volunteer-self-paused worker is routed around (owner hold).
+    _, binding = registered_tenant
+    exp = _make_experiment(
+        manifest_repository=manifest_repository,
+        experiment_repository=experiment_repository,
+        tenant_id=binding.tenant_id,
+        label="sp-1",
+    )
+    db = per_job_factory.get_or_create(exp.experiment_id)
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+
+    sp = Worker(
+        worker_id="wkr-sp",
+        pubkey_hex="s" * 64,
+        trust_tier=TrustTier.T2_TRUSTED,
+        capabilities={"os": "linux", "self_paused": True},
+        registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    assert worker_is_self_paused(sp) is True
+    assert scheduler.pick_for_worker(sp) is None
+    assert scheduler.pick_for_worker(_worker(worker_id="wkr-live", models=None)) is not None
 
 
 def test_picks_pending_unit_for_eligible_worker(

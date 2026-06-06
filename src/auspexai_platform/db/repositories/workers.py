@@ -195,16 +195,18 @@ class WorkerRepository:
         assert got is not None
         return got
 
-    def pause(self, worker_id: str) -> Worker:
+    def pause(self, worker_id: str, reason: str | None = None) -> Worker:
         """Mark a worker as paused — an OPERATIONAL pause (stop assigning), not a
-        fault. Reversible via unpause; idempotent (timestamp preserved). Raises
-        WorkerNotFoundError if unknown, ValueError if retired."""
+        fault. Reversible via unpause; idempotent (timestamp preserved, reason
+        refreshed). The `reason` is surfaced to the worker via the /assignments
+        423 (§2.1 #11 — transparent, no-fault). Raises WorkerNotFoundError if
+        unknown, ValueError if retired."""
         now = datetime.now(UTC).isoformat()
         with self.db.transaction() as cur:
             cur.execute(
-                "UPDATE workers SET paused_at = COALESCE(paused_at, ?) "
+                "UPDATE workers SET paused_at = COALESCE(paused_at, ?), pause_reason = ? "
                 "WHERE worker_id = ? AND retired_at IS NULL",
-                (now, worker_id),
+                (now, reason, worker_id),
             )
             if cur.rowcount == 0:
                 if self.get_by_id(worker_id) is None:
@@ -218,7 +220,7 @@ class WorkerRepository:
         """Clear pause on a worker. Idempotent. Raises WorkerNotFoundError if unknown."""
         with self.db.transaction() as cur:
             cur.execute(
-                "UPDATE workers SET paused_at = NULL WHERE worker_id = ?",
+                "UPDATE workers SET paused_at = NULL, pause_reason = NULL WHERE worker_id = ?",
                 (worker_id,),
             )
             if cur.rowcount == 0:
@@ -404,4 +406,5 @@ class WorkerRepository:
             ),
             quarantine_reason=row["quarantine_reason"],
             paused_at=(datetime.fromisoformat(row["paused_at"]) if row["paused_at"] else None),
+            pause_reason=row["pause_reason"] if "pause_reason" in row.keys() else None,
         )

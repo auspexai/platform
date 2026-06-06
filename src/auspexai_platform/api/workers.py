@@ -77,6 +77,7 @@ class WorkerResponse(BaseModel):
     quarantined_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
     quarantine_reason: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     paused_at: Annotated[datetime | None, ExposureTag.OPERATOR_ONLY] = None
+    pause_reason: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     pubkey_hex: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     account_id: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     capabilities: Annotated[dict[str, Any] | None, ExposureTag.OPERATOR_ONLY] = None
@@ -162,6 +163,7 @@ def _worker_to_response(worker) -> WorkerResponse:
         quarantined_at=worker.quarantined_at,
         quarantine_reason=worker.quarantine_reason,
         paused_at=getattr(worker, "paused_at", None),
+        pause_reason=getattr(worker, "pause_reason", None),
         pubkey_hex=worker.pubkey_hex,
         account_id=worker.account_id,
         capabilities=worker.capabilities,
@@ -628,7 +630,7 @@ def build_router(
     ) -> WorkerResponse:
         require_maintainer(credential)
         try:
-            worker = worker_repository.pause(worker_id)
+            worker = worker_repository.pause(worker_id, body.reason)
         except WorkerNotFoundError as e:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

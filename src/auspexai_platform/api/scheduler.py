@@ -45,6 +45,7 @@ from auspexai_platform.scheduler import (
     reoffer_eligible,
     replication_floor_for_tier,
     worker_is_degraded,
+    worker_is_self_paused,
     worker_satisfies,
 )
 from auspexai_platform.scheduler.conductor import _coords_for_models
@@ -75,6 +76,7 @@ class SchedulerWorker(BaseModel):
     model_count: int
     paused: bool
     degraded: bool = False  # M5: heartbeat thermal state == critical (routed around)
+    self_paused: bool = False  # §2.1 #11: volunteer self-pause (owner hold)
     eligible_experiment_count: int  # approved experiments w/ outstanding work this worker can take
 
 
@@ -159,9 +161,14 @@ def build_router(
             and w.last_heartbeat_at is not None
             and w.last_heartbeat_at >= cutoff
         ]
-        # M5: a degraded (thermal-critical) worker is routed around, like paused —
-        # exclude it from the available workforce so eligibility counts are honest.
-        workforce = [w for w in on_network if w.paused_at is None and not worker_is_degraded(w)]
+        # M5/§2.1 #11: a degraded (thermal-critical) or volunteer-self-paused worker
+        # is routed around, like operator-paused — exclude all from the available
+        # workforce so eligibility counts are honest.
+        workforce = [
+            w
+            for w in on_network
+            if w.paused_at is None and not worker_is_degraded(w) and not worker_is_self_paused(w)
+        ]
 
         elig_count: dict[str, int] = {w.worker_id: 0 for w in workforce}
         experiments_out: list[SchedulerExperiment] = []
@@ -212,6 +219,7 @@ def build_router(
                 model_count=_model_count(w),
                 paused=w.paused_at is not None,
                 degraded=worker_is_degraded(w),
+                self_paused=worker_is_self_paused(w),
                 eligible_experiment_count=elig_count.get(w.worker_id, 0),
             )
             for w in on_network

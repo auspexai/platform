@@ -266,6 +266,30 @@ def build_router(
                 },
             )
 
+        # §2.1 #11: an operator-PAUSED worker is now told it's paused + why — the
+        # same transparency as quarantine, but a distinct `worker_paused` code and
+        # `no_fault: true` so the volunteer's dashboard frames it as an operational
+        # hold, not a trust/fault signal. (Volunteer self-pause is the worker's own
+        # state — it doesn't 423 itself; the scheduler just offers it nothing.)
+        if worker.paused_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_423_LOCKED,
+                detail={
+                    "error": {
+                        "code": "worker_paused",
+                        "message": (
+                            "this worker was paused by the operator (no-fault); "
+                            "wait for unpause or contact the operator"
+                        ),
+                        "details": {
+                            "paused_at": worker.paused_at.isoformat(),
+                            "pause_reason": worker.pause_reason,
+                            "no_fault": True,
+                        },
+                    }
+                },
+            )
+
         pick = scheduler.pick_for_worker(worker)
         if pick is None:
             return AssignmentResponse(work_unit=None)

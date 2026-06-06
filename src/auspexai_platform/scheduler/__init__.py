@@ -95,6 +95,16 @@ def is_retryable_refusal(kind: str | None) -> bool:
     return kind in _RETRYABLE_REFUSAL_KINDS
 
 
+def worker_is_self_paused(worker: Worker) -> bool:
+    """True if the worker declared a volunteer self-pause (§2.1 #11) — the
+    resource owner temporarily withholding their machine, distinct from the
+    operator `paused_at` hold. Worker-declared via `capabilities["self_paused"]`
+    (like thermal/auto_acquire); the scheduler routes around it. The owner clears
+    it (the operator can't), and the operator's `paused_at` is separate (the
+    volunteer can't clear that) — two distinct holds, each cleared by its owner."""
+    return worker.capabilities.get("self_paused") is True
+
+
 def worker_is_degraded(worker: Worker) -> bool:
     """True if the worker's last heartbeat reports a thermal-critical state (M5,
     W-H increment 2). The worker declares `capabilities["thermal"]` =
@@ -199,6 +209,10 @@ class Scheduler:
         # host) and it just refused/aborted work locally. Route around it until it
         # cools and reports OK again. Analogous to the pause/quarantine skips.
         if worker_is_degraded(worker):
+            return None
+        # §2.1 #11: a volunteer self-paused worker is routed around too (owner's
+        # hold — resource-owner sovereignty). Distinct from the operator pause.
+        if worker_is_self_paused(worker):
             return None
         tier_floor = replication_floor_for_tier(worker.trust_tier)
 
