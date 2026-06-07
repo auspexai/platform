@@ -13,6 +13,8 @@ from __future__ import annotations
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
+from auspexai_platform.events import GLOBAL
+
 
 def _enroll(client: TestClient) -> tuple[Ed25519PrivateKey, str]:
     priv = Ed25519PrivateKey.generate()
@@ -23,6 +25,28 @@ def _enroll(client: TestClient) -> tuple[Ed25519PrivateKey, str]:
     )
     assert r.status_code == 201, r.text
     return priv, r.json()["worker_id"]
+
+
+def test_quarantine_publishes_worker_status(client: TestClient, maintainer_token: str) -> None:
+    """M6 (step 4): a worker-state transition emits worker.status on the maintainer
+    firehose → the operator console reflects fleet changes live. Full detail, fleet
+    event (experiment_id=None → firehose only)."""
+    _, worker_id = _enroll(client)
+    bus = client.app.state.event_bus
+    with bus.subscribe(GLOBAL) as q:
+        r = client.post(
+            f"/api/v0/workers/{worker_id}/actions/quarantine",
+            json={"reason": "m6 step4 test"},
+            headers={"Authorization": f"Bearer {maintainer_token}"},
+        )
+        assert r.status_code == 200, r.text
+        ev = q.get_nowait()  # publish ran during the synchronous POST
+    assert ev.type == "worker.status"
+    assert ev.experiment_id is None
+    assert ev.data["worker_id"] == worker_id
+    assert ev.data["status"] == "quarantined"
+    assert ev.data["quarantine_reason"] == "m6 step4 test"
+    assert ev.data["trigger"] == "quarantine"
 
 
 class TestQuarantineEndpoint:

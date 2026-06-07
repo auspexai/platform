@@ -61,9 +61,38 @@ from auspexai_platform.db.repositories.workers import (
     DuplicateWorkerError,
     WorkerNotFoundError,
 )
+from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.rate_limit import limiter
 from auspexai_platform.scheduler.capacity import experiments_collapsed_by_removing
+from auspexai_platform.worker_status import derive_worker_status
+
+
+def _publish_worker_status(event_bus: EventBus | None, worker, *, trigger: str) -> None:
+    """M6: emit `worker.status` to the maintainer firehose on a worker-state
+    transition (quarantine / pause / retire / …) so the operator console reflects
+    fleet changes live without a refresh. Full detail — filtered per-subscriber at
+    the render layer for any future tenant-scoped stream, not pre-redacted here."""
+    if event_bus is None:
+        return
+    now = datetime.now(UTC)
+    event_bus.publish(
+        "worker.status",
+        experiment_id=None,  # fleet-wide → maintainer firehose only
+        data={
+            "worker_id": worker.worker_id,
+            "status": derive_worker_status(worker, now).value,
+            "trust_tier": int(worker.trust_tier),
+            "account_id": getattr(worker, "account_id", None),
+            "quarantine_reason": worker.quarantine_reason,
+            "paused_at": (
+                worker.paused_at.isoformat() if getattr(worker, "paused_at", None) else None
+            ),
+            "retired_at": worker.retired_at.isoformat() if worker.retired_at else None,
+            "trigger": trigger,
+        },
+    )
+
 
 # ---- request / response models --------------------------------------------
 
@@ -225,6 +254,8 @@ def build_router(
     worker_registry: WorkerRegistry,
     experiment_repository: ExperimentRepository,
     per_job_factory: PerJobDatabaseFactory,
+    *,
+    event_bus: EventBus | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -552,6 +583,7 @@ def build_router(
             resource_id=worker.worker_id,
         )
 
+        _publish_worker_status(event_bus, worker, trigger="retire")
         return filter_for_credential(_worker_to_response(worker), credential)
 
     # ---- POST /workers/{id}/actions/quarantine (maintainer-only) --------
@@ -599,6 +631,7 @@ def build_router(
             payload={"reason": body.reason} if body.reason else None,
         )
 
+        _publish_worker_status(event_bus, worker, trigger="quarantine")
         return filter_for_credential(_worker_to_response(worker), credential)
 
     # ---- POST /workers/{id}/actions/unquarantine (maintainer-only) ------
@@ -634,6 +667,7 @@ def build_router(
             resource_id=worker.worker_id,
         )
 
+        _publish_worker_status(event_bus, worker, trigger="unquarantine")
         return filter_for_credential(_worker_to_response(worker), credential)
 
     # ---- POST /workers/{id}/actions/pause | unpause (maintainer; M4) -----
@@ -699,6 +733,7 @@ def build_router(
                 "experiments_blocked": [c.experiment_id for c in collapsed],
             },
         )
+        _publish_worker_status(event_bus, worker, trigger="pause")
         filtered = filter_for_credential(_worker_to_response(worker), credential)
         return WorkerPauseResponse(
             **filtered.model_dump(),
@@ -731,6 +766,7 @@ def build_router(
             resource_type="worker",
             resource_id=worker.worker_id,
         )
+        _publish_worker_status(event_bus, worker, trigger="unpause")
         return filter_for_credential(_worker_to_response(worker), credential)
 
     return router

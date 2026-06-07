@@ -255,6 +255,7 @@ def create_app(
             worker_registry,
             experiment_repository,
             per_job_factory,
+            event_bus=event_bus,
         ),
         prefix="/api/v0",
         tags=["workers"],
