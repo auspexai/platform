@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from auspexai_platform.auth.signature import sign_request
+from auspexai_platform.events import GLOBAL
 
 
 def _manifest(tenant_id: str, experiment_id: str, **extras) -> dict:
@@ -95,6 +96,27 @@ def test_submit_creates_experiment(
     # Researcher sees own tenant-scoped fields.
     assert body["tenant_experiment_label"] == "doubler-001"
     assert body["manifest_hash"]
+
+
+def test_submit_publishes_experiment_submitted_event(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """M6: a new submission publishes `experiment.submitted` to the firehose so the
+    operator console can surface a pending approval live (no refresh). Full payload
+    (not pre-redacted by audience — the §6.1 filter applies on tenant-scoped streams)."""
+    privkey, binding = registered_tenant
+    bus = client.app.state.event_bus
+    with bus.subscribe(GLOBAL) as q:
+        response = _submit_as_researcher(
+            client, privkey, binding.pubkey_hex, _manifest(binding.tenant_id, "evt-exp")
+        )
+        assert response.status_code == 201, response.text
+        ev = q.get_nowait()  # synchronous POST ran the publish before returning
+    assert ev.type == "experiment.submitted"
+    assert ev.data["status"] == "submitted"
+    assert ev.data["tenant_experiment_label"] == "evt-exp"
+    assert ev.data["tenant_id"] == binding.tenant_id
+    assert ev.data["manifest_hash"]
 
 
 def test_submit_derives_required_capabilities(

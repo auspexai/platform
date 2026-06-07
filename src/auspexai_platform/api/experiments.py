@@ -361,6 +361,31 @@ def build_router(
             },
         )
 
+        # M6: a newly-submitted experiment enters the approval queue. The bus
+        # otherwise emits `experiment.status` only on *transitions* — never on
+        # creation — so without this the operator console can't surface a pending
+        # approval live (it had to be refreshed). Full payload: the maintainer
+        # firehose renders it as-is; a tenant-scoped stream applies the §6.1
+        # per-subscriber exposure filter (the event is not pre-redacted by audience).
+        if event_bus is not None:
+            event_bus.publish(
+                "experiment.submitted",
+                experiment_id=experiment.experiment_id,
+                data={
+                    "status": experiment.status.value,
+                    "tenant_id": experiment.tenant_id,
+                    "tenant_experiment_label": experiment.tenant_experiment_label,
+                    "manifest_hash": experiment.manifest_hash,
+                    "submitted_at": (
+                        experiment.submitted_at.isoformat()
+                        if experiment.submitted_at is not None
+                        else None
+                    ),
+                    "required_capabilities": getattr(experiment, "required_capabilities", None)
+                    or None,
+                },
+            )
+
         return filter_for_credential(
             _to_response(experiment),
             credential,
