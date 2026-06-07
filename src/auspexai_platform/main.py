@@ -221,6 +221,7 @@ def create_app(
             experiment_repository,
             audit_repository,
             event_bus=event_bus,
+            per_job_factory=per_job_factory,
         ),
         prefix="/api/v0",
         tags=["experiments"],

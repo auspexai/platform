@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.dependency import require_maintainer
 from auspexai_platform.db.models import ExperimentStatus
+from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AuditRepository,
     ExperimentRepository,
@@ -243,6 +244,7 @@ def build_router(
     audit_repository: AuditRepository,
     *,
     event_bus: EventBus | None = None,
+    per_job_factory: PerJobDatabaseFactory | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -604,6 +606,25 @@ def build_router(
                 "was_already_finalized": experiment.submissions_finalized,
             },
         )
+        # If every unit already completed *before* this finalize (the autonomic
+        # loop's finalize-on-convergence case — it finalizes once the last round's
+        # units are all done), the unit-completion auto-complete trigger
+        # (assignments._maybe_auto_complete, fired on result submit) never re-fires.
+        # So run the same check here; otherwise the experiment is stuck APPROVED +
+        # finalized and never reaches COMPLETED (no result-set attestation).
+        if per_job_factory is not None:
+            per_job_db = per_job_factory.get(experiment_id)
+            if per_job_db is not None:
+                from auspexai_platform.api.assignments import _maybe_auto_complete
+
+                _maybe_auto_complete(
+                    experiment_id=experiment_id,
+                    per_job_db=per_job_db,
+                    experiment_repository=experiment_repository,
+                    audit_repository=audit_repository,
+                    event_bus=event_bus,
+                )
+                updated = experiment_repository.get_by_id(experiment_id) or updated
         return filter_for_credential(
             _to_response(updated),
             credential,

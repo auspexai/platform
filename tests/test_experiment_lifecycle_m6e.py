@@ -327,6 +327,73 @@ def test_auto_complete_fires_when_finalized_and_all_done(
     assert final.last_action_by_class.value == "system"
 
 
+def test_auto_complete_fires_when_finalize_arrives_after_all_units_done(
+    client: TestClient,
+    enrolled_worker,
+    worker_repository,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository,
+) -> None:
+    """Regression (autonomic-loop finalize-on-convergence): all units complete
+    *before* finalize, so the result-submission auto-complete trigger never
+    re-fires — finalize must complete the experiment itself, else it's stuck
+    APPROVED + finalized forever (no result-set attestation). Surfaced by the live
+    M8 e2e 2026-06-07."""
+    priv1, w1 = enrolled_worker
+    priv2 = Ed25519PrivateKey.generate()
+    pub2 = priv2.public_key().public_bytes_raw().hex()
+    w2 = worker_repository.enroll(worker_id="wkr-2", pubkey_hex=pub2)
+    priv3 = Ed25519PrivateKey.generate()
+    pub3 = priv3.public_key().public_bytes_raw().hex()
+    w3 = worker_repository.enroll(worker_id="wkr-3", pubkey_hex=pub3)
+
+    res_privkey, tenant_binding, experiment, _ = approved_experiment
+
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}])
+
+    # All results arrive FIRST → the unit completes, but the experiment is not
+    # finalized yet, so the result-path auto-complete correctly does NOT fire.
+    for priv, pub, wid in [
+        (priv1, w1.pubkey_hex, w1.worker_id),
+        (priv2, pub2, w2.worker_id),
+        (priv3, pub3, w3.worker_id),
+    ]:
+        _signed_get(client, privkey=priv, pubkey_hex=pub, path=f"/api/v0/workers/{wid}/assignments")
+        _signed_post(
+            client,
+            privkey=priv,
+            pubkey_hex=pub,
+            path=f"/api/v0/workers/{wid}/assignments/u1/result",
+            payload={
+                "unit_id": "u1",
+                "worker_pubkey": pub,
+                "completed_at": "2026-05-19T12:00:00+00:00",
+                "exit_code": 0,
+                "payload": {"out": 1},
+                "worker_signature": "Zm9v",
+            },
+        )
+
+    mid = experiment_repository.get_by_id(experiment.experiment_id)
+    assert mid.status is ExperimentStatus.APPROVED  # all units done, but not finalized
+
+    # Finalize AFTER everything is already complete → the finalize path itself must
+    # auto-complete (the fix).
+    resp = _signed_post(
+        client,
+        privkey=res_privkey,
+        pubkey_hex=tenant_binding.pubkey_hex,
+        path=f"/api/v0/experiments/{experiment.experiment_id}/actions/finalize-submissions",
+    )
+    assert resp.status_code == 200
+
+    final = experiment_repository.get_by_id(experiment.experiment_id)
+    assert final.status is ExperimentStatus.COMPLETED
+    assert final.last_action_by_class.value == "system"
+
+
 def test_auto_complete_does_not_fire_if_not_finalized(
     client: TestClient,
     enrolled_worker,
