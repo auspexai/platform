@@ -49,6 +49,33 @@ def test_quarantine_publishes_worker_status(client: TestClient, maintainer_token
     assert ev.data["trigger"] == "quarantine"
 
 
+def test_quarantine_publishes_network_status(client: TestClient, maintainer_token: str) -> None:
+    """M6 #2a: a worker-state transition also emits network.status — an
+    identity-free PUBLIC fleet count (network_active_workers) on the firehose, so
+    a network-size surface updates without enumerating workers. Anonymized: no
+    worker_id in the payload."""
+    _, worker_id = _enroll(client)
+    bus = client.app.state.event_bus
+    with bus.subscribe(GLOBAL) as q:
+        r = client.post(
+            f"/api/v0/workers/{worker_id}/actions/quarantine",
+            json={"reason": "m6 #2a test"},
+            headers={"Authorization": f"Bearer {maintainer_token}"},
+        )
+        assert r.status_code == 200, r.text
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+    by_type = {e.type: e for e in events}
+    assert "worker.status" in by_type
+    assert "network.status" in by_type
+    net = by_type["network.status"]
+    assert net.experiment_id is None  # fleet-wide → firehose
+    assert net.data["trigger"] == "quarantine"
+    assert isinstance(net.data["network_active_workers"], int)
+    assert "worker_id" not in net.data  # anonymized count, no identity
+
+
 class TestQuarantineEndpoint:
     def test_maintainer_can_quarantine_a_worker(
         self, client: TestClient, maintainer_token: str

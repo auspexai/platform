@@ -65,7 +65,7 @@ from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.rate_limit import limiter
 from auspexai_platform.scheduler.capacity import experiments_collapsed_by_removing
-from auspexai_platform.worker_status import derive_worker_status
+from auspexai_platform.worker_status import derive_worker_status, heartbeat_cutoff
 
 
 def _publish_worker_status(event_bus: EventBus | None, worker, *, trigger: str) -> None:
@@ -89,6 +89,34 @@ def _publish_worker_status(event_bus: EventBus | None, worker, *, trigger: str) 
                 worker.paused_at.isoformat() if getattr(worker, "paused_at", None) else None
             ),
             "retired_at": worker.retired_at.isoformat() if worker.retired_at else None,
+            "trigger": trigger,
+        },
+    )
+
+
+def _publish_network_status(
+    event_bus: EventBus | None, worker_repository: WorkerRepository, *, trigger: str
+) -> None:
+    """M6: emit `network.status` — an identity-free, PUBLIC count delta (just the
+    fleet-wide active-worker total) — on a transition that can change that count.
+    Anonymized by construction (no worker ids), so it is safe for any audience;
+    today it rides the maintainer firehose and the researcher network-size surface
+    will consume it when that stream lands.
+
+    Emitted alongside `worker.status` on the operator transitions (retire /
+    quarantine / unquarantine / pause / unpause). Organic online↔offline (a
+    heartbeat aging past the freshness window) has no trigger by design — that is
+    the consumer's baseline poll's job (poll is the truth, the event is a hint)."""
+    if event_bus is None:
+        return
+    now = datetime.now(UTC)
+    event_bus.publish(
+        "network.status",
+        experiment_id=None,  # PUBLIC anonymized fleet count → firehose (+ researchers later)
+        data={
+            "network_active_workers": worker_repository.count_active(
+                heartbeat_cutoff=heartbeat_cutoff(now)
+            ),
             "trigger": trigger,
         },
     )
@@ -584,6 +612,7 @@ def build_router(
         )
 
         _publish_worker_status(event_bus, worker, trigger="retire")
+        _publish_network_status(event_bus, worker_repository, trigger="retire")
         return filter_for_credential(_worker_to_response(worker), credential)
 
     # ---- POST /workers/{id}/actions/quarantine (maintainer-only) --------
@@ -632,6 +661,7 @@ def build_router(
         )
 
         _publish_worker_status(event_bus, worker, trigger="quarantine")
+        _publish_network_status(event_bus, worker_repository, trigger="quarantine")
         return filter_for_credential(_worker_to_response(worker), credential)
 
     # ---- POST /workers/{id}/actions/unquarantine (maintainer-only) ------
@@ -668,6 +698,7 @@ def build_router(
         )
 
         _publish_worker_status(event_bus, worker, trigger="unquarantine")
+        _publish_network_status(event_bus, worker_repository, trigger="unquarantine")
         return filter_for_credential(_worker_to_response(worker), credential)
 
     # ---- POST /workers/{id}/actions/pause | unpause (maintainer; M4) -----
@@ -734,6 +765,7 @@ def build_router(
             },
         )
         _publish_worker_status(event_bus, worker, trigger="pause")
+        _publish_network_status(event_bus, worker_repository, trigger="pause")
         filtered = filter_for_credential(_worker_to_response(worker), credential)
         return WorkerPauseResponse(
             **filtered.model_dump(),
@@ -767,6 +799,7 @@ def build_router(
             resource_id=worker.worker_id,
         )
         _publish_worker_status(event_bus, worker, trigger="unpause")
+        _publish_network_status(event_bus, worker_repository, trigger="unpause")
         return filter_for_credential(_worker_to_response(worker), credential)
 
     return router
