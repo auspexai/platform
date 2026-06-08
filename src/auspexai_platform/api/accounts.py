@@ -59,6 +59,14 @@ from auspexai_platform.oauth import (
 )
 from auspexai_platform.rate_limit import limiter
 
+# §6.2.2 anti-Sybil vouch gate: a voucher must have done real work across more
+# than one tenant before its vouch can feed a peer's identity gate — so a single
+# attacker can't spin up vouchers without first earning a cross-tenant track
+# record. A single vouch is sufficient in Phase 1, which makes this threshold the
+# load-bearing Sybil defense.
+VOUCH_MIN_RECEIPTS = 20
+VOUCH_MIN_DISTINCT_TENANTS = 2
+
 # ---- request / response models --------------------------------------------
 
 
@@ -549,6 +557,20 @@ def build_router(
             )
         if credential.trust_tier is None or credential.trust_tier < int(TrustTier.T2_TRUSTED):
             raise HTTPException(status_code=403, detail="voucher must be T2+")
+        # §6.2.2 anti-Sybil: the voucher must hold a real cross-tenant track
+        # record before its vouch counts (a vouch is enough to satisfy the
+        # target's identity gate, so this is the Sybil chokepoint).
+        if receipt_index_repository is not None:
+            total, tenants = receipt_index_repository.account_receipt_summary(credential.account_id)
+            if total < VOUCH_MIN_RECEIPTS or tenants < VOUCH_MIN_DISTINCT_TENANTS:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"voucher must hold ≥{VOUCH_MIN_RECEIPTS} receipts across "
+                        f"≥{VOUCH_MIN_DISTINCT_TENANTS} tenants (anti-Sybil, §6.2.2); "
+                        f"has {total} across {tenants}"
+                    ),
+                )
         if credential.account_id == account_id:
             raise HTTPException(status_code=422, detail="cannot vouch for yourself")
 

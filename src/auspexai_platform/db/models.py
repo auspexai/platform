@@ -178,6 +178,11 @@ class Experiment(BaseModel):
     # manifest's `local_weights_required` models, keyed by worker store model_id
     # (<repo-slug>-<quant>). Empty = no requirement (every worker eligible; pre-M1).
     required_capabilities: dict[str, list[str]] = Field(default_factory=dict)
+    # Audit 2026-06-08: a real-execution experiment with NO model requirement
+    # (executor runs real code but declares no local weights) must still be kept
+    # off synthetic-mode workers (which echo → false consensus). Derived at submit
+    # from the manifest's `requires_real_execution`. False = pre-existing behavior.
+    requires_real_execution: bool = False
     # M-Results: per-experiment retention controls (0015). NULL TTLs = platform
     # defaults; `retention_hold` makes the age-off sweep skip this experiment;
     # `results_collected_at` is the offload anchor (export-bundle pull).

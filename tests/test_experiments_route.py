@@ -532,3 +532,25 @@ def test_archive_after_abort(
     )
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "archived"
+
+
+def test_submit_rejects_custom_reducer(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """Custom reducers aren't implemented coordinator-side (issuance runs
+    builtin_hash_agreement only); a kind:custom manifest is rejected at ingest
+    rather than silently falling back to hash-agreement without the tenant
+    knowing (audit 2026-06-08)."""
+    privkey, binding = registered_tenant
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "custom-red-001",
+            reducer={"kind": "custom", "command": ["./reduce"]},
+        ),
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["error"]["code"] == "custom_reducer_unsupported"

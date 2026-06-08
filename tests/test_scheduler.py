@@ -587,3 +587,18 @@ def test_skips_experiment_with_no_per_job_db(
     # Don't create a per-job DB.
     scheduler = Scheduler(experiment_repository, per_job_factory)
     assert scheduler.pick_for_worker(worker) is None
+
+
+def test_worker_satisfies_requires_real_execution_gates_synthetic():
+    """Audit 2026-06-08: a real-execution experiment with NO model requirement
+    must still exclude synthetic-mode workers (an all-synthetic fleet would echo
+    identically → a FALSE consensus). The experiment-level requires_real_execution
+    flag gates such units to provisioned-mode workers only."""
+    syn = _worker(worker_id="s", models=[], execute_tenant_code="synthetic")
+    prov = _worker(worker_id="p", models=[], execute_tenant_code="provisioned")
+    # No model requirement + requires_real_execution → only provisioned eligible.
+    assert worker_satisfies(syn, {}, requires_real_execution=True) is False
+    assert worker_satisfies(prov, {}, requires_real_execution=True) is True
+    # Flag off → both eligible (pre-existing behavior, unchanged).
+    assert worker_satisfies(syn, {}, requires_real_execution=False) is True
+    assert worker_satisfies(prov, {}, requires_real_execution=False) is True

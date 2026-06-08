@@ -67,11 +67,18 @@ def _schedulable_workforce(
     return out
 
 
-def _eligible(workforce: list[Worker], required: dict[str, list[str]], repl: int) -> list[Worker]:
+def _eligible(
+    workforce: list[Worker],
+    required: dict[str, list[str]],
+    repl: int,
+    *,
+    requires_real_execution: bool = False,
+) -> list[Worker]:
     return [
         w
         for w in workforce
-        if worker_satisfies(w, required) and replication_floor_for_tier(w.trust_tier) <= repl
+        if worker_satisfies(w, required, requires_real_execution=requires_real_execution)
+        and replication_floor_for_tier(w.trust_tier) <= repl
     ]
 
 
@@ -106,7 +113,10 @@ def experiments_collapsed_by_removing(
             continue
         repl = INTEGRITY_POLICY_REPLICATION.get(exp.integrity_policy, 3)
         required = exp.required_capabilities or {}
-        if _eligible(before, required, repl) and not _eligible(after, required, repl):
+        rre = exp.requires_real_execution
+        if _eligible(before, required, repl, requires_real_execution=rre) and not _eligible(
+            after, required, repl, requires_real_execution=rre
+        ):
             collapsed.append(
                 BlockedExperiment(
                     experiment_id=exp.experiment_id,

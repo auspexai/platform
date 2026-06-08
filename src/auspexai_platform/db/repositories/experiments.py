@@ -75,6 +75,7 @@ class ExperimentRepository:
         tenant_experiment_label: str,
         manifest_hash: str,
         required_capabilities: dict[str, list[str]] | None = None,
+        requires_real_execution: bool = False,
     ) -> Experiment:
         """Insert a new experiment in `submitted` state. Raises
         DuplicateExperimentLabelError if (tenant_id, label) already exists.
@@ -93,8 +94,8 @@ class ExperimentRepository:
                 INSERT INTO experiments (
                     experiment_id, tenant_id, tenant_experiment_label,
                     manifest_hash, status, submitted_at, revision,
-                    required_capabilities_json
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                    required_capabilities_json, requires_real_execution
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     experiment_id,
@@ -104,6 +105,7 @@ class ExperimentRepository:
                     ExperimentStatus.SUBMITTED.value,
                     submitted_at,
                     caps_json,
+                    int(requires_real_execution),
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -379,6 +381,7 @@ class ExperimentRepository:
                 if row["required_capabilities_json"]
                 else {}
             ),
+            requires_real_execution=bool(row["requires_real_execution"]),
             raw_payload_ttl_days=row["raw_payload_ttl_days"],
             consensus_ttl_days=row["consensus_ttl_days"],
             retention_hold=bool(row["retention_hold"]),

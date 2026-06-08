@@ -115,6 +115,28 @@ class ReceiptIndexRepository:
         )
         return [self._row_to_entry(r) for r in rows]
 
+    def account_receipt_summary(self, account_id: str) -> tuple[int, int]:
+        """(total_receipts, distinct_tenants) for an account — joins
+        receipt_index → workers → experiments to count DISTINCT tenant_id (not
+        experiments). Powers the §6.2.2 anti-Sybil vouch gate; the
+        compute_receipt_stats `distinct_tenants` is only an experiment-count
+        upper bound, too weak for an anti-Sybil threshold. Receipts whose
+        experiment row is gone (e.g. a clean-slate) don't count — the INNER JOIN
+        keeps the gate to receipts tied to known tenants."""
+        rows = self.db.execute(
+            """
+            SELECT COUNT(*) AS total, COUNT(DISTINCT e.tenant_id) AS tenants
+            FROM receipt_index ri
+            INNER JOIN workers w     ON w.worker_id = ri.worker_id
+            INNER JOIN experiments e ON e.experiment_id = ri.experiment_id
+            WHERE w.account_id = ?
+            """,
+            (account_id,),
+        )
+        if not rows:
+            return (0, 0)
+        return (int(rows[0]["total"]), int(rows[0]["tenants"]))
+
     def get_for_worker_result(self, *, worker_id: str, result_id: str) -> ReceiptIndexEntry | None:
         """Find the receipt index entry for a specific (worker, result) pair
         (M7-tail). Returns None if no receipt was issued for this result

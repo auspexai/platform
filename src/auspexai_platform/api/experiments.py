@@ -308,6 +308,28 @@ def build_router(
                 },
             )
 
+        # Custom reducers are advertised in the SDK manifest contract but the
+        # coordinator only runs builtin_hash_agreement (issuance.py defers custom
+        # reducers). Reject `kind:"custom"` at ingest so a tenant can't submit a
+        # reducer that would silently never run (its consensus would fall back to
+        # hash-agreement without the tenant knowing). Drop this guard when custom
+        # reducer subprocess dispatch lands.
+        reducer = body.manifest.get("reducer")
+        if isinstance(reducer, dict) and reducer.get("kind") == "custom":
+            raise HTTPException(
+                status_code=422,  # UNPROCESSABLE_CONTENT (starlette 1.x deprecates the _ENTITY alias)
+                detail={
+                    "error": {
+                        "code": "custom_reducer_unsupported",
+                        "message": (
+                            "custom reducers are not yet supported; the coordinator "
+                            "runs builtin_hash_agreement only. Use "
+                            'reducer.kind="builtin_hash_agreement".'
+                        ),
+                    }
+                },
+            )
+
         # Insert manifest. Duplicate (same canonical hash) means re-submission;
         # treat as 409 — researchers shouldn't blindly re-upload identical
         # manifests; the receipt audit chain wants distinct submission events.
@@ -335,6 +357,7 @@ def build_router(
                 tenant_experiment_label=manifest_label,
                 manifest_hash=manifest.manifest_hash,
                 required_capabilities=_derive_required_capabilities(body.manifest),
+                requires_real_execution=bool(body.manifest.get("requires_real_execution")),
             )
         except DuplicateExperimentLabelError as e:
             raise HTTPException(

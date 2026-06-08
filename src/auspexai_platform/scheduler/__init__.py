@@ -165,24 +165,34 @@ def worker_runs_provisioned(worker: Worker) -> bool:
     return worker.capabilities.get("execute_tenant_code") == "provisioned"
 
 
-def worker_satisfies(worker: Worker, required_capabilities: dict[str, list[str]]) -> bool:
+def worker_satisfies(
+    worker: Worker,
+    required_capabilities: dict[str, list[str]],
+    *,
+    requires_real_execution: bool = False,
+) -> bool:
     """True if the worker is eligible for an experiment with these requirements
     (#30, M1; + M9 leg 4 execute-mode gate). `required_capabilities` is keyed by
     dimension; Phase-1 matches the "models" key against the worker's declared
     `capabilities["models"]` inventory by EXACT store model_id (hash-agreement
     consensus needs identical quants). Empty requirement ⇒ always satisfied (the
     pre-M1 behavior — every worker eligible, incl. synthetic-mode workers running
-    the doubler/test tenants). Unknown capability dimensions are ignored in Phase-1.
+    the doubler/test tenants), UNLESS `requires_real_execution` is set (below).
+    Unknown capability dimensions are ignored in Phase-1.
 
     **M9 leg 4 — consensus-safe routing.** A `models` requirement marks a
     *real-execution* experiment (it needs local weights ⇒ the tenant's executor
     must actually run). Such units route ONLY to `provisioned`-mode workers
     (`worker_runs_provisioned`); a `synthetic`/`off` worker is excluded even if it
     happens to hold the model in its store, because it would echo rather than run
-    — polluting consensus. (Limitation: this gates *model-requiring* experiments,
-    the BYOM/Vigiles case; a hypothetical real experiment that needs NO local
-    weights is not yet gated — add an explicit `requires_real_execution` manifest
-    flag if such a tenant appears. Documented, not silently assumed.)
+    — polluting consensus.
+
+    **Audit 2026-06-08 — model-less real execution.** A real-execution experiment
+    that declares NO local weights also must be kept off synthetic-mode workers
+    (else an all-synthetic fleet echoes identically → a FALSE consensus + receipt).
+    The experiment-level `requires_real_execution` flag (derived at submit from the
+    manifest) closes that gap: when set, only provisioned-mode workers are eligible
+    regardless of the model requirement.
 
     M3 (lazy auto-acquire): a provisioned worker that declares
     `capabilities["auto_acquire"]` satisfies any model requirement — on assignment
@@ -194,6 +204,11 @@ def worker_satisfies(worker: Worker, required_capabilities: dict[str, list[str]]
     — surfaced as demand, not a silent stall."""
     required_models = set(required_capabilities.get("models", []))
     if not required_models:
+        # No model requirement: every worker eligible UNLESS the experiment
+        # explicitly requires real execution, in which case synthetic/off workers
+        # would echo and pollute consensus — gate to provisioned-mode only.
+        if requires_real_execution:
+            return worker_runs_provisioned(worker)
         return True
     # Real-execution experiment → only provisioned-mode workers (consensus safety).
     if not worker_runs_provisioned(worker):
@@ -250,7 +265,11 @@ class Scheduler:
             # #30 (M1): skip the whole experiment when this worker lacks a model
             # it requires (the requirement is experiment-level, derived from the
             # manifest at submit). Empty requirement ⇒ satisfied (pre-M1 behavior).
-            if not worker_satisfies(worker, experiment.required_capabilities):
+            if not worker_satisfies(
+                worker,
+                experiment.required_capabilities,
+                requires_real_execution=experiment.requires_real_execution,
+            ):
                 continue
             per_job_db = self._per_job_factory.get(experiment.experiment_id)
             if per_job_db is None:

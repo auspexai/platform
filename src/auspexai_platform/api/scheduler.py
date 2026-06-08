@@ -185,7 +185,13 @@ def build_router(
             needs_work = pending + in_progress  # in-progress units may still need replicas
             repl = INTEGRITY_POLICY_REPLICATION.get(exp.integrity_policy, 3)
             required = exp.required_capabilities or {}
-            capable = [w for w in workforce if worker_satisfies(w, required)]
+            capable = [
+                w
+                for w in workforce
+                if worker_satisfies(
+                    w, required, requires_real_execution=exp.requires_real_execution
+                )
+            ]
             eligible = [w for w in capable if replication_floor_for_tier(w.trust_tier) <= repl]
             if needs_work > 0:
                 for w in eligible:
