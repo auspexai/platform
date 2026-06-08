@@ -54,6 +54,7 @@ from auspexai_platform.db.models import ExperimentStatus, TrustTier
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AssignmentRepository,
+    AttestationRepository,
     AuditRepository,
     ExperimentRepository,
     ReceiptIndexRepository,
@@ -65,6 +66,7 @@ from auspexai_platform.db.repositories.assignments import (
     AssignmentAlreadyResolvedError,
     DuplicateAssignmentError,
 )
+from auspexai_platform.db.repositories.attestations import DuplicateAttestationError
 from auspexai_platform.db.repositories.experiments import (
     InvalidStatusTransitionError,
 )
@@ -210,6 +212,7 @@ def build_router(
     event_bus=None,
     manifest_repository=None,  # M3b conductor: read acquisition coords from the manifest
     prestage_repository=None,  # M3b conductor: the model_prestage table
+    attestation_repository: AttestationRepository | None = None,  # A1: persist on complete
 ) -> APIRouter:
     router = APIRouter()
 
@@ -604,6 +607,7 @@ def build_router(
                 receipt_index_repository=receipt_index_repository,
                 signing_key=receipt_signing_key,
                 audit_repository=audit_repository,
+                attestation_repository=attestation_repository,
                 event_bus=event_bus,
             )
 
@@ -780,14 +784,28 @@ def _maybe_emit_completion_attestation(
     receipt_index_repository: ReceiptIndexRepository,
     signing_key: SigningKey,
     audit_repository: AuditRepository,
+    attestation_repository: AttestationRepository | None = None,
     event_bus=None,
 ) -> None:
-    """If the experiment is now COMPLETED, build + audit (+ emit) the result-set
-    completion attestation (#34 §6.3, M7-tail). Best-effort — wrapped so it never
-    blocks the result response; the on-demand GET can always rebuild it."""
+    """If the experiment is now COMPLETED, build + PERSIST (+ audit + emit) the
+    canonical result-set completion attestation (#34 §6.3, M7-tail / A1).
+
+    Persisting (A1) makes the attestation canonical — a stable id/bytes/anchor —
+    and durable past per-job DB deletion (the on-demand GET re-derives the same
+    root but would otherwise mint a fresh id each call and vanish with the
+    per-job DB). Idempotent: a no-op once a final attestation is persisted, so it
+    is safe to call from BOTH completion paths (result-submit + finalize-on-
+    convergence) and on every late result. Best-effort — wrapped so it never
+    blocks the result response; the on-demand GET canonicalizes lazily as a
+    backstop."""
     experiment = experiment_repository.get_by_id(experiment_id)
     if experiment is None or experiment.status is not ExperimentStatus.COMPLETED:
         return
+    if (
+        attestation_repository is not None
+        and attestation_repository.get_final(experiment_id) is not None
+    ):
+        return  # already canonical
     try:
         receipt_map = {
             e.result_id: e.receipt_id
@@ -803,6 +821,26 @@ def _maybe_emit_completion_attestation(
             signing_key=signing_key,
             rekor_client=None,
         )
+        if attestation_repository is not None:
+            try:
+                attestation_repository.insert(
+                    attestation_id=attestation.attestation_id,
+                    experiment_id=experiment_id,
+                    tenant_id=attestation.tenant_id,
+                    tenant_experiment_label=attestation.experiment_id,
+                    merkle_root=attestation.merkle_root,
+                    algorithm=attestation.algorithm,
+                    unit_count=attestation.unit_count,
+                    cose_signed_blob=attestation.cose_signed_blob,
+                    signing_key_pubkey_hex=attestation.signing_key_pubkey_hex,
+                    rekor_log_index=attestation.rekor_log_index,
+                    rekor_entry_uuid=attestation.rekor_entry_uuid,
+                    partial=attestation.partial,
+                )
+            except DuplicateAttestationError:
+                # Another completion path persisted it first — that row is the
+                # canonical one; don't double-audit/emit.
+                return
         audit_repository.append(
             actor_class=CredentialClass.SYSTEM,
             action="attestation.emitted",

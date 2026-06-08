@@ -38,9 +38,11 @@ from auspexai_platform.auth.dependency import require_maintainer
 from auspexai_platform.db.models import ExperimentStatus
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
+    AttestationRepository,
     AuditRepository,
     ExperimentRepository,
     ManifestRepository,
+    ReceiptIndexRepository,
 )
 from auspexai_platform.db.repositories.experiments import (
     DuplicateExperimentLabelError,
@@ -50,6 +52,7 @@ from auspexai_platform.db.repositories.manifests import DuplicateManifestError
 from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.maintenance import projected_raw_age_off
+from auspexai_platform.receipts.signing import SigningKey
 
 # ---- response models -------------------------------------------------------
 
@@ -245,6 +248,9 @@ def build_router(
     *,
     event_bus: EventBus | None = None,
     per_job_factory: PerJobDatabaseFactory | None = None,
+    receipt_index_repository: ReceiptIndexRepository | None = None,
+    signing_key: SigningKey | None = None,
+    attestation_repository: AttestationRepository | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -640,7 +646,10 @@ def build_router(
         if per_job_factory is not None:
             per_job_db = per_job_factory.get(experiment_id)
             if per_job_db is not None:
-                from auspexai_platform.api.assignments import _maybe_auto_complete
+                from auspexai_platform.api.assignments import (
+                    _maybe_auto_complete,
+                    _maybe_emit_completion_attestation,
+                )
 
                 _maybe_auto_complete(
                     experiment_id=experiment_id,
@@ -649,6 +658,22 @@ def build_router(
                     audit_repository=audit_repository,
                     event_bus=event_bus,
                 )
+                # A1: the finalize-on-convergence completion path (M8 autonomic
+                # driver finalizes after the last round's units are all done)
+                # reaches COMPLETED here, NOT via a result submit — so persist the
+                # canonical attestation on this path too. Idempotent + best-effort;
+                # the on-demand GET canonicalizes lazily if these deps are absent.
+                if receipt_index_repository is not None and signing_key is not None:
+                    _maybe_emit_completion_attestation(
+                        experiment_id=experiment_id,
+                        per_job_db=per_job_db,
+                        experiment_repository=experiment_repository,
+                        receipt_index_repository=receipt_index_repository,
+                        signing_key=signing_key,
+                        audit_repository=audit_repository,
+                        attestation_repository=attestation_repository,
+                        event_bus=event_bus,
+                    )
                 updated = experiment_repository.get_by_id(experiment_id) or updated
         return filter_for_credential(
             _to_response(updated),

@@ -126,6 +126,58 @@ def age_off(state_dir: Path | None, apply_changes: bool) -> None:
 
 
 # ----------------------------------------------------------------------------
+# attestation group (A2 — Rekor anchoring backfill)
+# ----------------------------------------------------------------------------
+
+
+@main.group()
+def attestation() -> None:
+    """Result-set attestation maintenance."""
+
+
+@attestation.command("backfill-rekor")
+@_state_dir_option
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Actually submit un-anchored attestations to Rekor. Default is a dry-run count.",
+)
+@click.option(
+    "--rekor-url",
+    default=None,
+    help="Rekor instance URL (default: config / public sigstore).",
+)
+def attestation_backfill_rekor(
+    state_dir: Path | None, apply_changes: bool, rekor_url: str | None
+) -> None:
+    """Anchor persisted attestations still carrying the NoOp Rekor placeholder.
+
+    The completion path persists attestations fast with a placeholder anchor (no
+    network on the request path); this sweep submits each un-anchored COSE blob
+    to Rekor and records the log index + entry UUID. DRY-RUN by default — pass
+    `--apply` to anchor. Idempotent + per-row fault-tolerant. Intended to run
+    from a systemd timer (mirrors `age-off`) or on demand.
+    """
+    from auspexai_platform.db.database import Database
+    from auspexai_platform.db.migrations import MigrationRunner
+    from auspexai_platform.receipts.attestation_backfill import backfill_rekor_anchors
+    from auspexai_platform.receipts.rekor import RekorClient
+
+    config = _resolve_config(state_dir)
+    db = Database(config.control_db_path)
+    try:
+        MigrationRunner(db).apply_all()  # idempotent; ensures the attestations table exists
+        client = RekorClient(rekor_url or config.rekor_url)
+        report = backfill_rekor_anchors(db, rekor_client=client, apply=apply_changes)
+    finally:
+        db.close()
+    click.echo(report.summary())
+    if not apply_changes and report.candidates:
+        click.echo("\nRe-run with --apply to anchor these in Rekor.")
+
+
+# ----------------------------------------------------------------------------
 # token group
 # ----------------------------------------------------------------------------
 

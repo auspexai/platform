@@ -25,6 +25,9 @@ from pathlib import Path
 DEFAULT_STATE_DIR = Path("./state")
 DEFAULT_RECEIPTS_MODE = "dev"
 VALID_RECEIPTS_MODES = ("dev", "operational")
+# Mirrors receipts.rekor.DEFAULT_REKOR_URL (kept inline so config stays
+# dependency-light). The A2 backfill sweep submits attestations here.
+DEFAULT_REKOR_URL = "https://rekor.sigstore.dev"
 
 # M7f tier-eligibility thresholds. Per §6.2 these are the receipt-history
 # preconditions that the eligibility readout reports on. They do NOT
@@ -45,6 +48,7 @@ class Config:
     receipts_mode: str = DEFAULT_RECEIPTS_MODE
     tier_t2_receipt_threshold: int = DEFAULT_TIER_T2_RECEIPT_THRESHOLD
     tier_t2_distinct_experiments: int = DEFAULT_TIER_T2_DISTINCT_EXPERIMENTS
+    rekor_url: str = DEFAULT_REKOR_URL
 
     def __post_init__(self) -> None:
         if self.receipts_mode not in VALID_RECEIPTS_MODES:
@@ -122,9 +126,11 @@ class Config:
                 DEFAULT_TIER_T2_DISTINCT_EXPERIMENTS,
             )
         )
+        rekor_url = os.environ.get("AUSPEXAI_REKOR_URL", DEFAULT_REKOR_URL)
         return cls(
             state_dir=resolved_state_dir,
             receipts_mode=receipts_mode,
             tier_t2_receipt_threshold=t2_receipts,
             tier_t2_distinct_experiments=t2_experiments,
+            rekor_url=rekor_url,
         )

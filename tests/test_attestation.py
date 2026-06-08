@@ -341,3 +341,166 @@ class TestAttestationRoute:
         resp = client.get(bare, headers=headers, params={"checkpoint": "true"})
         assert resp.status_code == 200, resp.text
         assert resp.json()["partial"] is False
+
+
+# ---- A1: attestation persistence + canonicalization ------------------------
+
+from auspexai_platform.db.database import Database  # noqa: E402
+from auspexai_platform.db.repositories import (  # noqa: E402
+    AttestationRepository,
+    AuditRepository,
+)
+from auspexai_platform.db.repositories.attestations import (  # noqa: E402
+    DuplicateAttestationError,
+)
+
+
+class TestAttestationRepository:
+    """Unit tests for the control-DB attestations store (A1)."""
+
+    def test_insert_get_final_and_duplicate_is_idempotent(self, db: Database):
+        repo = AttestationRepository(db)
+        rec = repo.insert(
+            attestation_id="att-1",
+            experiment_id="exp-A",
+            tenant_id="t",
+            tenant_experiment_label="label",
+            merkle_root="root1",
+            algorithm=RESULT_SET_ALGORITHM,
+            unit_count=3,
+            cose_signed_blob=b"\x01\x02\x03",
+            signing_key_pubkey_hex="ab" * 32,
+        )
+        assert rec.partial is False
+        assert rec.rekor_log_index == 0  # NoOp placeholder until A2
+        assert rec.doi is None
+        got = repo.get_final("exp-A")
+        assert got is not None and got.attestation_id == "att-1"
+        assert got.cose_signed_blob == b"\x01\x02\x03"  # BLOB round-trips as bytes
+
+        # A second FINAL attestation for the same experiment is refused by the
+        # partial-unique index — the first row stays canonical.
+        with pytest.raises(DuplicateAttestationError):
+            repo.insert(
+                attestation_id="att-2",
+                experiment_id="exp-A",
+                tenant_id="t",
+                tenant_experiment_label="label",
+                merkle_root="root2",
+                algorithm=RESULT_SET_ALGORITHM,
+                unit_count=4,
+                cose_signed_blob=b"\x09",
+                signing_key_pubkey_hex="ab" * 32,
+            )
+        assert repo.get_final("exp-A").attestation_id == "att-1"
+
+    def test_set_rekor_and_doi_and_list_unanchored(self, db: Database):
+        repo = AttestationRepository(db)
+        repo.insert(
+            attestation_id="att-R",
+            experiment_id="exp-R",
+            tenant_id="t",
+            tenant_experiment_label="label",
+            merkle_root="root",
+            algorithm=RESULT_SET_ALGORITHM,
+            unit_count=1,
+            cose_signed_blob=b"\x00",
+            signing_key_pubkey_hex="ab" * 32,
+        )
+        assert any(r.attestation_id == "att-R" for r in repo.list_unanchored())
+        repo.set_rekor("att-R", log_index=42, entry_uuid="uuid-42")
+        repo.set_doi("att-R", "10.5281/zenodo.999")
+        got = repo.get_by_id("att-R")
+        assert got.rekor_log_index == 42 and got.rekor_entry_uuid == "uuid-42"
+        assert got.doi == "10.5281/zenodo.999"
+        # No longer un-anchored.
+        assert all(r.attestation_id != "att-R" for r in repo.list_unanchored())
+
+
+class TestAttestationPersistence:
+    """A1: the FINAL attestation is persisted (canonical + durable), served from
+    the store on COMPLETED, and persisted lazily on first GET as a backstop."""
+
+    def test_emit_hook_persists_and_is_idempotent(
+        self,
+        client: TestClient,
+        db: Database,
+        approved_experiment,
+        enrolled_worker,
+        per_job_factory: PerJobDatabaseFactory,
+        receipt_index_repository,
+        experiment_repository,
+    ):
+        from auspexai_platform.api.assignments import _maybe_emit_completion_attestation
+
+        _, _, experiment, _ = approved_experiment
+        _, worker = enrolled_worker
+        _seed_consensus_unit(
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u1",
+            payload={"v": 1},
+            worker_id=worker.worker_id,
+        )
+        experiment_repository.update_status(experiment.experiment_id, ExperimentStatus.COMPLETED)
+        attestation_repository = AttestationRepository(db)
+        kwargs = {
+            "experiment_id": experiment.experiment_id,
+            "per_job_db": per_job_factory.get(experiment.experiment_id),
+            "experiment_repository": experiment_repository,
+            "receipt_index_repository": receipt_index_repository,
+            "signing_key": client.app.state.receipt_signing_key,
+            "audit_repository": AuditRepository(db),
+            "attestation_repository": attestation_repository,
+        }
+        _maybe_emit_completion_attestation(**kwargs)
+        first = attestation_repository.get_final(experiment.experiment_id)
+        assert first is not None and first.partial is False
+        # Calling again (e.g. a late result) does NOT mint a new canonical row.
+        _maybe_emit_completion_attestation(**kwargs)
+        again = attestation_repository.get_final(experiment.experiment_id)
+        assert again.attestation_id == first.attestation_id
+
+    def test_route_serves_persisted_canonical_and_is_stable(
+        self,
+        client: TestClient,
+        db: Database,
+        approved_experiment,
+        enrolled_worker,
+        per_job_factory: PerJobDatabaseFactory,
+        receipt_index_repository,
+        experiment_repository,
+    ):
+        """First GET on a COMPLETED experiment with no persisted row canonicalizes
+        lazily; the attestation_id is then STABLE across calls (the pre-A1
+        on-demand path minted a fresh id every call)."""
+        privkey, binding, experiment, _ = approved_experiment
+        _, worker = enrolled_worker
+        _seed_consensus_unit(
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u1",
+            payload={"v": 1},
+            worker_id=worker.worker_id,
+        )
+        experiment_repository.update_status(experiment.experiment_id, ExperimentStatus.COMPLETED)
+        path = f"/api/v0/experiments/{experiment.experiment_id}/attestation"
+
+        r1 = _signed_get(client, privkey=privkey, pubkey_hex=binding.pubkey_hex, path=path)
+        assert r1.status_code == 200, r1.text
+        b1 = r1.json()
+
+        # Lazy-persisted on that first GET.
+        persisted = AttestationRepository(db).get_final(experiment.experiment_id)
+        assert persisted is not None
+        assert persisted.attestation_id == b1["attestation_id"]
+        assert persisted.merkle_root == b1["merkle_root"]
+
+        # Second GET serves the SAME canonical artifact (stable id + bytes).
+        r2 = _signed_get(client, privkey=privkey, pubkey_hex=binding.pubkey_hex, path=path)
+        b2 = r2.json()
+        assert b2["attestation_id"] == b1["attestation_id"]
+        assert b2["cose_b64"] == b1["cose_b64"]
+        assert b2["unit_count"] == 1 and b2["units"]  # convenience units re-derived

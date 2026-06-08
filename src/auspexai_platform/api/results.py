@@ -32,11 +32,16 @@ from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.db.models import ExperimentStatus, Result
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
+    AttestationRepository,
     ExperimentRepository,
     ManifestRepository,
     ReceiptIndexRepository,
     ResultRepository,
     ResultTransferRepository,
+)
+from auspexai_platform.db.repositories.attestations import (
+    AttestationRecord,
+    DuplicateAttestationError,
 )
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.receipts.attestation import (
@@ -187,6 +192,7 @@ def build_router(
     result_transfer_repository: ResultTransferRepository,
     signing_key: SigningKey,
     audit_repository,
+    attestation_repository: AttestationRepository | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -205,6 +211,48 @@ def build_router(
             if entry.result_id is not None:
                 out[entry.result_id] = entry.receipt_id
         return out
+
+    def _collect_attestation_units(experiment_id: str) -> list[AttestationUnit]:
+        """Best-effort re-derive the per-unit list for the response convenience
+        field when serving a PERSISTED attestation. The canonical artifact is the
+        COSE blob (which already commits to these units); `units` just lets a
+        verifier recompute the root without re-pulling. Empty if the per-job DB is
+        gone — the cose_b64 still stands as the durable artifact."""
+        per_job_db = per_job_factory.get(experiment_id)
+        if per_job_db is None:
+            return []
+        entries = collect_result_set_entries(
+            per_job_db, receipt_id_by_result=_receipt_map(experiment_id)
+        )
+        return [
+            AttestationUnit(
+                unit_id=e.unit_id,
+                consensus_result_hash=e.consensus_result_hash,
+                receipt_id=e.receipt_id,
+            )
+            for e in entries
+        ]
+
+    def _persisted_to_attestation_response(
+        record: AttestationRecord, units: list[AttestationUnit]
+    ) -> ResultSetAttestationResponse:
+        """Map a persisted canonical attestation row → the API response. The
+        response's `experiment_id` is the tenant-facing label (receipt
+        convention), matching the on-demand build path."""
+        return ResultSetAttestationResponse(
+            attestation_id=record.attestation_id,
+            experiment_id=record.tenant_experiment_label,
+            tenant_id=record.tenant_id,
+            merkle_root=record.merkle_root,
+            algorithm=record.algorithm,
+            unit_count=record.unit_count,
+            units=units,
+            cose_b64=b64encode(record.cose_signed_blob).decode(),
+            signing_key_pubkey_hex=record.signing_key_pubkey_hex,
+            rekor_log_index=record.rekor_log_index,
+            rekor_entry_uuid=record.rekor_entry_uuid,
+            partial=record.partial,
+        )
 
     @router.get(
         "/experiments/{experiment_id}/results",
@@ -301,6 +349,18 @@ def build_router(
         # caller's flag.
         partial = not is_complete
 
+        # A1: serve the PERSISTED canonical attestation for a COMPLETED
+        # experiment. It is written once at completion (eager, from either
+        # completion path) or lazily below on first GET — a stable
+        # id/bytes/anchor, durable past per-job DB deletion. Checkpoints
+        # (partial) are transient and always rebuilt on demand.
+        if is_complete and attestation_repository is not None:
+            persisted = attestation_repository.get_final(experiment_id)
+            if persisted is not None:
+                return _persisted_to_attestation_response(
+                    persisted, _collect_attestation_units(experiment_id)
+                )
+
         # Only units that reached consensus (have a semantic_hash) AND have an
         # issued receipt are attested — a disagreed unit produced neither and is
         # excluded. Pages through ALL consensus units (no silent cap).
@@ -320,6 +380,42 @@ def build_router(
             rekor_client=None,
             partial=partial,
         )
+
+        # A1 lazy canonicalize-on-read: persist a freshly-built FINAL attestation
+        # so a COMPLETED experiment that wasn't persisted eagerly (e.g. completed
+        # before this migration, or via a path without the deps) now has a durable
+        # canonical record. Idempotent — a race with an emit path 409s on the
+        # partial-unique index, and we serve the now-canonical row.
+        if is_complete and attestation_repository is not None:
+            try:
+                attestation_repository.insert(
+                    attestation_id=attestation.attestation_id,
+                    experiment_id=experiment_id,
+                    tenant_id=attestation.tenant_id,
+                    tenant_experiment_label=attestation.experiment_id,
+                    merkle_root=attestation.merkle_root,
+                    algorithm=attestation.algorithm,
+                    unit_count=attestation.unit_count,
+                    cose_signed_blob=attestation.cose_signed_blob,
+                    signing_key_pubkey_hex=attestation.signing_key_pubkey_hex,
+                    rekor_log_index=attestation.rekor_log_index,
+                    rekor_entry_uuid=attestation.rekor_entry_uuid,
+                    partial=False,
+                )
+            except DuplicateAttestationError:
+                persisted = attestation_repository.get_final(experiment_id)
+                if persisted is not None:
+                    return _persisted_to_attestation_response(
+                        persisted,
+                        [
+                            AttestationUnit(
+                                unit_id=e.unit_id,
+                                consensus_result_hash=e.consensus_result_hash,
+                                receipt_id=e.receipt_id,
+                            )
+                            for e in attestation.entries
+                        ],
+                    )
         audit_repository.append(
             actor_class=credential.kind,
             actor_identifier=credential.pubkey_hex,

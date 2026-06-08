@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REKOR_URL = "https://rekor.sigstore.dev"
 
+# Sentinel anchor values for a not-yet-Rekor-anchored artifact (dev/lab mode or
+# pre-anchor). The A2 backfill sweep keys "unanchored" on the UUID sentinel.
+REKOR_PLACEHOLDER_LOG_INDEX = 0
+REKOR_PLACEHOLDER_UUID = "lab-mode-no-rekor"
+
 
 @dataclass(frozen=True)
 class RekorEntry:
@@ -74,4 +79,4 @@ class NoOpRekorClient:
     without contacting Rekor."""
 
     def record(self, cose_blob: bytes) -> RekorEntry:
-        return RekorEntry(log_index=0, entry_uuid="lab-mode-no-rekor")
+        return RekorEntry(log_index=REKOR_PLACEHOLDER_LOG_INDEX, entry_uuid=REKOR_PLACEHOLDER_UUID)

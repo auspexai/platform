@@ -50,6 +50,7 @@ from auspexai_platform.db import Database, MigrationRunner
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AccountRepository,
+    AttestationRepository,
     AuditRepository,
     ExperimentRepository,
     ManifestRepository,
@@ -110,6 +111,7 @@ def create_app(
     worker_repository = WorkerRepository(db)
     retired_key_repository = RetiredKeyRepository(db)
     receipt_index_repository = ReceiptIndexRepository(db)
+    attestation_repository = AttestationRepository(db)
     result_transfer_repository = ResultTransferRepository(db)
     model_request_repository = ModelRequestRepository(db)
     model_prestage_repository = ModelPrestageRepository(db)
@@ -222,6 +224,9 @@ def create_app(
             audit_repository,
             event_bus=event_bus,
             per_job_factory=per_job_factory,
+            receipt_index_repository=receipt_index_repository,
+            signing_key=receipt_signing_key,
+            attestation_repository=attestation_repository,
         ),
         prefix="/api/v0",
         tags=["experiments"],
@@ -297,6 +302,7 @@ def create_app(
             event_bus=event_bus,
             manifest_repository=manifest_repository,
             prestage_repository=model_prestage_repository,
+            attestation_repository=attestation_repository,
         ),
         prefix="/api/v0",
         tags=["assignments"],
@@ -326,6 +332,7 @@ def create_app(
             result_transfer_repository=result_transfer_repository,
             signing_key=receipt_signing_key,
             audit_repository=audit_repository,
+            attestation_repository=attestation_repository,
         ),
         prefix="/api/v0",
         tags=["results"],
