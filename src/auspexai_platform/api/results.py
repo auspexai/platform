@@ -315,10 +315,14 @@ def build_router(
     ) -> ResultSetAttestationResponse:
         """#34 §6.3 — the model-blind result-set attestation: a COSE-signed in-toto
         statement over the Merkle root of the experiment's per-unit consensus set,
-        so a tenant-side reduce has a reproducible, tamper-evident input. Built on
-        demand — deterministic from the stored consensus hashes, so no storage and
-        re-callable. The coordinator never reads a payload; it hashes/orders the
-        per-unit consensus hashes it holds.
+        so a tenant-side reduce has a reproducible, tamper-evident input. The
+        FINAL attestation is PERSISTED + canonical (A1, 2026-06-08): written once
+        at completion (or lazily on first GET) to the control-DB `attestations`
+        table, so it has a stable id/bytes/Rekor-anchor and survives per-job DB
+        deletion. This route serves the persisted row for COMPLETED experiments;
+        checkpoints (?checkpoint=true) are still rebuilt on demand (deterministic
+        from the stored consensus hashes). The coordinator never reads a payload;
+        it hashes/orders the per-unit consensus hashes it holds.
 
         Default: available only once the experiment is COMPLETED (the set is final).
         **M9 leg 2 — `?checkpoint=true`**: also returns an attestation over a

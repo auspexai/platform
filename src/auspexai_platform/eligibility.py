@@ -1,8 +1,12 @@
 """Tier-eligibility calculator (M7f).
 
 Implements the §6.2 "tier promotion logic [that] inspects receipt history
-at thresholds" — as a **read-only signal**, not as an auto-promotion
-mechanism.
+at thresholds" — as a **read-only signal**. This module never promotes; it only
+computes the signal. A SEPARATE consumer, `assignments._maybe_auto_promote`, DOES
+auto-promote T1→T2 when both this signal's thresholds AND the §6.2.1 identity gate
+are satisfied. §6.2's per-transition `manual`/`auto_with_override` toggle is not
+yet built, so "auto-on-both-gates" is the ratified Phase-1 default (audit
+2026-06-08).
 
 Per Principles & Scope §6.2 (revised 2026-05-24), T2 promotion requires
 both receipt-history thresholds AND an identity gate (§6.2.1 Maintainer
