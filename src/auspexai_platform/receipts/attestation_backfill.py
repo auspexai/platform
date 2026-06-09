@@ -42,9 +42,12 @@ class BackfillReport:
 
     def summary(self) -> str:
         verb = "anchored" if self.applied else "would anchor"
+        # Dry-run never simulates per-row, so "would anchor" reports the
+        # candidate count, not the (always-empty) anchored list.
+        count = len(self.anchored) if self.applied else self.candidates
         head = (
             f"rekor backfill ({'APPLIED' if self.applied else 'DRY-RUN'}): "
-            f"{self.candidates} un-anchored attestation(s); {verb} {len(self.anchored)}"
+            f"{self.candidates} un-anchored attestation(s); {verb} {count}"
         )
         if self.failed:
             head += f", {len(self.failed)} failed (left un-anchored)"

@@ -163,12 +163,14 @@ def attestation_backfill_rekor(
     from auspexai_platform.db.migrations import MigrationRunner
     from auspexai_platform.receipts.attestation_backfill import backfill_rekor_anchors
     from auspexai_platform.receipts.rekor import RekorClient
+    from auspexai_platform.receipts.signing import load_or_generate_signing_key
 
     config = _resolve_config(state_dir)
     db = Database(config.control_db_path)
     try:
         MigrationRunner(db).apply_all()  # idempotent; ensures the attestations table exists
-        client = RekorClient(rekor_url or config.rekor_url)
+        signing_key = load_or_generate_signing_key(config.receipt_signing_key_path)
+        client = RekorClient(rekor_url or config.rekor_url, signing_key=signing_key)
         report = backfill_rekor_anchors(db, rekor_client=client, apply=apply_changes)
     finally:
         db.close()
