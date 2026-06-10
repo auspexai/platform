@@ -35,8 +35,10 @@ from auspexai_platform.api import experiments as experiment_routes
 from auspexai_platform.api import health
 from auspexai_platform.api import model_requests as model_request_routes
 from auspexai_platform.api import receipts as receipt_routes
+from auspexai_platform.api import releases as release_routes
 from auspexai_platform.api import results as results_routes
 from auspexai_platform.api import scheduler as scheduler_routes
+from auspexai_platform.api import software_requests as software_request_routes
 from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.api import work_units as work_unit_routes
 from auspexai_platform.api import workers as worker_routes
@@ -57,8 +59,10 @@ from auspexai_platform.db.repositories import (
     ModelPrestageRepository,
     ModelRequestRepository,
     ReceiptIndexRepository,
+    ReleaseRepository,
     ResultTransferRepository,
     RetiredKeyRepository,
+    SoftwareRequestRepository,
     TenantRepository,
     WorkerRepository,
 )
@@ -115,6 +119,8 @@ def create_app(
     result_transfer_repository = ResultTransferRepository(db)
     model_request_repository = ModelRequestRepository(db)
     model_prestage_repository = ModelPrestageRepository(db)
+    software_request_repository = SoftwareRequestRepository(db)
+    release_repository = ReleaseRepository(db)
     from auspexai_platform.db.repositories.vouches import VouchRepository
 
     vouch_repository = VouchRepository(db)
@@ -261,6 +267,7 @@ def create_app(
             experiment_repository,
             per_job_factory,
             event_bus=event_bus,
+            release_repository=release_repository,
         ),
         prefix="/api/v0",
         tags=["workers"],
@@ -351,6 +358,27 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["model-requests"],
+    )
+    app.include_router(
+        software_request_routes.build_router(
+            credential_dep,
+            software_request_repository,
+            audit_repository,
+            event_bus=event_bus,
+        ),
+        prefix="/api/v0",
+        tags=["software-requests"],
+    )
+    app.include_router(
+        release_routes.build_router(
+            credential_dep,
+            release_repository,
+            software_request_repository,
+            audit_repository,
+            event_bus=event_bus,
+        ),
+        prefix="/api/v0",
+        tags=["releases"],
     )
     app.include_router(
         scheduler_routes.build_router(

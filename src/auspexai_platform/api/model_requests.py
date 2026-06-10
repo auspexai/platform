@@ -177,8 +177,15 @@ def build_router(
         status: str | None = None,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ModelRequestListResponse:
-        _require_maintainer(credential)
-        reqs = model_request_repository.list(status=status)
+        # Maintainers see the whole queue; a researcher gets a tenant-forced
+        # view of their own requests (the dashboard "my requests" surface).
+        if credential.is_maintainer():
+            reqs = model_request_repository.list(status=status)
+        elif credential.is_researcher() and credential.tenant_id:
+            reqs = model_request_repository.list(status=status, tenant_id=credential.tenant_id)
+        else:
+            _require_maintainer(credential)
+            raise AssertionError("unreachable")
         return ModelRequestListResponse(requests=[_to_response(r) for r in reqs])
 
     def _resolve(

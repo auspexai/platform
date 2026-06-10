@@ -141,6 +141,12 @@ class WorkerResponse(BaseModel):
     pubkey_hex: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     account_id: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     capabilities: Annotated[dict[str, Any] | None, ExposureTag.OPERATOR_ONLY] = None
+    # §9 #46: latest-release announcement, populated ONLY by the heartbeat
+    # handler (other worker routes leave it None → dropped by exclude_none).
+    # A single PUBLIC dict, not a nested model — the exposure filter does not
+    # recurse into nested Pydantic models, and release info is public anyway
+    # (it's a GitHub release).
+    latest_release: Annotated[dict[str, Any] | None, ExposureTag.PUBLIC] = None
 
 
 class CapacityWarning(BaseModel):
@@ -284,6 +290,7 @@ def build_router(
     per_job_factory: PerJobDatabaseFactory,
     *,
     event_bus: EventBus | None = None,
+    release_repository=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -516,7 +523,20 @@ def build_router(
                     }
                 },
             ) from e
-        return filter_for_credential(_worker_to_response(worker), credential)
+        response = _worker_to_response(worker)
+        # §9 #46: relay the latest announced release for the worker channel.
+        # The volunteer's election is the install decision — this is informational.
+        if release_repository is not None:
+            latest = release_repository.latest(channel="worker")
+            if latest is not None:
+                response.latest_release = {
+                    "version": latest.version,
+                    "channel": latest.channel,
+                    "headline": latest.headline,
+                    "release_url": latest.release_url,
+                    "published_at": latest.published_at.isoformat(),
+                }
+        return filter_for_credential(response, credential)
 
     # ---- GET /workers — maintainer list --------------------------------
 
