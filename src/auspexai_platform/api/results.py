@@ -518,6 +518,15 @@ def build_router(
                     "payload": None if r.payload_aged_off_at else r.payload,
                     "aged_off": r.payload_aged_off_at is not None,
                     "worker_signature": r.worker_signature,
+                    # EB-1: the members of the worker's canonical signing input
+                    # (signing/result.py convention) so the bundle verifies the
+                    # only non-coordinator signature in the chain. The pubkey is
+                    # a pseudonymous verification handle (ratified §3,
+                    # researcher_data_custody_and_analysis_design.md) — worker
+                    # IDENTITY stays exposure-gated on the list routes.
+                    "worker_pubkey_hex": r.worker_pubkey_hex,
+                    "exit_code": r.exit_code,
+                    "environment": r.environment,
                     "receipt_id": rid,
                     "completed_at": r.completed_at.isoformat(),
                 }
