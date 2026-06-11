@@ -118,6 +118,12 @@ class ResultSubmissionRequest(BaseModel):
     exit_code: int = Field(ge=-255, le=255)
     payload: dict[str, Any]
     worker_signature: str = Field(min_length=1)
+    # §9 #46 D6 finding: unit_ids are tenant-chosen and can collide across
+    # experiments — the bare (unit_id, worker_id) scan once matched a stale
+    # ABORTED experiment's assignment. Workers ≥ v0.2.2 send the exact
+    # assignment_id; older workers omit it (the scan then skips terminal
+    # experiments, which already fixes the observed incident).
+    assignment_id: str | None = Field(default=None, max_length=128)
 
 
 class RefuseRequest(BaseModel):
@@ -132,6 +138,8 @@ class RefuseRequest(BaseModel):
             "tenant_deny, tenant_allow_list_miss, manual."
         ),
     )
+    # Same disambiguator as ResultSubmissionRequest (workers ≥ v0.2.2).
+    assignment_id: str | None = Field(default=None, max_length=128)
     reason: str = Field(
         max_length=2048,
         description="Free-form human-readable detail (operator-visible).",
@@ -418,10 +426,14 @@ def build_router(
 
         # Find the assignment — scan all per-job DBs is expensive, but the
         # worker-side flow normally knows the experiment_id (it just got
-        # one from /assignments). For M6d we don't take experiment_id in
-        # the URL — we scan. M6d-polish or M8 may add a hint header.
+        # one from /assignments). Terminal experiments are skipped and the
+        # body's assignment_id (workers ≥ v0.2.2) disambiguates exactly.
         experiment_id, per_job_db, assignment = _find_assignment(
-            per_job_factory, unit_id, worker_id
+            per_job_factory,
+            unit_id,
+            worker_id,
+            experiment_repository=experiment_repository,
+            assignment_id=body.assignment_id,
         )
         if assignment is None:
             raise HTTPException(
@@ -640,7 +652,11 @@ def build_router(
         _require_self_worker(credential, worker_id)
 
         experiment_id, per_job_db, assignment = _find_assignment(
-            per_job_factory, unit_id, worker_id
+            per_job_factory,
+            unit_id,
+            worker_id,
+            experiment_repository=experiment_repository,
+            assignment_id=body.assignment_id,
         )
         if assignment is None:
             raise HTTPException(
@@ -755,24 +771,43 @@ def build_router(
 # ---- module-level helpers --------------------------------------------------
 
 
+_TERMINAL_EXPERIMENT_STATUSES = ("aborted", "archived")
+
+
 def _find_assignment(
     per_job_factory: PerJobDatabaseFactory,
     unit_id: str,
     worker_id: str,
+    *,
+    experiment_repository: ExperimentRepository | None = None,
+    assignment_id: str | None = None,
 ):
     """Scan cached per-job DBs for an assignment matching (unit_id, worker_id).
 
     Returns (experiment_id, per_job_db, assignment) or (None, None, None).
     Hot DBs are cached by definition — a worker submitting a result just
     received the assignment from a recent GET, so the DB is in cache.
-    Cold-load (post-restart) is rare; M8 may replace this with an indexed
-    lookup once the control DB tracks assignment→experiment_id.
+
+    §9 #46 D6 finding (2026-06-10): unit_ids are TENANT-CHOSEN and collide
+    across experiments — the bare scan once matched (and accepted a result
+    into) an ABORTED experiment's stale assignment. Two fixes here:
+    - experiments in a terminal status (aborted/archived) are skipped, so a
+      stale assignment can never receive a late result or refusal;
+    - an explicit `assignment_id` (sent by workers ≥ v0.2.2) must match
+      exactly, removing the ambiguity entirely.
     """
     for experiment_id, db in per_job_factory.iter_cached_dbs():
+        if experiment_repository is not None:
+            exp = experiment_repository.get_by_id(experiment_id)
+            if exp is not None and exp.status in _TERMINAL_EXPERIMENT_STATUSES:
+                continue
         repo = AssignmentRepository(db)
         assignment = repo.get_for_unit_and_worker(unit_id, worker_id)
-        if assignment is not None:
-            return experiment_id, db, assignment
+        if assignment is None:
+            continue
+        if assignment_id is not None and assignment.assignment_id != assignment_id:
+            continue
+        return experiment_id, db, assignment
     return None, None, None
 
 
