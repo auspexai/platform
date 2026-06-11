@@ -28,7 +28,11 @@ from auspexai_platform.db.repositories import (
     ReleaseRepository,
     SoftwareRequestRepository,
 )
-from auspexai_platform.db.repositories.releases import Release, ReleaseExistsError
+from auspexai_platform.db.repositories.releases import (
+    Release,
+    ReleaseExistsError,
+    ReleaseNotDraftError,
+)
 from auspexai_platform.events import EventBus
 
 
@@ -49,7 +53,19 @@ class ReleaseResponse(BaseModel):
     release_url: str | None = None
     published_at: datetime
     announced_by: str
+    draft: bool = False
+    source: str | None = None
     fulfilled_request_ids: list[str] = Field(default_factory=list)
+
+
+class ReleaseAnnounce(BaseModel):
+    """Publish a webhook-created draft: maintainer-edited volunteer-facing
+    wording overrides the GitHub text when provided."""
+
+    headline: str | None = Field(default=None, min_length=1, max_length=500)
+    notes: str | None = Field(default=None, max_length=8000)
+    release_url: str | None = Field(default=None, max_length=512)
+    fulfils_request_ids: list[str] = Field(default_factory=list)
 
 
 class ReleaseListResponse(BaseModel):
@@ -66,6 +82,8 @@ def _to_response(r: Release, *, fulfilled: list[str] | None = None) -> ReleaseRe
         published_at=r.published_at,
         announced_by=r.announced_by,
         fulfilled_request_ids=fulfilled or [],
+        draft=r.draft,
+        source=r.source,
     )
 
 
@@ -162,6 +180,7 @@ def build_router(
     )
     async def list_releases(
         channel: str | None = None,
+        include_drafts: bool = False,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ReleaseListResponse:
         if not (credential.is_researcher() or credential.is_maintainer()):
@@ -169,8 +188,104 @@ def build_router(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="researcher or maintainer credential required",
             )
+        # Drafts are pre-announcement maintainer workflow state — researchers
+        # only ever see what the fleet sees.
+        if include_drafts and not credential.is_maintainer():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="maintainer required for include_drafts",
+            )
         return ReleaseListResponse(
-            releases=[_to_response(r) for r in release_repository.list(channel=channel)]
+            releases=[
+                _to_response(r)
+                for r in release_repository.list(channel=channel, include_drafts=include_drafts)
+            ]
         )
+
+    @router.post(
+        "/releases/{version}/actions/announce",
+        response_model=ReleaseResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def announce_release(
+        version: str,
+        body: ReleaseAnnounce,
+        channel: str = "worker",
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ReleaseResponse:
+        """Publish a draft (webhook-created) announcement — THE moment it
+        reaches the fleet. Mirrors record_release's fulfils validation."""
+        if not credential.is_maintainer():
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="maintainer required")
+        existing = release_repository.get(version=version, channel=channel)
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"release {channel}/{version} not found",
+            )
+        for request_id in body.fulfils_request_ids:
+            req = software_request_repository.get_by_id(request_id)
+            if req is None or req.status != "approved":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": {
+                            "code": "request_not_approved",
+                            "message": (
+                                f"software request {request_id!r} "
+                                + ("not found" if req is None else f"is {req.status!r}")
+                                + " — only approved requests can be fulfilled by a release"
+                            ),
+                        }
+                    },
+                )
+        try:
+            release = release_repository.publish_draft(
+                version=version,
+                channel=channel,
+                announced_by=credential.maintainer_login or "maintainer",
+                headline=body.headline,
+                notes=body.notes,
+                release_url=body.release_url,
+            )
+        except ReleaseNotDraftError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "not_a_draft",
+                        "message": f"release {channel}/{version} is already published",
+                    }
+                },
+            ) from e
+        for request_id in body.fulfils_request_ids:
+            software_request_repository.mark_released(request_id, release_version=version)
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=credential.maintainer_login,
+            action="release.publish",
+            resource_type="release",
+            resource_id=f"{channel}/{version}",
+            payload={
+                "version": version,
+                "channel": channel,
+                "headline": release.headline,
+                "fulfils_request_ids": body.fulfils_request_ids,
+                "from_draft": True,
+                "source": existing.source,
+            },
+        )
+        if event_bus is not None:
+            event_bus.publish(
+                "release.published",
+                experiment_id=None,
+                data={
+                    "version": version,
+                    "channel": channel,
+                    "headline": release.headline,
+                    "fulfils_request_ids": body.fulfils_request_ids,
+                },
+            )
+        return _to_response(release, fulfilled=body.fulfils_request_ids)
 
     return router

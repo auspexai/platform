@@ -17,6 +17,8 @@ Composition order (one section per M-milestone):
 
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI, Request
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -32,6 +34,7 @@ from auspexai_platform.api import audit as audit_routes
 from auspexai_platform.api import auth as auth_routes
 from auspexai_platform.api import events as event_routes
 from auspexai_platform.api import experiments as experiment_routes
+from auspexai_platform.api import github_webhook as github_webhook_routes
 from auspexai_platform.api import health
 from auspexai_platform.api import model_requests as model_request_routes
 from auspexai_platform.api import receipts as receipt_routes
@@ -379,6 +382,18 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["releases"],
+    )
+    # GitHub release webhook (§9 #46 follow-on): HMAC-authenticated by the
+    # shared secret, NOT a coordinator credential — creates DRAFTS only.
+    app.include_router(
+        github_webhook_routes.build_router(
+            release_repository,
+            audit_repository,
+            webhook_secret=os.environ.get("AUSPEXAI_GITHUB_WEBHOOK_SECRET"),
+            event_bus=event_bus,
+        ),
+        prefix="/api/v0",
+        tags=["webhooks"],
     )
     app.include_router(
         scheduler_routes.build_router(
