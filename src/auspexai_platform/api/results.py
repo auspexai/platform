@@ -182,6 +182,30 @@ def _result_set_root(consensus_results: list[Result]) -> str:
     return hashlib.sha256(json.dumps(items, separators=(",", ":")).encode()).hexdigest()
 
 
+def _drain_consensus(per_job_db) -> list[Result]:
+    """EVERY consensus row, paged to exhaustion. The export bundle must never
+    be built from one capped page: the proof-of-transfer signs the result-set
+    root, and a root signed over a truncated set is a valid-looking custody
+    proof of an incomplete dataset (D1, researcher_data_custody_and_analysis
+    design §2). Reuses the list route's (completed_at, result_id) row-value
+    cursor convention."""
+    repo = ResultRepository(per_job_db)
+    rows: list[Result] = []
+    after_completed_at: str | None = None
+    after_result_id: str | None = None
+    while True:
+        page = repo.list_consensus(
+            limit=MAX_PAGE_SIZE,
+            after_completed_at=after_completed_at,
+            after_result_id=after_result_id,
+        )
+        rows.extend(page)
+        if len(page) < MAX_PAGE_SIZE:
+            return rows
+        after_completed_at = page[-1].completed_at.isoformat()
+        after_result_id = page[-1].result_id
+
+
 def build_router(
     *,
     credential_dep,
@@ -470,11 +494,7 @@ def build_router(
         age-off). The bundle is self-contained and offline-verifiable."""
         experiment = _load_experiment_authz(experiment_id, credential)
         per_job_db = per_job_factory.get(experiment_id)
-        consensus = (
-            ResultRepository(per_job_db).list_consensus(limit=MAX_PAGE_SIZE)
-            if per_job_db is not None
-            else []
-        )
+        consensus = _drain_consensus(per_job_db) if per_job_db is not None else []
         rmap = _receipt_map(experiment_id)
         receipt_repo = ReceiptRepository(per_job_db) if per_job_db is not None else None
 

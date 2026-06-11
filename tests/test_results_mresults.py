@@ -217,6 +217,47 @@ class TestExportBundle:
         # Collection stamped → arms collection-anchored age-off.
         assert experiment_repository.get_by_id(experiment.experiment_id).results_collected_at
 
+    def test_export_drains_past_page_cap_and_signs_full_root(
+        self, client, approved_experiment, per_job_factory, monkeypatch
+    ):
+        """D1 regression (researcher_data_custody_and_analysis_design.md §2):
+        export must page consensus rows to exhaustion — a custody root signed
+        over one capped page is a valid-looking proof of an incomplete
+        dataset. Cap forced to 2 so 5 units require three pages."""
+        import hashlib
+        import json
+
+        from auspexai_platform.api import results as results_api
+
+        privkey, binding, experiment, _h = approved_experiment
+        for i in range(5):
+            _seed_unit(
+                per_job_factory,
+                experiment.experiment_id,
+                unit_id=f"u{i}",
+                payloads=[{"v": i}, {"v": i}],
+            )
+        monkeypatch.setattr(results_api, "MAX_PAGE_SIZE", 2)
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/results/export",
+        )
+        assert resp.status_code == 200, resp.text
+        bundle = resp.json()
+        assert {r["unit_id"] for r in bundle["consensus_results"]} == {
+            f"u{i}" for i in range(5)
+        }
+        # The signed custody root must cover the FULL set, not the first page.
+        items = sorted(
+            (r["unit_id"], r.get("semantic_hash") or "") for r in bundle["consensus_results"]
+        )
+        expected_root = hashlib.sha256(
+            json.dumps(items, separators=(",", ":")).encode()
+        ).hexdigest()
+        assert bundle["transfer"]["result_set_root"] == expected_root
+
 
 # ---- age-off sweep ---------------------------------------------------------
 
