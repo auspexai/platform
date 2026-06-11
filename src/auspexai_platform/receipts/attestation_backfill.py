@@ -19,6 +19,7 @@ attestation commits to (plan L2).
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 
@@ -90,6 +91,15 @@ def backfill_rekor_anchors(
             # NoOp / degraded — don't overwrite with a placeholder.
             report.failed.append(rec.attestation_id)
             continue
-        repo.set_rekor(rec.attestation_id, log_index=entry.log_index, entry_uuid=entry.entry_uuid)
+        repo.set_rekor(
+            rec.attestation_id,
+            log_index=entry.log_index,
+            entry_uuid=entry.entry_uuid,
+            # EB-1: persist the inclusion proof when the anchor response carried
+            # one — the evidence bundle ships it for offline verification.
+            inclusion_proof_json=(
+                json.dumps(entry.inclusion_proof) if entry.inclusion_proof else None
+            ),
+        )
         report.anchored.append(rec.attestation_id)
     return report

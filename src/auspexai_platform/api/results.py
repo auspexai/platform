@@ -45,10 +45,11 @@ from auspexai_platform.db.repositories.attestations import (
 )
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.receipts.attestation import (
-    RESULT_SET_ALGORITHM,
+    RESULT_SET_ALGORITHM_V1,
     ResultSetEntry,
     build_result_set_attestation,
     collect_result_set_entries,
+    merkle_root,
 )
 from auspexai_platform.receipts.repository import ReceiptRepository
 from auspexai_platform.receipts.signing import SigningKey
@@ -85,6 +86,11 @@ class AttestationUnit(BaseModel):
     unit_id: str
     consensus_result_hash: str
     receipt_id: str
+    # EB-1 (§9 #47, result-set/v1): the input binding (leaf member) and the
+    # coordinator-asserted environment snapshot (predicate metadata). None on
+    # legacy v0 attestations.
+    unit_payload_sha256: str | None = None
+    environment: dict[str, Any] | None = None
 
 
 class ResultSetAttestationResponse(BaseModel):
@@ -106,6 +112,9 @@ class ResultSetAttestationResponse(BaseModel):
     signing_key_pubkey_hex: Annotated[str | None, ExposureTag.PUBLIC] = None
     rekor_log_index: Annotated[int | None, ExposureTag.PUBLIC] = None
     rekor_entry_uuid: Annotated[str | None, ExposureTag.PUBLIC] = None
+    # EB-1: the inclusion proof captured at anchor time (offline verification);
+    # None when anchored pre-EB-1 or not yet anchored.
+    rekor_inclusion_proof: Annotated[dict[str, Any] | None, ExposureTag.PUBLIC] = None
     # M9 leg 2: True when this is a checkpoint over a not-yet-COMPLETED experiment
     # (consensus-so-far). Always present so the tenant can branch on it; the same
     # flag lives in the COSE-signed predicate.
@@ -236,6 +245,15 @@ def build_router(
                 out[entry.result_id] = entry.receipt_id
         return out
 
+    def _unit_from_entry(e: ResultSetEntry) -> AttestationUnit:
+        return AttestationUnit(
+            unit_id=e.unit_id,
+            consensus_result_hash=e.consensus_result_hash,
+            receipt_id=e.receipt_id,
+            unit_payload_sha256=e.unit_payload_sha256,
+            environment=e.environment,
+        )
+
     def _collect_attestation_units(experiment_id: str) -> list[AttestationUnit]:
         """Best-effort re-derive the per-unit list for the response convenience
         field when serving a PERSISTED attestation. The canonical artifact is the
@@ -248,14 +266,7 @@ def build_router(
         entries = collect_result_set_entries(
             per_job_db, receipt_id_by_result=_receipt_map(experiment_id)
         )
-        return [
-            AttestationUnit(
-                unit_id=e.unit_id,
-                consensus_result_hash=e.consensus_result_hash,
-                receipt_id=e.receipt_id,
-            )
-            for e in entries
-        ]
+        return [_unit_from_entry(e) for e in entries]
 
     def _persisted_to_attestation_response(
         record: AttestationRecord, units: list[AttestationUnit]
@@ -275,6 +286,11 @@ def build_router(
             signing_key_pubkey_hex=record.signing_key_pubkey_hex,
             rekor_log_index=record.rekor_log_index,
             rekor_entry_uuid=record.rekor_entry_uuid,
+            rekor_inclusion_proof=(
+                json.loads(record.rekor_inclusion_proof_json)
+                if record.rekor_inclusion_proof_json
+                else None
+            ),
             partial=record.partial,
         )
 
@@ -434,15 +450,7 @@ def build_router(
                 persisted = attestation_repository.get_final(experiment_id)
                 if persisted is not None:
                     return _persisted_to_attestation_response(
-                        persisted,
-                        [
-                            AttestationUnit(
-                                unit_id=e.unit_id,
-                                consensus_result_hash=e.consensus_result_hash,
-                                receipt_id=e.receipt_id,
-                            )
-                            for e in attestation.entries
-                        ],
+                        persisted, [_unit_from_entry(e) for e in attestation.entries]
                     )
         audit_repository.append(
             actor_class=credential.kind,
@@ -454,7 +462,7 @@ def build_router(
                 "attestation_id": attestation.attestation_id,
                 "merkle_root": attestation.merkle_root,
                 "unit_count": attestation.unit_count,
-                "algorithm": RESULT_SET_ALGORITHM,
+                "algorithm": attestation.algorithm,
                 "partial": partial,
             },
         )
@@ -465,14 +473,7 @@ def build_router(
             merkle_root=attestation.merkle_root,
             algorithm=attestation.algorithm,
             unit_count=attestation.unit_count,
-            units=[
-                AttestationUnit(
-                    unit_id=e.unit_id,
-                    consensus_result_hash=e.consensus_result_hash,
-                    receipt_id=e.receipt_id,
-                )
-                for e in attestation.entries
-            ],
+            units=[_unit_from_entry(e) for e in attestation.entries],
             cose_b64=b64encode(attestation.cose_signed_blob).decode(),
             signing_key_pubkey_hex=attestation.signing_key_pubkey_hex,
             rekor_log_index=attestation.rekor_log_index,
@@ -488,10 +489,16 @@ def build_router(
         experiment_id: str,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> dict[str, Any]:
-        """The offload bundle: all consensus payloads + their COSE receipts + the
-        signed manifest + a **signed proof-of-transfer**. Records a permanent
-        custody row and stamps `results_collected_at` (arming collection-anchored
-        age-off). The bundle is self-contained and offline-verifiable."""
+        """The evidence bundle (EB-1, §9 #47): all consensus payloads + their
+        COSE receipts + the signed manifest + the work-unit INPUTS + the
+        COSE result-set attestation with its Rekor anchor/inclusion proof + a
+        **signed proof-of-transfer**. For a COMPLETED experiment the custody
+        record signs the ATTESTATION's merkle root (one root binds data ↔
+        custody ↔ Rekor) after a verify-on-export self-check; pre-completion
+        exports keep the flat custody root (`transfer.root_kind`
+        disambiguates). Records a permanent custody row and stamps
+        `results_collected_at` (arming collection-anchored age-off). The
+        bundle is self-contained and offline-verifiable."""
         experiment = _load_experiment_authz(experiment_id, credential)
         per_job_db = per_job_factory.get(experiment_id)
         consensus = _drain_consensus(per_job_db) if per_job_db is not None else []
@@ -524,9 +531,146 @@ def build_router(
                     seen_receipts.add(rid)
 
         manifest = manifest_repository.get(experiment.manifest_hash)
+
+        # EB-1: the INPUT leg — every work unit's payload (the parameters each
+        # result was produced from), so a verifier recomputes the v1 leaf input
+        # hashes from bytes in hand.
+        work_units_out: list[dict[str, Any]] = (
+            [
+                {"unit_id": row["unit_id"], "payload": json.loads(row["payload_json"])}
+                for row in per_job_db.execute(
+                    "SELECT unit_id, payload_json FROM work_units ORDER BY unit_id"
+                )
+            ]
+            if per_job_db is not None
+            else []
+        )
+
+        def _get_or_persist_final_attestation() -> AttestationRecord | None:
+            """The canonical attestation for a COMPLETED experiment — served
+            if persisted, else built v1 + persisted now (same lazy
+            canonicalize-on-read semantics as the attestation route)."""
+            if (
+                experiment.status is not ExperimentStatus.COMPLETED
+                or attestation_repository is None
+            ):
+                return None
+            persisted = attestation_repository.get_final(experiment_id)
+            if persisted is not None or per_job_db is None:
+                return persisted
+            built = build_result_set_attestation(
+                attestation_id=_generate_attestation_id(),
+                tenant_experiment_label=experiment.tenant_experiment_label,
+                tenant_id=experiment.tenant_id,
+                entries=collect_result_set_entries(
+                    per_job_db, receipt_id_by_result=_receipt_map(experiment_id)
+                ),
+                signing_key=signing_key,
+                rekor_client=None,
+                partial=False,
+            )
+            try:
+                return attestation_repository.insert(
+                    attestation_id=built.attestation_id,
+                    experiment_id=experiment_id,
+                    tenant_id=built.tenant_id,
+                    tenant_experiment_label=built.experiment_id,
+                    merkle_root=built.merkle_root,
+                    algorithm=built.algorithm,
+                    unit_count=built.unit_count,
+                    cose_signed_blob=built.cose_signed_blob,
+                    signing_key_pubkey_hex=built.signing_key_pubkey_hex,
+                    rekor_log_index=built.rekor_log_index,
+                    rekor_entry_uuid=built.rekor_entry_uuid,
+                    partial=False,
+                )
+            except DuplicateAttestationError:
+                return attestation_repository.get_final(experiment_id)
+
+        attestation_record = _get_or_persist_final_attestation()
+        attestation_out: dict[str, Any] | None = None
+        root_kind = "flat-v0"
+        root = _result_set_root(consensus)
+        if attestation_record is not None and per_job_db is not None:
+            # Verify-on-export: recompute the attested root from the rows being
+            # delivered. A mismatch means the per-job DB no longer reproduces
+            # the canonical Rekor-anchored attestation — REFUSE to sign custody
+            # (this is the at-rest tamper alarm, audited).
+            entries = collect_result_set_entries(
+                per_job_db, receipt_id_by_result=_receipt_map(experiment_id)
+            )
+            version = 1 if attestation_record.algorithm == RESULT_SET_ALGORITHM_V1 else 0
+            recomputed = merkle_root(entries, schema_version=version)
+            if recomputed != attestation_record.merkle_root:
+                audit_repository.append(
+                    actor_class=credential.kind,
+                    actor_identifier=credential.pubkey_hex,
+                    actor_tenant_id=credential.tenant_id,
+                    action="export.attestation_root_mismatch",
+                    resource_type="experiment",
+                    resource_id=experiment_id,
+                    payload={
+                        "attestation_id": attestation_record.attestation_id,
+                        "attested_root": attestation_record.merkle_root,
+                        "recomputed_root": recomputed,
+                    },
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": {
+                            "code": "attestation_root_mismatch",
+                            "message": (
+                                "the stored result set no longer reproduces the "
+                                "canonical attestation's merkle root — refusing to "
+                                "sign custody over a set that fails verification"
+                            ),
+                            "details": {
+                                "attestation_id": attestation_record.attestation_id
+                            },
+                        }
+                    },
+                )
+            attestation_out = {
+                "attestation_id": attestation_record.attestation_id,
+                "merkle_root": attestation_record.merkle_root,
+                "algorithm": attestation_record.algorithm,
+                "cose_b64": b64encode(attestation_record.cose_signed_blob).decode(),
+                "signing_key_pubkey_hex": attestation_record.signing_key_pubkey_hex,
+                "rekor_log_index": attestation_record.rekor_log_index,
+                "rekor_entry_uuid": attestation_record.rekor_entry_uuid,
+                "rekor_inclusion_proof": (
+                    json.loads(attestation_record.rekor_inclusion_proof_json)
+                    if attestation_record.rekor_inclusion_proof_json
+                    else None
+                ),
+            }
+            delivered = {(r.unit_id, r.semantic_hash or "") for r in consensus}
+            attested = {(e.unit_id, e.consensus_result_hash) for e in entries}
+            if delivered == attested:
+                # One root binds data ↔ custody ↔ Rekor.
+                root = attestation_record.merkle_root
+                root_kind = attestation_record.algorithm
+            else:
+                # Delivered ⊃/⊅ attested (e.g. a receipt-less consensus row) —
+                # custody must describe what is DELIVERED, so keep the flat
+                # root over the delivered set; audited, not fatal.
+                audit_repository.append(
+                    actor_class=credential.kind,
+                    actor_identifier=credential.pubkey_hex,
+                    actor_tenant_id=credential.tenant_id,
+                    action="export.attestation_set_divergence",
+                    resource_type="experiment",
+                    resource_id=experiment_id,
+                    payload={
+                        "attestation_id": attestation_record.attestation_id,
+                        "delivered_count": len(delivered),
+                        "attested_count": len(attested),
+                    },
+                )
+
         collected_at = datetime.now(UTC)
         collected_by = credential.pubkey_hex or f"<{credential.kind.value}>"
-        root = _result_set_root(consensus)
         record_bytes = (
             f"{root}|{collected_by}|{collected_at.isoformat()}|{experiment.manifest_hash}".encode()
         )
@@ -553,14 +697,23 @@ def build_router(
             payload={"transfer_id": transfer.transfer_id, "result_set_root": root},
         )
         return {
+            "schema": "auspexai-evidence-bundle/v1",
             "experiment_id": experiment_id,
             "manifest_hash": experiment.manifest_hash,
             "manifest": manifest.manifest_json if manifest is not None else None,
+            "work_units": work_units_out,
             "consensus_results": results_out,
             "receipts": receipts_out,
+            "attestation": attestation_out,
             "transfer": {
                 "transfer_id": transfer.transfer_id,
                 "result_set_root": root,
+                "root_kind": root_kind,
+                "attestation_id": (
+                    attestation_record.attestation_id
+                    if attestation_record is not None
+                    else None
+                ),
                 "collected_at": collected_at.isoformat(),
                 "collected_by_pubkey": collected_by,
                 "manifest_hash": experiment.manifest_hash,

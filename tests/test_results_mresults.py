@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 from fastapi.testclient import TestClient
 
 from auspexai_platform.auth.signature import sign_request
+from auspexai_platform.db.models import ExperimentStatus
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import ResultRepository
 from auspexai_platform.maintenance import age_off_sweep
@@ -214,8 +215,126 @@ class TestExportBundle:
         pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(t["coordinator_pubkey_hex"]))
         pub.verify(bytes.fromhex(t["coordinator_signature"]), record)  # raises if bad
         assert t["collected_by_pubkey"] == binding.pubkey_hex
+        # EB-1: a pre-completion export has no canonical attestation — the
+        # custody root stays the flat construction, and the bundle says so.
+        assert t["root_kind"] == "flat-v0"
+        assert bundle["attestation"] is None
+        assert bundle["schema"] == "auspexai-evidence-bundle/v1"
+        # The INPUT leg is always present (seeded work-unit payloads are {}).
+        assert {u["unit_id"] for u in bundle["work_units"]} == {"u1"}
         # Collection stamped → arms collection-anchored age-off.
         assert experiment_repository.get_by_id(experiment.experiment_id).results_collected_at
+
+    def _seed_receipted_unit(
+        self, per_job_factory, receipt_index_repository, experiment_id, *,
+        unit_id, payload, worker_id,
+    ):
+        _repo, results = _seed_unit(
+            per_job_factory, experiment_id, unit_id=unit_id, payloads=[payload]
+        )
+        receipt_index_repository.record(
+            receipt_id=f"rcpt-{unit_id}",
+            experiment_id=experiment_id,
+            worker_id=worker_id,
+            worker_pubkey="ab" * 32,
+            result_id=results[0].result_id,
+        )
+
+    def test_export_completed_unifies_root_with_attestation(
+        self,
+        client,
+        approved_experiment,
+        per_job_factory,
+        receipt_index_repository,
+        experiment_repository,
+        enrolled_worker,
+    ):
+        """EB-1 (§9 #47): for a COMPLETED experiment the proof-of-transfer
+        signs the canonical attestation's merkle root — one root binds data ↔
+        custody ↔ Rekor — and the bundle carries the attestation artifact."""
+        privkey, binding, experiment, _h = approved_experiment
+        _, worker = enrolled_worker
+        for i in range(2):
+            self._seed_receipted_unit(
+                per_job_factory,
+                receipt_index_repository,
+                experiment.experiment_id,
+                unit_id=f"u{i}",
+                payload={"v": i},
+                worker_id=worker.worker_id,
+            )
+        experiment_repository.update_status(
+            experiment.experiment_id, ExperimentStatus.COMPLETED
+        )
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/results/export",
+        )
+        assert resp.status_code == 200, resp.text
+        bundle = resp.json()
+        att = bundle["attestation"]
+        assert att is not None
+        assert att["algorithm"] == "sha256-merkle-v1"
+        assert att["cose_b64"]
+        t = bundle["transfer"]
+        assert t["root_kind"] == "sha256-merkle-v1"
+        assert t["result_set_root"] == att["merkle_root"]
+        assert t["attestation_id"] == att["attestation_id"]
+        # The custody signature verifies over the UNIFIED root.
+        record = (
+            f"{t['result_set_root']}|{t['collected_by_pubkey']}|"
+            f"{t['collected_at']}|{t['manifest_hash']}"
+        ).encode()
+        pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(t["coordinator_pubkey_hex"]))
+        pub.verify(bytes.fromhex(t["coordinator_signature"]), record)
+        assert {u["unit_id"] for u in bundle["work_units"]} == {"u0", "u1"}
+
+    def test_export_refuses_when_results_no_longer_match_attestation(
+        self,
+        client,
+        approved_experiment,
+        per_job_factory,
+        receipt_index_repository,
+        experiment_repository,
+        enrolled_worker,
+    ):
+        """Verify-on-export (the at-rest tamper alarm): if the stored result
+        set no longer reproduces the canonical attestation's root, the export
+        REFUSES to sign custody — 409, audited."""
+        privkey, binding, experiment, _h = approved_experiment
+        _, worker = enrolled_worker
+        self._seed_receipted_unit(
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u1",
+            payload={"v": 1},
+            worker_id=worker.worker_id,
+        )
+        experiment_repository.update_status(
+            experiment.experiment_id, ExperimentStatus.COMPLETED
+        )
+        # First export persists the canonical attestation.
+        ok = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/results/export",
+        )
+        assert ok.status_code == 200, ok.text
+        # Tamper the at-rest consensus hash, then export again.
+        db = per_job_factory.get(experiment.experiment_id)
+        db.execute("UPDATE results SET semantic_hash = ?", ("ff" * 32,))
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/results/export",
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["error"]["code"] == "attestation_root_mismatch"
 
     def test_export_drains_past_page_cap_and_signs_full_root(
         self, client, approved_experiment, per_job_factory, monkeypatch

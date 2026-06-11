@@ -51,6 +51,11 @@ class AttestationRecord:
     partial: bool
     doi: str | None
     issued_at: datetime
+    # EB-1 (§9 #47, migration 0027): the Rekor inclusion proof captured at
+    # anchor time (create-entry response verification.inclusionProof JSON) so
+    # the evidence bundle verifies offline forever. None = anchored pre-EB-1
+    # or not yet anchored — the SDK falls back to the online check.
+    rekor_inclusion_proof_json: str | None = None
 
 
 class AttestationRepository:
@@ -74,6 +79,7 @@ class AttestationRepository:
         rekor_log_index: int = 0,
         rekor_entry_uuid: str = "lab-mode-no-rekor",
         partial: bool = False,
+        rekor_inclusion_proof_json: str | None = None,
     ) -> AttestationRecord:
         """Persist the canonical (final) attestation for an experiment. Raises
         DuplicateAttestationError if a final attestation already exists (the
@@ -87,8 +93,8 @@ class AttestationRepository:
                   (attestation_id, experiment_id, tenant_id, tenant_experiment_label,
                    merkle_root, algorithm, unit_count, cose_signed_blob,
                    signing_key_pubkey_hex, rekor_log_index, rekor_entry_uuid,
-                   partial, issued_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   partial, issued_at, rekor_inclusion_proof_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     attestation_id,
@@ -104,6 +110,7 @@ class AttestationRepository:
                     rekor_entry_uuid,
                     int(partial),
                     issued_at,
+                    rekor_inclusion_proof_json,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -112,13 +119,23 @@ class AttestationRepository:
         assert got is not None
         return got
 
-    def set_rekor(self, attestation_id: str, *, log_index: int, entry_uuid: str) -> None:
+    def set_rekor(
+        self,
+        attestation_id: str,
+        *,
+        log_index: int,
+        entry_uuid: str,
+        inclusion_proof_json: str | None = None,
+    ) -> None:
         """A2 hook — stamp the Rekor anchor onto a persisted attestation (the
-        emit path once it has the entry, or the `backfill-rekor` sweep)."""
+        emit path once it has the entry, or the `backfill-rekor` sweep). EB-1:
+        also persists the inclusion proof when the anchor response carried one,
+        so the evidence bundle can verify inclusion offline."""
         self.db.execute(
-            "UPDATE attestations SET rekor_log_index = ?, rekor_entry_uuid = ? "
+            "UPDATE attestations SET rekor_log_index = ?, rekor_entry_uuid = ?, "
+            "rekor_inclusion_proof_json = COALESCE(?, rekor_inclusion_proof_json) "
             "WHERE attestation_id = ?",
-            (log_index, entry_uuid, attestation_id),
+            (log_index, entry_uuid, inclusion_proof_json, attestation_id),
         )
 
     def set_doi(self, attestation_id: str, doi: str) -> None:
@@ -175,4 +192,9 @@ class AttestationRepository:
             partial=bool(row["partial"]),
             doi=row["doi"],
             issued_at=datetime.fromisoformat(row["issued_at"]),
+            rekor_inclusion_proof_json=(
+                row["rekor_inclusion_proof_json"]
+                if "rekor_inclusion_proof_json" in row.keys()
+                else None
+            ),
         )

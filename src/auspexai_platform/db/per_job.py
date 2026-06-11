@@ -89,6 +89,10 @@ CREATE TABLE IF NOT EXISTS results (
     delivered_at         TEXT,
     payload_expires_at   TEXT,
     payload_aged_off_at  TEXT,
+    -- EB-1 (§9 #47): coordinator-asserted serving-environment snapshot taken
+    -- at result submission (worker version / ollama_version / served model ids
+    -- from the worker's last heartbeat). NULL = pre-EB-1 row or nothing known.
+    environment_json     TEXT,
     FOREIGN KEY (unit_id) REFERENCES work_units(unit_id)
 );
 
@@ -140,6 +144,7 @@ class PerJobDatabaseFactory:
             db.executescript(PER_JOB_SCHEMA_SQL)
             _ensure_assignments_refused_columns(db)
             _ensure_results_retention_columns(db)
+            _ensure_results_environment_column(db)
             _ensure_work_units_pin_column(db)
             self._cache[experiment_id] = db
             return db
@@ -163,6 +168,7 @@ class PerJobDatabaseFactory:
             db = Database(db_path)
             _ensure_assignments_refused_columns(db)
             _ensure_results_retention_columns(db)
+            _ensure_results_environment_column(db)
             _ensure_work_units_pin_column(db)
             self._cache[experiment_id] = db
             return db
@@ -209,6 +215,14 @@ def _ensure_assignments_refused_columns(db: Database) -> None:
             ("attempt_count", "INTEGER NOT NULL DEFAULT 1"),
         ),
     )
+
+
+def _ensure_results_environment_column(db: Database) -> None:
+    """Idempotently add `environment_json` (EB-1 §9 #47) to the per-job
+    `results` table — the coordinator-asserted serving-environment snapshot
+    captured at result submission. Pre-existing rows read NULL (= unknown,
+    pre-EB-1), which the attestation builder passes through as absent."""
+    _add_columns_idempotent(db, "results", (("environment_json", "TEXT"),))
 
 
 def _ensure_work_units_pin_column(db: Database) -> None:

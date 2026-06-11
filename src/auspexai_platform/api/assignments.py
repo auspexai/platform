@@ -464,6 +464,22 @@ def build_router(
         assignments_repo = AssignmentRepository(per_job_db)
         work_units_repo = WorkUnitRepository(per_job_db)
 
+        # EB-1 (§9 #47): snapshot the coordinator-asserted serving environment
+        # at submission — the reproducibility triple's environment leg. Sourced
+        # from the worker's last heartbeat-declared capabilities (what the
+        # coordinator authoritatively knows); the richer worker-REPORTED
+        # per-result environment (gguf digest) rides a future worker release.
+        environment: dict[str, Any] | None = None
+        worker_row = worker_repository.get_by_id(worker_id)
+        if worker_row is not None:
+            caps = worker_row.capabilities or {}
+            snapshot = {
+                "worker_version": caps.get("version"),
+                "ollama_version": caps.get("ollama_version"),
+                "served_models": caps.get("served_models"),
+            }
+            environment = {k: v for k, v in snapshot.items() if v is not None} or None
+
         result = results_repo.insert(
             result_id=_generate_result_id(),
             unit_id=unit_id,
@@ -473,6 +489,7 @@ def build_router(
             payload=body.payload,
             worker_signature=body.worker_signature,
             completed_at=body.completed_at,
+            environment=environment,
         )
         assignments_repo.attach_result(assignment.assignment_id, result.result_id)
         updated_unit, just_completed = work_units_repo.increment_completions(unit_id)

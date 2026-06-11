@@ -305,6 +305,10 @@ class Result(BaseModel):
     delivered_at: datetime | None = None
     payload_expires_at: datetime | None = None
     payload_aged_off_at: datetime | None = None
+    # EB-1 (§9 #47): coordinator-asserted serving-environment snapshot captured
+    # at submission (worker version / ollama_version / served model ids). The
+    # reproducibility triple's environment leg; None = pre-EB-1 row.
+    environment: dict[str, Any] | None = None
 
 
 class WorkUnit(BaseModel):

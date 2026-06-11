@@ -42,10 +42,17 @@ REKOR_PLACEHOLDER_UUID = "lab-mode-no-rekor"
 
 @dataclass(frozen=True)
 class RekorEntry:
-    """Metadata returned by Rekor after a successful log entry."""
+    """Metadata returned by Rekor after a successful log entry.
+
+    `inclusion_proof` (EB-1 §9 #47) is the create-entry response's
+    `verification.inclusionProof` (checkpoint + hashes + logIndex + rootHash +
+    treeSize), captured so it can be persisted and shipped in the evidence
+    bundle for offline verification. None when the response omitted it (older
+    Rekor) or for NoOp entries."""
 
     log_index: int
     entry_uuid: str
+    inclusion_proof: dict | None = None
 
 
 class RekorClient:
@@ -111,8 +118,11 @@ class RekorClient:
         entry_uuid = next(iter(body.keys()))
         entry_data = body[entry_uuid]
         log_index = entry_data.get("logIndex", 0)
+        # EB-1: keep the inclusion proof Rekor returns at upload — persisted
+        # alongside the anchor, it makes the evidence bundle offline-verifiable.
+        proof = (entry_data.get("verification") or {}).get("inclusionProof")
         logger.info("rekor: recorded entry logIndex=%d uuid=%s", log_index, entry_uuid)
-        return RekorEntry(log_index=log_index, entry_uuid=entry_uuid)
+        return RekorEntry(log_index=log_index, entry_uuid=entry_uuid, inclusion_proof=proof)
 
 
 class NoOpRekorClient:

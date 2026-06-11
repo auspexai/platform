@@ -9,11 +9,16 @@ import pytest
 
 from auspexai_platform.receipts.attestation import (
     RESULT_SET_ALGORITHM,
+    RESULT_SET_ALGORITHM_V1,
     ResultSetEntry,
     build_result_set_attestation,
     merkle_root,
+    unit_payload_sha256,
 )
-from auspexai_platform.receipts.intoto import AUSPEXAI_RESULT_SET_PREDICATE_TYPE
+from auspexai_platform.receipts.intoto import (
+    AUSPEXAI_RESULT_SET_PREDICATE_TYPE,
+    AUSPEXAI_RESULT_SET_PREDICATE_TYPE_V1,
+)
 from auspexai_platform.receipts.signing import (
     CoseVerificationError,
     cose_sign1_decode,
@@ -61,9 +66,9 @@ def test_build_attestation_signs_and_round_trips(tmp_path: Path):
         entries=entries,
         signing_key=key,
     )
-    assert att.merkle_root == merkle_root(entries)
+    assert att.merkle_root == merkle_root(entries, schema_version=1)
     assert att.unit_count == 2
-    assert att.algorithm == RESULT_SET_ALGORITHM
+    assert att.algorithm == RESULT_SET_ALGORITHM_V1
     # entries are returned sorted by unit_id
     assert [e.unit_id for e in att.entries] == ["u1", "u2"]
 
@@ -72,11 +77,60 @@ def test_build_attestation_signs_and_round_trips(tmp_path: Path):
     assert kid == key.pubkey_hex
     # ... and the in-toto statement decodes to the result-set predicate + attested root.
     statement = cbor2.loads(payload)
-    assert statement["predicateType"] == AUSPEXAI_RESULT_SET_PREDICATE_TYPE
+    assert statement["predicateType"] == AUSPEXAI_RESULT_SET_PREDICATE_TYPE_V1
     body = cbor2.loads(statement["predicate"])
     assert body["merkle_root"] == att.merkle_root
     assert body["unit_count"] == 2
     assert [u["unit_id"] for u in body["units"]] == ["u1", "u2"]
+    # v1 predicate units carry the input-binding hash (empty-string when unknown).
+    assert all("unit_payload_sha256" in u for u in body["units"])
+
+
+def test_build_attestation_schema_version_0_reproduces_legacy_format(tmp_path: Path):
+    """Honor-forever: schema_version=0 must reproduce the M7 byte format —
+    v0 algorithm, v0 predicate type, v0 leaves (no input hash member)."""
+    key = load_or_generate_signing_key(tmp_path / "sign.key")
+    entries = [_entry("u1", "h1", "rcpt-1")]
+    att = build_result_set_attestation(
+        attestation_id="att-legacy",
+        tenant_experiment_label="exp-label",
+        tenant_id="tenant-a",
+        entries=entries,
+        signing_key=key,
+        schema_version=0,
+    )
+    assert att.algorithm == RESULT_SET_ALGORITHM
+    assert att.merkle_root == merkle_root(entries)  # default = v0 leaves
+    payload, _ = cose_sign1_decode(att.cose_signed_blob, expected_pubkey=key.public_key)
+    statement = cbor2.loads(payload)
+    assert statement["predicateType"] == AUSPEXAI_RESULT_SET_PREDICATE_TYPE
+    body = cbor2.loads(statement["predicate"])
+    assert body["algorithm"] == RESULT_SET_ALGORITHM
+    assert all("unit_payload_sha256" not in u for u in body["units"])
+
+
+def test_v1_leaves_bind_the_unit_payload_hash():
+    """EB-1 reproducibility triple: changing the INPUT hash changes the v1
+    root (input is leaf-bound) but not the v0 root (legacy leaves ignore it)."""
+    a = [ResultSetEntry("u1", "h1", "r1", unit_payload_sha256="aa" * 32)]
+    b = [ResultSetEntry("u1", "h1", "r1", unit_payload_sha256="bb" * 32)]
+    assert merkle_root(a, schema_version=1) != merkle_root(b, schema_version=1)
+    assert merkle_root(a) == merkle_root(b)  # v0: input hash not in the leaf
+    # environment is predicate metadata, NEVER leaf material — same root.
+    c = [
+        ResultSetEntry(
+            "u1", "h1", "r1", unit_payload_sha256="aa" * 32, environment={"x": 1}
+        )
+    ]
+    assert merkle_root(a, schema_version=1) == merkle_root(c, schema_version=1)
+
+
+def test_unit_payload_sha256_is_canonical():
+    """The input-hash convention is over the canonical re-serialization, so
+    storage formatting differences don't change the hash."""
+    assert unit_payload_sha256('{"b": 1, "a": 2}') == unit_payload_sha256(
+        '{"a":2,"b":1}'
+    )
 
 
 def test_build_attestation_signature_rejects_wrong_key(tmp_path: Path):
@@ -246,7 +300,14 @@ class TestAttestationRoute:
         body = resp.json()
         assert body["unit_count"] == 2
         # The endpoint's root matches a local recompute from the seeded set.
-        expected = merkle_root([ResultSetEntry(*e1), ResultSetEntry(*e2)])
+        ph = unit_payload_sha256("{}")  # the seeded work-unit payload
+        expected = merkle_root(
+            [
+                ResultSetEntry(*e1, unit_payload_sha256=ph),
+                ResultSetEntry(*e2, unit_payload_sha256=ph),
+            ],
+            schema_version=1,
+        )
         assert body["merkle_root"] == expected
         # COSE blob verifies against the coordinator's signing key.
         from base64 import b64decode
@@ -298,7 +359,10 @@ class TestAttestationRoute:
         body = resp.json()
         assert body["partial"] is True
         assert body["unit_count"] == 1
-        assert body["merkle_root"] == merkle_root([ResultSetEntry(*e1)])
+        assert body["merkle_root"] == merkle_root(
+            [ResultSetEntry(*e1, unit_payload_sha256=unit_payload_sha256("{}"))],
+            schema_version=1,
+        )
         # the partial flag is in the SIGNED predicate, not just the response
         from base64 import b64decode
 

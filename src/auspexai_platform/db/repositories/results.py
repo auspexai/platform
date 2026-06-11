@@ -39,6 +39,7 @@ class ResultRepository:
         payload: dict[str, Any],
         worker_signature: str,
         completed_at: datetime,
+        environment: dict[str, Any] | None = None,
     ) -> Result:
         received_at = datetime.now(UTC).isoformat()
         # M-Results: persist the semantic hash at insert so an aged-off row still
@@ -51,8 +52,8 @@ class ResultRepository:
                 INSERT INTO results (
                     result_id, unit_id, worker_id, worker_pubkey_hex,
                     exit_code, payload_json, worker_signature,
-                    completed_at, received_at, semantic_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    completed_at, received_at, semantic_hash, environment_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     result_id,
@@ -65,6 +66,9 @@ class ResultRepository:
                     completed_at.isoformat(),
                     received_at,
                     sem_hash,
+                    # EB-1: coordinator-asserted serving-environment snapshot at
+                    # submission (the reproducibility triple's environment leg).
+                    json.dumps(environment) if environment else None,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -257,4 +261,7 @@ class ResultRepository:
             delivered_at=_dt(row["delivered_at"]),
             payload_expires_at=_dt(row["payload_expires_at"]),
             payload_aged_off_at=_dt(row["payload_aged_off_at"]),
+            environment=(
+                json.loads(row["environment_json"]) if row["environment_json"] else None
+            ),
         )
