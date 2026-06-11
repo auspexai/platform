@@ -389,6 +389,7 @@ def create_app(
         github_webhook_routes.build_router(
             release_repository,
             audit_repository,
+            software_request_repository,
             webhook_secret=os.environ.get("AUSPEXAI_GITHUB_WEBHOOK_SECRET"),
             event_bus=event_bus,
         ),

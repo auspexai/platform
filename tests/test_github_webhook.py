@@ -1,8 +1,10 @@
-"""§9 #46 follow-on — GitHub release webhook → draft announcement.
+"""§9 #46 follow-on — GitHub release webhook → DIRECT fleet announcement.
 
-The webhook is HMAC-authenticated (X-Hub-Signature-256 over the raw body);
-it only ever creates DRAFT registry rows, which heartbeats skip until a
-maintainer publishes via the announce action.
+The webhook is HMAC-authenticated (X-Hub-Signature-256 over the raw body)
+and records the release PUBLISHED — the GitHub release gate is the human
+gate (ratified 2026-06-11). `Fulfils: swr-…` lines in the description link
+approved software requests. The draft/announce machinery stays dormant
+(announce-action tests seed drafts via the repository directly).
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ def _release_event(
     repo: str = "auspexai/worker",
     draft: bool = False,
     prerelease: bool = False,
+    body_text: str = "release notes from github",
 ) -> bytes:
     return json.dumps(
         {
@@ -41,7 +44,7 @@ def _release_event(
             "release": {
                 "tag_name": tag,
                 "name": f"worker {tag}",
-                "body": "release notes from github",
+                "body": body_text,
                 "html_url": f"https://github.com/{repo}/releases/tag/{tag}",
                 "draft": draft,
                 "prerelease": prerelease,
@@ -63,15 +66,19 @@ def _mtnr(maintainer_token: str) -> dict:
 
 
 class TestSignature:
-    def test_valid_signature_creates_draft(self, client: TestClient, maintainer_token) -> None:
+    def test_valid_signature_announces_directly(self, client: TestClient, maintainer_token) -> None:
         r = _post(client, _release_event())
         assert r.status_code == 201, r.text
-        assert r.json() == {"draft": True, "version": "0.9.9", "channel": "worker"}
-        listing = client.get(
-            "/api/v0/releases?include_drafts=true", headers=_mtnr(maintainer_token)
-        ).json()
+        assert r.json() == {
+            "announced": True,
+            "version": "0.9.9",
+            "channel": "worker",
+            "fulfilled_request_ids": [],
+        }
+        # Published immediately: visible in the DEFAULT (fleet-facing) listing.
+        listing = client.get("/api/v0/releases", headers=_mtnr(maintainer_token)).json()
         (rel,) = [x for x in listing["releases"] if x["version"] == "0.9.9"]
-        assert rel["draft"] is True
+        assert rel["draft"] is False
         assert rel["source"] == "github-webhook"
         assert rel["announced_by"] == "github-webhook"
         assert rel["notes"] == "release notes from github"
@@ -121,23 +128,74 @@ class TestFiltering:
         assert "already recorded" in r.json()["ignored"]
 
 
-class TestDraftInvisibility:
-    def test_draft_not_in_default_listing(self, client: TestClient, maintainer_token) -> None:
-        _post(client, _release_event())
-        listing = client.get("/api/v0/releases", headers=_mtnr(maintainer_token)).json()
-        assert all(x["version"] != "0.9.9" for x in listing["releases"])
-
-    def test_draft_not_relayed_as_latest(self, client: TestClient, db) -> None:
-        # The fleet must never hear about an unannounced draft.
+class TestRelay:
+    def test_webhook_release_is_latest(self, client: TestClient, db) -> None:
+        # Direct announce: the fleet hears about it on the next heartbeat.
         from auspexai_platform.db.repositories import ReleaseRepository
 
         _post(client, _release_event())
+        latest = ReleaseRepository(db).latest(channel="worker")
+        assert latest is not None and latest.version == "0.9.9"
+
+    def test_manual_draft_still_invisible(self, client: TestClient, db, maintainer_token) -> None:
+        # The dormant draft machinery keeps its invariant.
+        from auspexai_platform.db.repositories import ReleaseRepository
+
+        ReleaseRepository(db).create(
+            version="0.9.8", channel="worker", headline="x", announced_by="t", draft=True
+        )
         assert ReleaseRepository(db).latest(channel="worker") is None
+        listing = client.get("/api/v0/releases", headers=_mtnr(maintainer_token)).json()
+        assert all(x["version"] != "0.9.8" for x in listing["releases"])
+
+
+class TestFulfils:
+    def test_fulfils_line_links_approved_request(
+        self, client: TestClient, registered_tenant, maintainer_token
+    ) -> None:
+        from tests.test_releases import _approved_request
+
+        rid = _approved_request(client, registered_tenant, maintainer_token)
+        body = _release_event(body_text=f"Good stuff for volunteers.\n\nFulfils: {rid}")
+        r = _post(client, body)
+        assert r.status_code == 201, r.text
+        assert r.json()["fulfilled_request_ids"] == [rid]
+        sr = client.get(f"/api/v0/software-requests/{rid}", headers=_mtnr(maintainer_token)).json()
+        assert sr["status"] == "released"
+        assert sr["release_version"] == "0.9.9"
+        # Plumbing line stripped from the volunteer-facing notes.
+        listing = client.get("/api/v0/releases", headers=_mtnr(maintainer_token)).json()
+        (rel,) = [x for x in listing["releases"] if x["version"] == "0.9.9"]
+        assert rel["notes"] == "Good stuff for volunteers."
+
+    def test_bad_fulfils_id_never_blocks_announcement(
+        self, client: TestClient, maintainer_token
+    ) -> None:
+        body = _release_event(body_text="Notes.\nFulfils: swr-doesnotexist")
+        r = _post(client, body)
+        assert r.status_code == 201, r.text
+        assert r.json()["fulfilled_request_ids"] == []
+        listing = client.get("/api/v0/releases", headers=_mtnr(maintainer_token)).json()
+        assert any(x["version"] == "0.9.9" for x in listing["releases"])
 
 
 class TestAnnounce:
-    def test_announce_publishes_with_edits(self, client: TestClient, maintainer_token) -> None:
-        _post(client, _release_event())
+    @staticmethod
+    def _seed_draft(db) -> None:
+        from auspexai_platform.db.repositories import ReleaseRepository
+
+        ReleaseRepository(db).create(
+            version="0.9.9",
+            channel="worker",
+            headline="worker v0.9.9",
+            notes="release notes from github",
+            announced_by="github-webhook",
+            draft=True,
+            source="github-webhook",
+        )
+
+    def test_announce_publishes_with_edits(self, client: TestClient, db, maintainer_token) -> None:
+        self._seed_draft(db)
         r = client.post(
             "/api/v0/releases/0.9.9/actions/announce",
             json={"headline": "Volunteer-facing headline", "fulfils_request_ids": []},
@@ -160,8 +218,10 @@ class TestAnnounce:
         )
         assert r.status_code == 404
 
-    def test_announce_409_on_already_published(self, client: TestClient, maintainer_token) -> None:
-        _post(client, _release_event())
+    def test_announce_409_on_already_published(
+        self, client: TestClient, db, maintainer_token
+    ) -> None:
+        self._seed_draft(db)
         first = client.post(
             "/api/v0/releases/0.9.9/actions/announce", json={}, headers=_mtnr(maintainer_token)
         )
