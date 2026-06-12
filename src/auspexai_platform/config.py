@@ -82,6 +82,14 @@ class Config:
         return self.state_dir / "jobs"
 
     @property
+    def packages_dir(self) -> Path:
+        """Content-addressed executor-package blobs (§9 #40a courier). One
+        ``<package_digest>.tar.gz`` per uploaded tenant executor package;
+        the digest is `compute_package_digest` over the extracted tree
+        (verified on upload, re-derived by workers after fetch)."""
+        return self.state_dir / "packages"
+
+    @property
     def cors_allowed_origins(self) -> list[str]:
         """CORS allowed origins. Read from ``CORS_ALLOWED_ORIGINS`` env var
         (comma-separated). Defaults to ``["https://auspexai.network"]``."""

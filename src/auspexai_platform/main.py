@@ -37,6 +37,7 @@ from auspexai_platform.api import experiments as experiment_routes
 from auspexai_platform.api import github_webhook as github_webhook_routes
 from auspexai_platform.api import health
 from auspexai_platform.api import model_requests as model_request_routes
+from auspexai_platform.api import packages as package_routes
 from auspexai_platform.api import receipts as receipt_routes
 from auspexai_platform.api import releases as release_routes
 from auspexai_platform.api import results as results_routes
@@ -74,6 +75,7 @@ from auspexai_platform.db.repositories import (
 from auspexai_platform.eligibility import EligibilityThresholds
 from auspexai_platform.events import EventBus
 from auspexai_platform.oauth import IdentityVerifier, build_default_verifier
+from auspexai_platform.packages import PackageStore
 from auspexai_platform.rate_limit import limiter
 from auspexai_platform.receipts import load_or_generate_signing_key
 from auspexai_platform.scheduler import Scheduler
@@ -146,6 +148,8 @@ def create_app(
     # M8: in-process live-event bus. SSE endpoints subscribe; lifecycle /
     # result-submission routes publish. Process-local (single-process coord).
     event_bus = EventBus()
+    # §9 #40a: content-addressed executor-package blob store (the courier).
+    package_store = PackageStore(config.packages_dir)
 
     app = FastAPI(
         title="AuspexAI Coordinator",
@@ -204,6 +208,7 @@ def create_app(
     app.state.receipt_signing_key = receipt_signing_key
     app.state.receipt_index_repository = receipt_index_repository
     app.state.event_bus = event_bus
+    app.state.package_store = package_store
 
     # D3 accountability cascade: the account_repository arms the
     # account-suspension check on signed researcher requests.
@@ -368,6 +373,19 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["model-requests"],
+    )
+    # §9 #40a executor-package courier: researcher upload (verified +
+    # content-addressed) / enrolled-worker fetch. No dispatch changes —
+    # workers decide to fetch from the manifest digest they already receive.
+    app.include_router(
+        package_routes.build_router(
+            credential_dep,
+            audit_repository,
+            package_store,
+            event_bus=event_bus,
+        ),
+        prefix="/api/v0",
+        tags=["packages"],
     )
     app.include_router(
         software_request_routes.build_router(
