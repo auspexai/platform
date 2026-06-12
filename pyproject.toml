@@ -36,6 +36,10 @@ dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
     "pytest-asyncio>=0.24",
+    # Property-based integrity pass over the result-acceptance + export state
+    # machine (§9 #47 follow-up; 3 integrity bugs in 48h argued for systematic
+    # adversarial coverage over incidental discovery).
+    "hypothesis>=6.100",
     # Hard per-test wall-clock cap so a wedged test fails fast instead of
     # hanging the run. An unconsumed infinite SSE body parks the server
     # generator in its keepalive `wait_for` under Starlette's TestClient (no
