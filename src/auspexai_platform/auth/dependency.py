@@ -17,6 +17,15 @@ Routes that require a particular credential class use a stronger dependency
 M2 ships only `get_credential` + `require_maintainer` + `require_researcher`;
 audience-specific authorization (per-tenant ownership checks etc.) lands with
 each resource route.
+
+Accountability cascade (D3): the account is the accountability root, so a
+SUSPENDED account's linked tenants stop working. When the resolved researcher
+credential's tenant is account-linked and that account is suspended, the
+dependency raises 403 `account_suspended` carrying the maintainer's
+suspension_reason — the same surfacing rule as the worker-side 423
+`worker_quarantined`. `/auth/whoami` stays exempt (read-only), matching the
+worker-side philosophy: status surfaces keep answering so the account holder
+can see that — and why — they were suspended; work surfaces refuse.
 """
 
 from __future__ import annotations
@@ -34,6 +43,15 @@ from auspexai_platform.auth.errors import (
 )
 from auspexai_platform.auth.resolver import CredentialResolver
 from auspexai_platform.auth.signature import RequestSummary, verify_request
+from auspexai_platform.db.repositories.accounts import AccountRepository
+
+# Paths exempt from the account-suspension cascade. whoami is the researcher's
+# status surface — it keeps working read-only for a suspended account so the
+# dashboard can show the suspension banner (suspended_at + suspension_reason
+# are ACCOUNT_SCOPED fields on the whoami response). Mirrors the worker-side
+# philosophy: a quarantined worker still heartbeats and sees its quarantine
+# reason; it just gets no work.
+_SUSPENSION_EXEMPT_PATHS = frozenset({"/api/v0/auth/whoami"})
 
 
 def _auth_failure(
@@ -45,13 +63,59 @@ def _auth_failure(
     )
 
 
+def _enforce_account_not_suspended(
+    credential: Credential,
+    request_path: str,
+    account_repository: AccountRepository | None,
+) -> None:
+    """D3 accountability cascade: 403 a researcher whose linked account is
+    suspended.
+
+    Applies only to researcher credentials whose tenant carries an
+    `account_id` (legacy tenants without one are unaffected — there is no
+    accountability root to cascade from). Suspension itself is already
+    audited at suspend time; this enforcement adds no new audit entries.
+    """
+    if account_repository is None:
+        return
+    if not credential.is_researcher() or credential.account_id is None:
+        return
+    if request_path in _SUSPENSION_EXEMPT_PATHS:
+        return
+    account = account_repository.get_by_id(credential.account_id)
+    if account is None or account.suspended_at is None:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error": {
+                "code": "account_suspended",
+                "message": (
+                    "this tenant's account is suspended; contact the operator "
+                    "or wait for unsuspension"
+                ),
+                "details": {
+                    "suspended_at": account.suspended_at.isoformat(),
+                    "suspension_reason": account.suspension_reason,
+                },
+            }
+        },
+    )
+
+
 def make_credential_dependency(
     token_store: TokenStore,
     resolver: CredentialResolver,
+    account_repository: AccountRepository | None = None,
 ):
     """Build the `get_credential` dependency bound to a token store + a
     keyid resolver (tenants + workers). Each `create_app()` call binds its
-    own resolver so tests can run in parallel with isolated state."""
+    own resolver so tests can run in parallel with isolated state.
+
+    `account_repository` arms the account-suspension cascade (D3): signed
+    researcher requests from a tenant whose linked account is suspended are
+    refused with 403 `account_suspended`. When omitted (minimal test apps),
+    the cascade is disarmed."""
 
     async def get_credential(request: Request) -> Credential:
         auth_header = request.headers.get("Authorization")
@@ -96,9 +160,11 @@ def make_credential_dependency(
                 content_digest_header=request.headers.get("Content-Digest"),
             )
             try:
-                return verify_request(summary, resolver)
+                credential = verify_request(summary, resolver)
             except AuthError as e:
                 raise _auth_failure(e) from e
+            _enforce_account_not_suspended(credential, request.url.path, account_repository)
+            return credential
 
         return Credential.anonymous()
 

@@ -615,3 +615,62 @@ def test_resolve_twice_conflicts_and_unknown_id_404s(
         f"{APPLY_PATH}/tapp-missing0/actions/approve", json={}, headers=_mtnr(maintainer_token)
     )
     assert r.status_code == 404
+
+
+# ---- account_existing_tenants (D2 review context) -------------------------------
+
+
+def test_list_fresh_account_has_empty_account_existing_tenants(
+    client: TestClient, applied, maintainer_token
+) -> None:
+    """An account with no linked tenants yet → [] (not absent, not null)."""
+    r = client.get(APPLY_PATH, headers=_mtnr(maintainer_token))
+    assert r.status_code == 200
+    (row,) = r.json()["applications"]
+    assert row["account_existing_tenants"] == []
+
+
+def test_list_shows_existing_tenant_on_second_application_from_same_account(
+    client: TestClient, applied, maintainer_token
+) -> None:
+    """Approve the first application (creates tenant 'vigiles' linked to the
+    account), then a second application from the SAME GitHub identity (same
+    account, new applying key): its queue row carries the already-linked
+    tenant so multi-tenancy-per-account is approved deliberately. The
+    resolved first application's row carries it too (exclude nothing)."""
+    r = client.post(
+        f"{APPLY_PATH}/{applied['application_id']}/actions/approve",
+        json={},
+        headers=_mtnr(maintainer_token),
+    )
+    assert r.status_code == 200, r.text
+
+    second_priv = Ed25519PrivateKey.generate()
+    second_pub = second_priv.public_key().public_bytes_raw().hex()
+    r2 = _signed_post(
+        client,
+        privkey=second_priv,
+        pubkey_hex=second_pub,
+        path=APPLY_PATH,
+        body=_apply_body(requested_tenant_id="vigiles-aux"),
+    )
+    assert r2.status_code == 201, r2.text
+
+    listing = client.get(APPLY_PATH, headers=_mtnr(maintainer_token))
+    assert listing.status_code == 200
+    rows = {a["application_id"]: a for a in listing.json()["applications"]}
+    assert rows[r2.json()["application_id"]]["account_existing_tenants"] == ["vigiles"]
+    assert rows[applied["application_id"]]["account_existing_tenants"] == ["vigiles"]
+
+
+def test_mine_does_not_carry_account_existing_tenants(client: TestClient, applied) -> None:
+    """Ratified: the review-context field is maintainer-queue-only, NOT /mine."""
+    r = _signed_get(
+        client,
+        privkey=applied["privkey"],
+        pubkey_hex=applied["pubkey_hex"],
+        path=f"{APPLY_PATH}/mine",
+    )
+    assert r.status_code == 200
+    for row in r.json()["applications"]:
+        assert "account_existing_tenants" not in row

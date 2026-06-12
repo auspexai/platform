@@ -16,6 +16,14 @@ application SIGNED BY THE APPLYING KEY:
                                                     the account row is
                                                     resolved-or-created.
   GET  /api/v0/tenant-applications[?status_filter=] — maintainer-only queue.
+                                                    Each row carries
+                                                    account_existing_tenants:
+                                                    tenant_ids already linked
+                                                    to the application's
+                                                    account (review context
+                                                    for deliberate multi-
+                                                    tenancy-per-account
+                                                    decisions). NOT on /mine.
   GET  /api/v0/tenant-applications/mine           — signed by the applying key
                                                     (same self-keyid check);
                                                     that key's applications.
@@ -55,7 +63,7 @@ from auspexai_platform.db.repositories.tenant_applications import (
     ApplicationNotPendingError,
     TenantApplication,
 )
-from auspexai_platform.db.repositories.tenants import DuplicateTenantError
+from auspexai_platform.db.repositories.tenants import DuplicateTenantError, TenantRepository
 from auspexai_platform.events import EventBus
 from auspexai_platform.oauth import (
     IdentityVerifier,
@@ -150,6 +158,11 @@ class TenantApplicationResponse(BaseModel):
     resolved_by: str | None
     resolution_reason: str | None
     created_tenant_id: str | None
+    # D2 review context (maintainer queue only): tenant_ids already linked to
+    # this application's account, so a second-tenant-for-the-same-account
+    # approval is a deliberate decision, not a surprise. Populated by the
+    # GET /tenant-applications list route; defaults to [] elsewhere.
+    account_existing_tenants: list[str] = Field(default_factory=list)
 
 
 class TenantApplicationListResponse(BaseModel):
@@ -246,7 +259,9 @@ def _require_maintainer(credential: Credential) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="maintainer required")
 
 
-def _to_response(a: TenantApplication) -> TenantApplicationResponse:
+def _to_response(
+    a: TenantApplication, *, account_existing_tenants: list[str] | None = None
+) -> TenantApplicationResponse:
     return TenantApplicationResponse(
         application_id=a.application_id,
         account_id=a.account_id,
@@ -263,6 +278,7 @@ def _to_response(a: TenantApplication) -> TenantApplicationResponse:
         resolved_by=a.resolved_by,
         resolution_reason=a.resolution_reason,
         created_tenant_id=a.created_tenant_id,
+        account_existing_tenants=account_existing_tenants or [],
     )
 
 
@@ -276,6 +292,7 @@ def build_router(
     audit_repository: AuditRepository,
     identity_verifier: IdentityVerifier,
     *,
+    tenant_repository: TenantRepository,
     event_bus: EventBus | None = None,
 ) -> APIRouter:
     router = APIRouter()
@@ -447,7 +464,20 @@ def build_router(
     ) -> TenantApplicationListResponse:
         _require_maintainer(credential)
         applications = tenant_application_repository.list(status=status_filter)
-        return TenantApplicationListResponse(applications=[_to_response(a) for a in applications])
+        # D2 review context: per-application, the tenant_ids already linked to
+        # the application's account (excludes nothing; [] when none) — so a
+        # second tenant for an account is approved deliberately.
+        return TenantApplicationListResponse(
+            applications=[
+                _to_response(
+                    a,
+                    account_existing_tenants=[
+                        t.tenant_id for t in tenant_repository.list_for_account(a.account_id)
+                    ],
+                )
+                for a in applications
+            ]
+        )
 
     def _load_pending(application_id: str) -> TenantApplication:
         existing = tenant_application_repository.get_by_id(application_id)

@@ -205,7 +205,11 @@ def create_app(
     app.state.receipt_index_repository = receipt_index_repository
     app.state.event_bus = event_bus
 
-    credential_dep = make_credential_dependency(token_store, credential_resolver)
+    # D3 accountability cascade: the account_repository arms the
+    # account-suspension check on signed researcher requests.
+    credential_dep = make_credential_dependency(
+        token_store, credential_resolver, account_repository=account_repository
+    )
 
     app.include_router(
         health.build_router(credential_dep, worker_repository),
@@ -384,6 +388,7 @@ def create_app(
             account_repository,
             audit_repository,
             identity_verifier,
+            tenant_repository=tenant_repository,
             event_bus=event_bus,
         ),
         prefix="/api/v0",

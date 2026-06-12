@@ -95,6 +95,15 @@ class TenantRepository:
         rows = self.db.execute("SELECT * FROM tenants ORDER BY registered_at")
         return [self._row_to_tenant(r) for r in rows]
 
+    def list_for_account(self, account_id: str) -> list[Tenant]:
+        """All tenants linked to an account (D2 review context). Excludes
+        nothing — suspended/legacy state is the caller's concern."""
+        rows = self.db.execute(
+            "SELECT * FROM tenants WHERE account_id = ? ORDER BY registered_at",
+            (account_id,),
+        )
+        return [self._row_to_tenant(r) for r in rows]
+
     # ---- helpers ----
 
     @staticmethod
