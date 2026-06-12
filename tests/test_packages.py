@@ -456,3 +456,57 @@ def test_round_trip_upload_fetch_extract_digest_matches(
     for rel, data in PKG_BODY_TREE.items():
         assert (dest / rel).read_bytes() == data
     assert compute_package_digest(dest) == PKG_DIGEST
+
+
+def _signed_fetch_path(client: TestClient, *, privkey, pubkey_hex: str, path: str):
+    headers = sign_request(
+        privkey=privkey,
+        pubkey_hex=pubkey_hex,
+        method="GET",
+        path=path,
+        authority="testserver",
+        body=b"",
+    )
+    return client.get(path, headers=headers)
+
+
+def test_fetch_by_manifest_resolves_pin(
+    client: TestClient, registered_tenant, enrolled_worker, manifest_repository
+) -> None:
+    """The worker's natural fetch key is the manifest hash (the digest pin
+    lives INSIDE the manifest) — the integration gap that stalled the first
+    live #40a run: workers fetched /packages/{manifest_sha256} against a
+    digest-keyed store. The by-manifest route resolves hash -> pin -> blob."""
+    _upload_pkg(client, registered_tenant)
+    _, binding = registered_tenant
+    manifest = manifest_repository.insert(
+        tenant_id=binding.tenant_id,
+        manifest_json={
+            "tenant_id": binding.tenant_id,
+            "experiment_id": "by-manifest-test",
+            "executor": {"package_sha256": PKG_DIGEST},
+        },
+        signature_json={"alg": "ed25519", "sig": "opaque"},
+    )
+    worker_priv, worker = enrolled_worker
+    r = _signed_fetch_path(
+        client,
+        privkey=worker_priv,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/packages/by-manifest/{manifest.manifest_hash}",
+    )
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/gzip"
+    assert r.content == _tar_gz(PKG_BODY_TREE)
+
+
+def test_fetch_by_manifest_unknown_404(client: TestClient, enrolled_worker) -> None:
+    worker_priv, worker = enrolled_worker
+    r = _signed_fetch_path(
+        client,
+        privkey=worker_priv,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/packages/by-manifest/{'ab' * 32}",
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"]["code"] == "package_not_found"

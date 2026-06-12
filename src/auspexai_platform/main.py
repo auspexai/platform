@@ -382,6 +382,7 @@ def create_app(
             credential_dep,
             audit_repository,
             package_store,
+            manifest_repository,
             event_bus=event_bus,
         ),
         prefix="/api/v0",

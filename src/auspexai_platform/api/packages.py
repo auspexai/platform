@@ -82,6 +82,7 @@ def build_router(
     credential_dep,
     audit_repository: AuditRepository,
     package_store: PackageStore,
+    manifest_repository,
     *,
     event_bus: EventBus | None = None,
 ) -> APIRouter:
@@ -220,6 +221,57 @@ def build_router(
             blob_path,
             media_type="application/gzip",
             filename=f"{digest}.tar.gz",
+        )
+
+    @router.get("/packages/by-manifest/{manifest_sha256}")
+    async def fetch_package_by_manifest(
+        manifest_sha256: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> FileResponse:
+        """Enrolled worker fetches the package PINNED BY a manifest. The
+        dispatch wire carries only `manifest_sha256` (the digest pin lives
+        inside the manifest, which arrives WITH the package), so this lookup
+        is the worker's natural fetch key. The coordinator resolves the
+        stored manifest's `executor.package_sha256` and serves that blob —
+        trust unchanged: the worker independently re-verifies BOTH the
+        manifest hash and the package digest after extraction, so the courier
+        still cannot substitute a byte. 404 on unknown manifest, unpinned
+        manifest, or missing blob."""
+        require_worker(credential)
+        if not _DIGEST_RE.match(manifest_sha256):
+            raise _error(
+                status.HTTP_404_NOT_FOUND,
+                "package_not_found",
+                "no manifest stored under this hash",
+            )
+        record = manifest_repository.get(manifest_sha256.lower())
+        if record is None:
+            raise _error(
+                status.HTTP_404_NOT_FOUND,
+                "package_not_found",
+                "no manifest stored under this hash",
+            )
+        try:
+            pin = record.manifest_json["executor"]["package_sha256"]
+        except (KeyError, TypeError):
+            pin = None
+        if not isinstance(pin, str) or not _DIGEST_RE.match(pin):
+            raise _error(
+                status.HTTP_404_NOT_FOUND,
+                "package_not_found",
+                "manifest does not pin a fetchable package digest",
+            )
+        blob_path = package_store.path_for(pin.lower())
+        if not blob_path.is_file():
+            raise _error(
+                status.HTTP_404_NOT_FOUND,
+                "package_not_found",
+                "the pinned package has not been uploaded",
+            )
+        return FileResponse(
+            blob_path,
+            media_type="application/gzip",
+            filename=f"{pin.lower()}.tar.gz",
         )
 
     return router
