@@ -179,6 +179,107 @@ def attestation_backfill_rekor(
         click.echo("\nRe-run with --apply to anchor these in Rekor.")
 
 
+@main.group()
+def receipts() -> None:
+    """Receipt maintenance."""
+
+
+@receipts.command("rebuild-index")
+@_state_dir_option
+@click.option(
+    "--experiment",
+    "experiment_id",
+    default=None,
+    help="Rebuild for one experiment only (default: all experiments with a per-job DB).",
+)
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Actually insert missing index rows. Default is a dry-run count.",
+)
+def receipts_rebuild_index(
+    state_dir: Path | None, experiment_id: str | None, apply_changes: bool
+) -> None:
+    """Reconcile the control-DB receipt_index against the per-job receipts tables.
+
+    The index write at issuance is best-effort (a failure is logged, never
+    fatal — the per-job receipt row is the source of truth). This is the
+    promised rebuild sweep: it re-derives each experiment's
+    {result_id: receipt_id} map from the per-job receipts ⨝ results join and
+    inserts any rows the index is missing. DRY-RUN by default. NB: signing
+    paths no longer depend on the index (they derive membership from the
+    per-job tables directly); this keeps the display routes complete.
+    """
+    from auspexai_platform.db.database import Database
+    from auspexai_platform.db.migrations import MigrationRunner
+    from auspexai_platform.db.per_job import PerJobDatabaseFactory
+    from auspexai_platform.db.repositories import ReceiptIndexRepository
+    from auspexai_platform.receipts.attestation import receipt_map_from_per_job
+
+    config = _resolve_config(state_dir)
+    db = Database(config.control_db_path)
+    try:
+        MigrationRunner(db).apply_all()
+        index_repo = ReceiptIndexRepository(db)
+        factory = PerJobDatabaseFactory(config.jobs_dir)
+        if experiment_id is not None:
+            experiment_ids = [experiment_id]
+        else:
+            experiment_ids = sorted(p.stem for p in config.jobs_dir.glob("*.db"))
+        total_missing = 0
+        total_inserted = 0
+        for exp_id in experiment_ids:
+            per_job_db = factory.get(exp_id)
+            if per_job_db is None:
+                click.echo(f"{exp_id}: no per-job DB, skipped")
+                continue
+            indexed = {
+                e.result_id
+                for e in index_repo.list_for_experiment(exp_id)
+                if e.result_id is not None
+            }
+            authoritative = receipt_map_from_per_job(per_job_db)
+            worker_by_result = {
+                row["result_id"]: (row["worker_id"], row["worker_pubkey_hex"])
+                for row in per_job_db.execute(
+                    "SELECT result_id, worker_id, worker_pubkey_hex FROM results"
+                )
+            }
+            missing = sorted(set(authoritative) - indexed)
+            total_missing += len(missing)
+            inserted = 0
+            for result_id in missing:
+                if not apply_changes:
+                    continue
+                worker_id, worker_pubkey = worker_by_result[result_id]
+                try:
+                    index_repo.record(
+                        receipt_id=authoritative[result_id],
+                        experiment_id=exp_id,
+                        worker_id=worker_id,
+                        worker_pubkey=worker_pubkey,
+                        result_id=result_id,
+                    )
+                    inserted += 1
+                except Exception as e:  # per-row fault tolerance, mirror backfill-rekor
+                    click.echo(f"{exp_id}: failed to index {result_id}: {e}")
+            total_inserted += inserted
+            if missing:
+                click.echo(
+                    f"{exp_id}: {len(missing)} missing index row(s)"
+                    + (f", {inserted} inserted" if apply_changes else "")
+                )
+        click.echo(
+            f"done: {total_missing} missing across {len(experiment_ids)} experiment(s)"
+            + (f", {total_inserted} inserted" if apply_changes else " (dry-run)")
+        )
+        if not apply_changes and total_missing:
+            click.echo("Re-run with --apply to insert the missing rows.")
+    finally:
+        db.close()
+
+
 # ----------------------------------------------------------------------------
 # token group
 # ----------------------------------------------------------------------------

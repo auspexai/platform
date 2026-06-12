@@ -266,8 +266,10 @@ def issue_receipts_for_completed_unit(
                 )
             except Exception:
                 logger.exception(
-                    "receipt_index insert failed for %s; per-job row is "
-                    "intact and the index can be rebuilt by a sweep",
+                    "receipt_index insert failed for %s; per-job row is intact — "
+                    "rebuild with `auspexai-coordinator receipts rebuild-index "
+                    "--apply`. NB the index is a display cache only: attestation "
+                    "and bundle membership derive from the per-job tables",
                     record.receipt_id,
                 )
         logger.info(

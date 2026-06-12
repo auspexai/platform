@@ -111,6 +111,86 @@ def _unit_payload_hashes(per_job_db) -> dict[str, str]:
     return {r["unit_id"]: unit_payload_sha256(r["payload_json"]) for r in rows}
 
 
+class IncompleteAttestationSetError(Exception):
+    """The collected attestation entries do not cover every consensus unit
+    that holds an issued receipt — signing this set would put the coordinator's
+    signature on a claim narrower than the data (the D1 bug family). Refuse to
+    canonicalize; the divergence is the finding."""
+
+    def __init__(self, missing_units: list[str], extra_units: list[str]) -> None:
+        self.missing_units = missing_units
+        self.extra_units = extra_units
+        super().__init__(
+            f"attestation set diverges from the consensus set: "
+            f"missing={missing_units} extra={extra_units}"
+        )
+
+
+def receipt_map_from_per_job(per_job_db) -> dict[str, str]:
+    """{result_id: receipt_id} derived from the AUTHORITATIVE per-job tables
+    (receipts ⨝ results) — NOT the control-DB `receipt_index`.
+
+    The index is a best-effort display cache: its write is swallowed-on-error
+    at issuance, so deciding attestation-leaf membership from it let one failed
+    index write silently narrow the signed set while the claim stayed
+    "complete" (the 2026-06-12 signature-scope finding, D1's sibling). Signing
+    and bundle-membership paths use this map; the index keeps serving the
+    cross-experiment display routes it was built for.
+
+    Receipts are keyed back to results by joining each receipt body's
+    (worker_pubkey, work_unit_ids) to the results table. Deterministic:
+    receipts walk in (issued_at, receipt_id) order and the first receipt for a
+    (unit, worker) wins, so a rebuilt map reproduces the same leaves."""
+    from auspexai_platform.receipts.models import decode_cbor
+
+    by_unit_worker: dict[tuple[str, str], str] = {}
+    for row in per_job_db.execute(
+        "SELECT receipt_id, receipt_body_cbor FROM receipts ORDER BY issued_at, receipt_id"
+    ):
+        try:
+            receipt = decode_cbor(row["receipt_body_cbor"])
+        except Exception:
+            # An undecodable body cannot claim a leaf. Skipping narrows the
+            # set, so the assert_entries_cover_consensus guard (whose
+            # unit-level predicate does NOT decode bodies) refuses to sign it.
+            continue
+        pubkey = receipt.worker_pubkey.hex().lower()
+        for unit_id in receipt.work_unit_ids:
+            by_unit_worker.setdefault((unit_id, pubkey), row["receipt_id"])
+    out: dict[str, str] = {}
+    for row in per_job_db.execute("SELECT result_id, unit_id, worker_pubkey_hex FROM results"):
+        receipt_id = by_unit_worker.get((row["unit_id"], row["worker_pubkey_hex"].lower()))
+        if receipt_id is not None:
+            out[row["result_id"]] = receipt_id
+    return out
+
+
+def assert_entries_cover_consensus(per_job_db, entries: list[ResultSetEntry]) -> None:
+    """Independent persist-time recount (D1-family guard): every consensus unit
+    for which ANY receipt row exists must appear in the attested entries, and
+    nothing else may. Deliberately a different code path from the collection
+    join — a raw SQL existence check that doesn't decode receipt bodies — so a
+    bug in either path surfaces as divergence instead of a short signed set.
+    Raises IncompleteAttestationSetError on divergence."""
+    rows = per_job_db.execute(
+        """
+        SELECT r.unit_id FROM results r
+        WHERE r.is_consensus = 1 AND r.semantic_hash IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM receipts rc
+            WHERE rc.work_unit_ids_json LIKE '%"' || r.unit_id || '"%'
+          )
+        """
+    )
+    expected = {row["unit_id"] for row in rows}
+    attested = {e.unit_id for e in entries}
+    if expected != attested:
+        raise IncompleteAttestationSetError(
+            missing_units=sorted(expected - attested),
+            extra_units=sorted(attested - expected),
+        )
+
+
 def collect_result_set_entries(
     per_job_db,
     *,

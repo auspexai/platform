@@ -201,6 +201,50 @@ def _signed_get(client, *, privkey, pubkey_hex, path):
     return client.get(path, headers=headers)
 
 
+def insert_per_job_receipt(
+    db, *, receipt_id: str, unit_id: str, worker_pubkey_hex: str = "ab" * 32
+) -> None:
+    """Seed the AUTHORITATIVE per-job receipt row. Since the 2026-06-12
+    signature-scope fix, attestation/bundle membership is derived from the
+    per-job receipts ⨝ results join — the receipt_index is display-only."""
+    import json as _json
+
+    from auspexai_platform.receipts.models import (
+        QuorumAgreement,
+        Receipt,
+        ResultHashAnchor,
+        TimeWindow,
+        encode_cbor,
+    )
+
+    now = datetime.now(UTC)
+    body = encode_cbor(
+        Receipt(
+            version="0.1",
+            tenant_id="tenant-x",
+            experiment_id="label-x",
+            worker_pubkey=bytes.fromhex(worker_pubkey_hex),
+            work_unit_ids=[unit_id],
+            time_window=TimeWindow(start=now, end=now),
+            quorum_agreement=QuorumAgreement(
+                replication_factor=1, agreeing_workers=1, method="hash-equality"
+            ),
+            result_hash_anchors=[
+                ResultHashAnchor(
+                    rekor_log_index=0,
+                    rekor_entry_uuid="lab-mode-no-rekor",
+                    result_sha256="00" * 32,
+                )
+            ],
+        )
+    )
+    db.execute(
+        "INSERT INTO receipts (receipt_id, work_unit_ids_json, cose_signed_blob, "
+        "receipt_body_cbor, signing_key_pubkey_hex, issued_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (receipt_id, _json.dumps([unit_id]), b"\x00", body, "aa" * 32, now.isoformat()),
+    )
+
+
 def _seed_consensus_unit(
     per_job_factory: PerJobDatabaseFactory,
     receipt_index_repository,
@@ -210,8 +254,9 @@ def _seed_consensus_unit(
     payload: dict,
     worker_id: str,  # must be an enrolled worker (receipt_index FKs workers)
 ) -> tuple[str, str, str]:
-    """Completed unit + consensus result + a receipt-index entry. Returns
-    (unit_id, consensus semantic_hash, receipt_id)."""
+    """Completed unit + consensus result + the authoritative per-job receipt
+    row + a receipt-index entry. Returns (unit_id, consensus semantic_hash,
+    receipt_id)."""
     db = per_job_factory.get_or_create(experiment_id)
     now = datetime.now(UTC)
     db.execute(
@@ -233,6 +278,7 @@ def _seed_consensus_unit(
     )
     repo.promote_consensus(unit_id, result.result_id)
     receipt_id = f"rcpt-{unit_id}"
+    insert_per_job_receipt(db, receipt_id=receipt_id, unit_id=unit_id)
     receipt_index_repository.record(
         receipt_id=receipt_id,
         experiment_id=experiment_id,

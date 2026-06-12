@@ -235,8 +235,19 @@ class TestExportBundle:
         payload,
         worker_id,
     ):
+        from tests.test_attestation import insert_per_job_receipt
+
         _repo, results = _seed_unit(
             per_job_factory, experiment_id, unit_id=unit_id, payloads=[payload]
+        )
+        # The authoritative per-job receipt row (attestation/bundle membership
+        # derives from it since the 2026-06-12 fix) + the display-cache index.
+        insert_per_job_receipt(
+            per_job_factory.get_or_create(experiment_id),
+            receipt_id=f"rcpt-{unit_id}",
+            unit_id=unit_id,
+            # must match the consensus (first) result's pubkey from _seed_unit
+            worker_pubkey_hex="01" * 32,
         )
         receipt_index_repository.record(
             receipt_id=f"rcpt-{unit_id}",

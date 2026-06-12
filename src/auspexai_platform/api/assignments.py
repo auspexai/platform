@@ -77,8 +77,11 @@ from auspexai_platform.receipts import (
     issue_receipts_for_completed_unit,
 )
 from auspexai_platform.receipts.attestation import (
+    IncompleteAttestationSetError,
+    assert_entries_cover_consensus,
     build_result_set_attestation,
     collect_result_set_entries,
+    receipt_map_from_per_job,
 )
 from auspexai_platform.scheduler import Scheduler, reoffer_eligible
 from auspexai_platform.scheduler.conductor import plan_prestage_for_worker
@@ -859,12 +862,29 @@ def _maybe_emit_completion_attestation(
     ):
         return  # already canonical
     try:
-        receipt_map = {
-            e.result_id: e.receipt_id
-            for e in receipt_index_repository.list_for_experiment(experiment_id)
-            if e.result_id is not None
-        }
-        entries = collect_result_set_entries(per_job_db, receipt_id_by_result=receipt_map)
+        # Leaf membership from the AUTHORITATIVE per-job receipts table — the
+        # control-DB receipt_index is a best-effort display cache whose write
+        # failures are swallowed at issuance (signature-scope finding,
+        # 2026-06-12). The recount guard below refuses to canonicalize a set
+        # that diverges from the consensus table.
+        entries = collect_result_set_entries(
+            per_job_db, receipt_id_by_result=receipt_map_from_per_job(per_job_db)
+        )
+        try:
+            assert_entries_cover_consensus(per_job_db, entries)
+        except IncompleteAttestationSetError as e:
+            audit_repository.append(
+                actor_class=CredentialClass.SYSTEM,
+                action="attestation.incomplete_set",
+                resource_type="experiment",
+                resource_id=experiment_id,
+                payload={
+                    "missing_units": e.missing_units,
+                    "extra_units": e.extra_units,
+                    "trigger": "auto_complete",
+                },
+            )
+            raise
         attestation = build_result_set_attestation(
             attestation_id=f"att-{secrets.token_urlsafe(9)}",
             tenant_experiment_label=experiment.tenant_experiment_label,

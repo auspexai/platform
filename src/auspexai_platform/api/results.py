@@ -46,10 +46,13 @@ from auspexai_platform.db.repositories.attestations import (
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.receipts.attestation import (
     RESULT_SET_ALGORITHM_V1,
+    IncompleteAttestationSetError,
     ResultSetEntry,
+    assert_entries_cover_consensus,
     build_result_set_attestation,
     collect_result_set_entries,
     merkle_root,
+    receipt_map_from_per_job,
 )
 from auspexai_platform.receipts.repository import ReceiptRepository
 from auspexai_platform.receipts.signing import SigningKey
@@ -237,8 +240,12 @@ def build_router(
         return experiment
 
     def _receipt_map(experiment_id: str) -> dict[str, str]:
-        """{result_id: receipt_id} for the experiment (links each result to its
-        attestation)."""
+        """{result_id: receipt_id} from the control-DB receipt_index — a
+        DISPLAY CACHE for the list routes only. Anything that signs or claims
+        completeness (attestation builds, the evidence bundle) must use
+        `receipt_map_from_per_job` instead: the index write is best-effort at
+        issuance, so membership decided here can silently under-cover
+        (signature-scope finding, 2026-06-12)."""
         out: dict[str, str] = {}
         for entry in receipt_index_repository.list_for_experiment(experiment_id):
             if entry.result_id is not None:
@@ -264,7 +271,7 @@ def build_router(
         if per_job_db is None:
             return []
         entries = collect_result_set_entries(
-            per_job_db, receipt_id_by_result=_receipt_map(experiment_id)
+            per_job_db, receipt_id_by_result=receipt_map_from_per_job(per_job_db)
         )
         return [_unit_from_entry(e) for e in entries]
 
@@ -407,13 +414,47 @@ def build_router(
 
         # Only units that reached consensus (have a semantic_hash) AND have an
         # issued receipt are attested — a disagreed unit produced neither and is
-        # excluded. Pages through ALL consensus units (no silent cap).
+        # excluded. Pages through ALL consensus units (no silent cap); membership
+        # comes from the authoritative per-job receipts table, and the recount
+        # guard refuses to sign a set that diverges from it.
         entries: list[ResultSetEntry] = []
         per_job_db = per_job_factory.get(experiment_id)
         if per_job_db is not None:
             entries = collect_result_set_entries(
-                per_job_db, receipt_id_by_result=_receipt_map(experiment_id)
+                per_job_db, receipt_id_by_result=receipt_map_from_per_job(per_job_db)
             )
+            try:
+                assert_entries_cover_consensus(per_job_db, entries)
+            except IncompleteAttestationSetError as e:
+                audit_repository.append(
+                    actor_class=credential.kind,
+                    actor_identifier=credential.pubkey_hex,
+                    action="attestation.incomplete_set",
+                    resource_type="experiment",
+                    resource_id=experiment_id,
+                    payload={
+                        "missing_units": e.missing_units,
+                        "extra_units": e.extra_units,
+                        "partial": partial,
+                    },
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": {
+                            "code": "attestation_incomplete_set",
+                            "message": (
+                                "the collected attestation set diverges from the "
+                                "experiment's consensus set — refusing to sign a "
+                                "root narrower than the data"
+                            ),
+                            "details": {
+                                "missing_units": e.missing_units,
+                                "extra_units": e.extra_units,
+                            },
+                        }
+                    },
+                ) from e
 
         attestation = build_result_set_attestation(
             attestation_id=_generate_attestation_id(),
@@ -502,7 +543,10 @@ def build_router(
         experiment = _load_experiment_authz(experiment_id, credential)
         per_job_db = per_job_factory.get(experiment_id)
         consensus = _drain_consensus(per_job_db) if per_job_db is not None else []
-        rmap = _receipt_map(experiment_id)
+        # Bundle membership (which receipts ship, which result rows carry a
+        # receipt_id) is a completeness claim — source it from the per-job
+        # tables, not the best-effort index.
+        rmap = receipt_map_from_per_job(per_job_db) if per_job_db is not None else {}
         receipt_repo = ReceiptRepository(per_job_db) if per_job_db is not None else None
 
         results_out: list[dict[str, Any]] = []
@@ -567,13 +611,15 @@ def build_router(
             persisted = attestation_repository.get_final(experiment_id)
             if persisted is not None or per_job_db is None:
                 return persisted
+            lazy_entries = collect_result_set_entries(per_job_db, receipt_id_by_result=rmap)
+            # Same recount guard as the attestation route: never canonicalize
+            # a set that diverges from the consensus table.
+            assert_entries_cover_consensus(per_job_db, lazy_entries)
             built = build_result_set_attestation(
                 attestation_id=_generate_attestation_id(),
                 tenant_experiment_label=experiment.tenant_experiment_label,
                 tenant_id=experiment.tenant_id,
-                entries=collect_result_set_entries(
-                    per_job_db, receipt_id_by_result=_receipt_map(experiment_id)
-                ),
+                entries=lazy_entries,
                 signing_key=signing_key,
                 rekor_client=None,
                 partial=False,
@@ -596,7 +642,35 @@ def build_router(
             except DuplicateAttestationError:
                 return attestation_repository.get_final(experiment_id)
 
-        attestation_record = _get_or_persist_final_attestation()
+        try:
+            attestation_record = _get_or_persist_final_attestation()
+        except IncompleteAttestationSetError as e:
+            audit_repository.append(
+                actor_class=credential.kind,
+                actor_identifier=credential.pubkey_hex,
+                actor_tenant_id=credential.tenant_id,
+                action="attestation.incomplete_set",
+                resource_type="experiment",
+                resource_id=experiment_id,
+                payload={"missing_units": e.missing_units, "extra_units": e.extra_units},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "attestation_incomplete_set",
+                        "message": (
+                            "the attestation set diverges from the experiment's "
+                            "consensus set — refusing to canonicalize or sign "
+                            "custody over a root narrower than the data"
+                        ),
+                        "details": {
+                            "missing_units": e.missing_units,
+                            "extra_units": e.extra_units,
+                        },
+                    }
+                },
+            ) from e
         attestation_out: dict[str, Any] | None = None
         root_kind = "flat-v0"
         root = _result_set_root(consensus)
@@ -605,9 +679,7 @@ def build_router(
             # delivered. A mismatch means the per-job DB no longer reproduces
             # the canonical Rekor-anchored attestation — REFUSE to sign custody
             # (this is the at-rest tamper alarm, audited).
-            entries = collect_result_set_entries(
-                per_job_db, receipt_id_by_result=_receipt_map(experiment_id)
-            )
+            entries = collect_result_set_entries(per_job_db, receipt_id_by_result=rmap)
             version = 1 if attestation_record.algorithm == RESULT_SET_ALGORITHM_V1 else 0
             recomputed = merkle_root(entries, schema_version=version)
             if recomputed != attestation_record.merkle_root:
