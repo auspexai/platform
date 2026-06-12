@@ -34,6 +34,7 @@ other (HealthCheck.function_scoped_fixture).
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -172,6 +173,104 @@ class World:
         assert r.status_code == 201, r.text
         return {"priv": priv, "pub": pub, "id": r.json()["worker_id"]}
 
+    def soak(self) -> None:
+        """Pre-populate accumulated coordinator mess (nightly profile): six
+        experiments left in varied states — aborted with dangling assignments,
+        completed-and-finalized, paused with pending units — plus two busy
+        workers, so every Hypothesis example runs against a soaked DB instead
+        of a clean slate. Fully deterministic (no randomness): a failure under
+        soak reproduces. Every soak experiment ends in a state the scheduler
+        will NOT offer from (aborted/completed/paused), so the machine's own
+        workers never receive soak units."""
+        workers = [self.enroll_worker() for _ in range(2)]
+
+        def drain(exp_id: str) -> None:
+            # fetch+submit until the scheduler stops offering (trusted, N=1)
+            for _ in range(6):
+                offered = False
+                for w in workers:
+                    r = self.signed(
+                        "GET",
+                        f"/api/v0/workers/{w['id']}/assignments",
+                        privkey=w["priv"],
+                        pubkey_hex=w["pub"],
+                    )
+                    body = r.json()
+                    if not body.get("work_unit"):
+                        continue
+                    offered = True
+                    u = body["work_unit"]["unit_id"]
+                    self.signed(
+                        "POST",
+                        f"/api/v0/workers/{w['id']}/assignments/{u}/result",
+                        privkey=w["priv"],
+                        pubkey_hex=w["pub"],
+                        json_body={
+                            "unit_id": u,
+                            "worker_pubkey": w["pub"],
+                            "completed_at": "2026-06-11T12:00:00+00:00",
+                            "exit_code": 0,
+                            "payload": {"answer": u},
+                            "worker_signature": "ZmFrZS1zaWc=",
+                            "assignment_id": body["assignment_id"],
+                        },
+                    )
+                if not offered:
+                    return
+
+        for i in range(6):
+            label = f"soak-exp-{i}"
+            exp_id, manifest_hash = self.create_approved_experiment(label)
+            r = self.client.post(
+                f"/api/v0/experiments/{exp_id}/actions/set-integrity-policy",
+                headers=self.maintainer_headers,
+                json={"integrity_policy": "trusted", "reason": "soak fixture"},
+            )
+            assert r.status_code == 200, r.text
+            units = [f"soak-u{i}-{j}" for j in range(2)]
+            r = self.researcher(
+                "POST",
+                f"/api/v0/experiments/{exp_id}/work-units",
+                json_body={
+                    "work_units": [
+                        {
+                            "schema_version": "0.1",
+                            "unit_id": u,
+                            "tenant_id": "prop-tenant",
+                            "experiment_id": label,
+                            "manifest_sha256": manifest_hash,
+                            "created_at": "2026-06-11T00:00:00Z",
+                            "payload": {"q": u},
+                            "replication_target": 1,
+                        }
+                        for u in units
+                    ]
+                },
+            )
+            assert r.status_code == 201, r.text
+            if i % 3 == 0:
+                # dangling assignments into an abort (stale-state mess)
+                for w in workers:
+                    self.signed(
+                        "GET",
+                        f"/api/v0/workers/{w['id']}/assignments",
+                        privkey=w["priv"],
+                        pubkey_hex=w["pub"],
+                    )
+                r = self.researcher("POST", f"/api/v0/experiments/{exp_id}/actions/abort")
+                assert r.status_code == 200, r.text
+            elif i % 3 == 1:
+                # fully run: results + receipts + attestation-eligible history
+                drain(exp_id)
+                r = self.researcher(
+                    "POST", f"/api/v0/experiments/{exp_id}/actions/finalize-submissions"
+                )
+                assert r.status_code == 200, r.text
+            else:
+                # pending units parked behind a pause (no new assignments)
+                r = self.researcher("POST", f"/api/v0/experiments/{exp_id}/actions/pause")
+                assert r.status_code == 200, r.text
+
     def per_job_rows(self, exp_id: str, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         path = self.config.jobs_dir / f"{exp_id}.db"
         if not path.exists():
@@ -191,6 +290,8 @@ class ResultAcceptanceMachine(RuleBasedStateMachine):
     def __init__(self) -> None:
         super().__init__()
         self.w = World()
+        if os.environ.get("AUSPEXAI_PROPERTY_SOAK") == "1":
+            self.w.soak()
         self.exp_count = 0
         # exp_id -> {"label", "manifest_hash", "status", "units": {unit_id: target},
         #            "accepted": int, "consensus_snapshot": set | None}
@@ -468,6 +569,37 @@ class ResultAcceptanceMachine(RuleBasedStateMachine):
                     assert u["status"] == "completed"
 
     @invariant()
+    def attestation_covers_consensus(self) -> None:
+        # I7 (2026-06-12, from the signature-scope fix) — the served result-set
+        # attestation must cover EXACTLY the consensus-with-receipt set
+        # recomputed from the per-job DB. A narrower signed set was the 4th
+        # integrity bug (receipt_index-sourced membership); this keeps the
+        # recount continuously exercised rather than fixed-once.
+        for exp_id in self.exps:
+            if self._db_status(exp_id) != "completed":
+                continue
+            r = self.w.client.get(
+                f"/api/v0/experiments/{exp_id}/attestation",
+                headers=self.w.maintainer_headers,
+            )
+            assert r.status_code != 409, (
+                f"{exp_id}: attestation refused as incomplete_set: {r.text}"
+            )
+            if r.status_code != 200:
+                continue
+            expected = self.w.per_job_rows(
+                exp_id,
+                "SELECT COUNT(*) AS n FROM results r "
+                "WHERE r.is_consensus = 1 AND r.semantic_hash IS NOT NULL "
+                "  AND EXISTS (SELECT 1 FROM receipts rc "
+                "              WHERE rc.work_unit_ids_json LIKE '%\"' || r.unit_id || '\"%')",
+            )[0]["n"]
+            assert r.json()["unit_count"] == expected, (
+                f"{exp_id}: attestation unit_count {r.json()['unit_count']} != "
+                f"consensus-with-receipt count {expected}"
+            )
+
+    @invariant()
     def completed_consensus_is_frozen(self) -> None:
         # I5 — once completed, the consensus set never changes.
         for exp_id, e in self.exps.items():
@@ -489,11 +621,28 @@ class ResultAcceptanceMachine(RuleBasedStateMachine):
                 )
 
 
-ResultAcceptanceMachine.TestCase.settings = settings(
+# Depth profiles: "ci" (default) fits inside the normal suite; "nightly" is
+# the deep exploration (16x the state space) the systemd timer runs with
+# AUSPEXAI_PROPERTY_PROFILE=nightly + AUSPEXAI_PROPERTY_SOAK=1 (+ pytest
+# -o timeout=0 — the global 60s per-test cap would kill it). Hypothesis
+# persists shrunk failing examples in .hypothesis/ across runs.
+settings.register_profile(
+    "ci",
     max_examples=50,
     stateful_step_count=50,
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+)
+settings.register_profile(
+    "nightly",
+    max_examples=200,
+    stateful_step_count=200,
+    deadline=None,
+    print_blob=True,
+    suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+)
+ResultAcceptanceMachine.TestCase.settings = settings.get_profile(
+    os.environ.get("AUSPEXAI_PROPERTY_PROFILE", "ci")
 )
 TestResultAcceptanceProperties = ResultAcceptanceMachine.TestCase
 

@@ -197,10 +197,12 @@ class TestIssueReceiptsForCompletedUnit:
         signing_key = load_or_generate_signing_key(tmp_path / "k.pem")
         receipt_repo = ReceiptRepository(per_job_db)
         wu = _work_unit(replication_target=3)
+        # Distinct workers (the real replication shape; same-worker duplicate
+        # rows are deduped to one voice — see TestSameWorkerDedup).
         results = [
-            _result(result_id="r-1", payload={"answer": 42}),
-            _result(result_id="r-2", payload={"answer": 43}),  # disagree
-            _result(result_id="r-3", payload={"answer": 42}),
+            _result(result_id="r-1", worker_pubkey_hex="a" * 64, payload={"answer": 42}),
+            _result(result_id="r-2", worker_pubkey_hex="b" * 64, payload={"answer": 43}),
+            _result(result_id="r-3", worker_pubkey_hex="c" * 64, payload={"answer": 42}),
         ]
         outcome = issue_receipts_for_completed_unit(
             work_unit=wu,
@@ -296,3 +298,69 @@ class TestIssueReceiptsForCompletedUnit:
             receipt = decode_cbor(record.receipt_body_cbor)
             assert receipt.quorum_agreement.replication_factor == 5
             assert receipt.quorum_agreement.agreeing_workers == 5
+
+
+class TestSameWorkerDedup:
+    """Audit 2026-06-12 side-finding: `agreeing_workers` is a signed quorum
+    claim — a duplicated same-worker result row (unreachable via the API:
+    assignments UNIQUE(unit_id, worker_id) + result_already_submitted 409, but
+    possible via direct DB write or a future regression) must count one voice
+    and earn one receipt."""
+
+    def test_duplicate_same_worker_results_count_once(
+        self, tmp_path: Path, per_job_db: Database
+    ) -> None:
+        signing_key = load_or_generate_signing_key(tmp_path / "k.pem")
+        receipt_repo = ReceiptRepository(per_job_db)
+        wu = _work_unit(replication_target=2)
+        results = [
+            _result(result_id="r-1", worker_id="wkr-a", worker_pubkey_hex="a" * 64),
+            _result(result_id="r-1-dup", worker_id="wkr-a", worker_pubkey_hex="a" * 64),
+            _result(result_id="r-2", worker_id="wkr-b", worker_pubkey_hex="b" * 64),
+        ]
+        outcome = issue_receipts_for_completed_unit(
+            work_unit=wu,
+            experiment=_experiment(),
+            results=results,
+            receipt_repo=receipt_repo,
+            signing_key=signing_key,
+        )
+        assert outcome.agreement.agreed is True
+        assert outcome.agreement.agreeing_workers == 2  # not 3
+        assert len(outcome.issued_receipt_ids) == 2  # one per WORKER, not per row
+
+    def test_duplicate_disagreeing_row_from_same_worker_cannot_block_quorum(
+        self, tmp_path: Path, per_job_db: Database
+    ) -> None:
+        """The first (earliest-completed) row per worker is the worker's voice;
+        a later divergent duplicate is ignored rather than poisoning agreement."""
+        signing_key = load_or_generate_signing_key(tmp_path / "k.pem")
+        receipt_repo = ReceiptRepository(per_job_db)
+        wu = _work_unit(replication_target=2)
+        early = datetime(2026, 5, 22, 10, 0, tzinfo=UTC)
+        late = datetime(2026, 5, 22, 11, 0, tzinfo=UTC)
+        results = [
+            _result(
+                result_id="r-1",
+                worker_id="wkr-a",
+                worker_pubkey_hex="a" * 64,
+                completed_at=early,
+            ),
+            _result(
+                result_id="r-1-dup",
+                worker_id="wkr-a",
+                worker_pubkey_hex="a" * 64,
+                payload={"answer": 999},
+                completed_at=late,
+            ),
+            _result(result_id="r-2", worker_id="wkr-b", worker_pubkey_hex="b" * 64),
+        ]
+        outcome = issue_receipts_for_completed_unit(
+            work_unit=wu,
+            experiment=_experiment(),
+            results=results,
+            receipt_repo=receipt_repo,
+            signing_key=signing_key,
+        )
+        assert outcome.agreement.agreed is True
+        assert outcome.agreement.agreeing_workers == 2

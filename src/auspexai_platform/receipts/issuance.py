@@ -160,6 +160,27 @@ def issue_receipts_for_completed_unit(
     standpoint; missing receipts can be re-issued by a sweep job later
     if needed.
     """
+    # Defense-in-depth (audit 2026-06-12): one voice per worker. The API path
+    # already makes duplicates unreachable (assignments UNIQUE(unit_id,
+    # worker_id) + result_already_submitted 409), but `agreeing_workers` is a
+    # signed quorum claim — never let a duplicated row (direct DB write, future
+    # regression) double-count a worker or mint it two receipts.
+    seen_workers: set[str] = set()
+    deduped: list[Result] = []
+    for r in sorted(results, key=lambda r: (r.completed_at, r.result_id)):
+        key = r.worker_pubkey_hex.lower()
+        if key in seen_workers:
+            logger.warning(
+                "unit %s: duplicate result %s from worker %s ignored for quorum",
+                work_unit.unit_id,
+                r.result_id,
+                key[:16],
+            )
+            continue
+        seen_workers.add(key)
+        deduped.append(r)
+    results = deduped
+
     outcome = hash_agreement_reducer(results)
     if not outcome.agreed:
         logger.warning(

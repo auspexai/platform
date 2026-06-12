@@ -15,3 +15,11 @@ lint:
 
 test:
 	.venv/bin/pytest -v
+
+# Deep property exploration (reviewer rec): 200x200 Hypothesis state machine
+# against a soaked DB. Run nightly by auspexai-property-nightly.timer on rage;
+# -o timeout=0 lifts the global 60s per-test cap (this single test runs for
+# tens of minutes by design).
+property-nightly:
+	AUSPEXAI_PROPERTY_PROFILE=nightly AUSPEXAI_PROPERTY_SOAK=1 \
+	.venv/bin/pytest tests/test_integrity_properties.py -q -o timeout=0
