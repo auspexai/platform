@@ -165,15 +165,38 @@ class TenantApplicationRepository:
                 )
                 if cur.rowcount == 0:
                     raise ApplicationNotPendingError(application_id)
+                # Carry the application's metadata into the tenant record —
+                # the applicant already said who they are; discarding it left
+                # operators staring at placeholder rows (researcher-#0 finding,
+                # 2026-06-12). contact_email stays NULL (never collected); the
+                # GitHub login is the public contact handle.
+                description_parts = []
+                if application.research_classes:
+                    description_parts.append(
+                        "Research classes: " + ", ".join(application.research_classes) + "."
+                    )
+                if application.research_summary:
+                    description_parts.append(application.research_summary)
+                display_name = application.contact_name
+                if application.affiliation and application.affiliation != application.contact_name:
+                    display_name = f"{application.contact_name} ({application.affiliation})"
                 cur.execute(
                     """
                     INSERT INTO tenants (
                         tenant_id, maintainer_pubkey, display_name,
                         contact_email, contact_public, description,
                         account_id, registered_at, revision
-                    ) VALUES (?, ?, NULL, NULL, NULL, NULL, ?, ?, 1)
+                    ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 1)
                     """,
-                    (tenant_id, application.pubkey_hex.lower(), application.account_id, now),
+                    (
+                        tenant_id,
+                        application.pubkey_hex.lower(),
+                        display_name or None,
+                        f"github:{application.github_login}" if application.github_login else None,
+                        " ".join(description_parts) or None,
+                        application.account_id,
+                        now,
+                    ),
                 )
         except sqlite3.IntegrityError as e:
             raise DuplicateTenantError(str(e)) from e

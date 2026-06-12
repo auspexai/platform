@@ -482,6 +482,11 @@ def test_approve_creates_tenant_binds_key_and_links_account(
     assert tenant is not None
     assert tenant.maintainer_pubkey == applied["pubkey_hex"]
     assert tenant.account_id == account.account_id
+    # The application's metadata is carried into the tenant record (operators
+    # were seeing placeholder rows — researcher-#0 finding, 2026-06-12).
+    assert tenant.display_name == "Vigiles Dev (Independent — drift-probe research)"
+    assert tenant.contact_public == "github:vigiles-dev"
+    assert "drift probes" in (tenant.description or "")
 
     # End-to-end: the applying key now resolves as a live researcher credential.
     r = _signed_get(
