@@ -42,6 +42,11 @@ from __future__ import annotations
 import re
 from typing import Literal
 
+import gzip
+import io
+import json
+import tarfile
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -268,10 +273,44 @@ def build_router(
                 "package_not_found",
                 "the pinned package has not been uploaded",
             )
-        return FileResponse(
-            blob_path,
+        # Inject the manifest into the served archive. The stored blob
+        # deliberately contains ONLY digest-covered files (one package, many
+        # manifests may pin it), but the worker's verifier requires a
+        # top-level manifest.json beside the code — under operator staging it
+        # always rode along (the gap that refused the first live #40a run).
+        # Injection is digest-neutral (manifests are excluded from
+        # compute_package_digest) and trust-neutral: the worker independently
+        # re-verifies hash_manifest(manifest.json) == the dispatch pin AND
+        # the package digest over the remaining tree.
+        composite = io.BytesIO()
+        with (
+            gzip.open(blob_path, "rb") as src_gz,
+            tarfile.open(fileobj=src_gz, mode="r|") as src_tar,
+            gzip.GzipFile(fileobj=composite, mode="wb", mtime=0) as out_gz,
+            tarfile.open(fileobj=out_gz, mode="w", format=tarfile.PAX_FORMAT) as out_tar,
+        ):
+            for member in src_tar:
+                out_tar.addfile(member, src_tar.extractfile(member))
+            manifest_bytes = json.dumps(
+                record.manifest_json, sort_keys=True, separators=(",", ":")
+            ).encode()
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(manifest_bytes)
+            info.mode = 0o644
+            out_tar.addfile(info, io.BytesIO(manifest_bytes))
+            sig_bytes = json.dumps(
+                record.signature_json, sort_keys=True, separators=(",", ":")
+            ).encode()
+            sig_info = tarfile.TarInfo("manifest.json.sig")
+            sig_info.size = len(sig_bytes)
+            sig_info.mode = 0o644
+            out_tar.addfile(sig_info, io.BytesIO(sig_bytes))
+        return Response(
+            content=composite.getvalue(),
             media_type="application/gzip",
-            filename=f"{pin.lower()}.tar.gz",
+            headers={
+                "Content-Disposition": f'attachment; filename="{pin.lower()}.tar.gz"'
+            },
         )
 
     return router

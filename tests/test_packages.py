@@ -497,7 +497,14 @@ def test_fetch_by_manifest_resolves_pin(
     )
     assert r.status_code == 200, r.text
     assert r.headers["content-type"] == "application/gzip"
-    assert r.content == _tar_gz(PKG_BODY_TREE)
+    # Served archive = stored blob + injected manifest(.sig) — not byte-equal
+    # to the upload; the digest-covered members must ride through untouched.
+    import io as _io
+    import tarfile as _tarfile
+
+    with _tarfile.open(fileobj=_io.BytesIO(r.content), mode="r:gz") as tar:
+        for name, content in PKG_BODY_TREE.items():
+            assert tar.extractfile(name).read() == content
 
 
 def test_fetch_by_manifest_unknown_404(client: TestClient, enrolled_worker) -> None:
@@ -510,3 +517,51 @@ def test_fetch_by_manifest_unknown_404(client: TestClient, enrolled_worker) -> N
     )
     assert r.status_code == 404
     assert r.json()["detail"]["error"]["code"] == "package_not_found"
+
+
+def test_fetch_by_manifest_injects_manifest(
+    client: TestClient, registered_tenant, enrolled_worker, manifest_repository
+) -> None:
+    """The served archive must carry the manifest beside the code: the blob
+    deliberately holds only digest-covered files, but the worker's verifier
+    needs a top-level manifest.json (the gap that refused the second live
+    #40a attempt). Injection is digest-neutral and worker-verifiable."""
+    import io as _io
+    import tarfile as _tarfile
+
+    _upload_pkg(client, registered_tenant)
+    _, binding = registered_tenant
+    manifest = manifest_repository.insert(
+        tenant_id=binding.tenant_id,
+        manifest_json={
+            "tenant_id": binding.tenant_id,
+            "experiment_id": "inject-test",
+            "executor": {"package_sha256": PKG_DIGEST},
+        },
+        signature_json={"alg": "ed25519", "sig": "opaque"},
+    )
+    worker_priv, worker = enrolled_worker
+    r = _signed_fetch_path(
+        client,
+        privkey=worker_priv,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/packages/by-manifest/{manifest.manifest_hash}",
+    )
+    assert r.status_code == 200, r.text
+    with _tarfile.open(fileobj=_io.BytesIO(r.content), mode="r:gz") as tar:
+        names = tar.getnames()
+        assert "manifest.json" in names
+        assert "manifest.json.sig" in names
+        # The original digest-covered files ride along untouched.
+        for expected in PKG_BODY_TREE:
+            assert expected in names
+        import json as _json
+
+        body = _json.loads(tar.extractfile("manifest.json").read())
+        assert body["executor"]["package_sha256"] == PKG_DIGEST
+        # Injection preserves the manifest's canonical hash — the worker's
+        # hash_manifest check against the dispatch pin must still pass.
+        canonical = _json.dumps(body, sort_keys=True, separators=(",", ":"))
+        import hashlib as _hashlib
+
+        assert _hashlib.sha256(canonical.encode()).hexdigest() == manifest.manifest_hash
