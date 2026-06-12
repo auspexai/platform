@@ -42,6 +42,7 @@ from auspexai_platform.api import releases as release_routes
 from auspexai_platform.api import results as results_routes
 from auspexai_platform.api import scheduler as scheduler_routes
 from auspexai_platform.api import software_requests as software_request_routes
+from auspexai_platform.api import tenant_applications as tenant_application_routes
 from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.api import work_units as work_unit_routes
 from auspexai_platform.api import workers as worker_routes
@@ -66,6 +67,7 @@ from auspexai_platform.db.repositories import (
     ResultTransferRepository,
     RetiredKeyRepository,
     SoftwareRequestRepository,
+    TenantApplicationRepository,
     TenantRepository,
     WorkerRepository,
 )
@@ -123,6 +125,7 @@ def create_app(
     model_request_repository = ModelRequestRepository(db)
     model_prestage_repository = ModelPrestageRepository(db)
     software_request_repository = SoftwareRequestRepository(db)
+    tenant_application_repository = TenantApplicationRepository(db)
     release_repository = ReleaseRepository(db)
     from auspexai_platform.db.repositories.vouches import VouchRepository
 
@@ -371,6 +374,20 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["software-requests"],
+    )
+    # Researcher onboarding (Option D): GitHub-verified, proof-of-possession-
+    # signed tenant applications + the maintainer review queue.
+    app.include_router(
+        tenant_application_routes.build_router(
+            credential_dep,
+            tenant_application_repository,
+            account_repository,
+            audit_repository,
+            identity_verifier,
+            event_bus=event_bus,
+        ),
+        prefix="/api/v0",
+        tags=["tenant-applications"],
     )
     app.include_router(
         release_routes.build_router(
