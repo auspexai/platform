@@ -110,6 +110,16 @@ ignore = [
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 asyncio_mode = "auto"
+markers = [
+    # Writes ONE throwaway entry to the PUBLIC rekor.sigstore.dev log and
+    # round-trips it. Opt-in (skipped unless AUSPEXAI_LIVE_REKOR=1) — run as a
+    # RELEASE-CHECKLIST step before tagging:
+    #     AUSPEXAI_LIVE_REKOR=1 uv run pytest -m live_rekor
+    # Rationale: the mock-vs-live bug class (rekord-kind discovery 2026-06-09,
+    # executor-harness seam 2026-06-08) — mocks encode our beliefs about the
+    # other side; one real entry per release checks the beliefs.
+    "live_rekor: writes a throwaway entry to public Rekor (opt-in, release checklist)",
+]
 # Per-test wall-clock cap (pytest-timeout). Generous for the slowest real test
 # (~a couple seconds) but well under a hang. `thread` method works without
 # signal support and interrupts blocked C/await calls.
