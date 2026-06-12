@@ -39,13 +39,12 @@ slowapi/future-annotations gotcha doesn't apply to this module.)
 
 from __future__ import annotations
 
-import re
-from typing import Literal
-
 import gzip
 import io
 import json
+import re
 import tarfile
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse
@@ -308,9 +307,7 @@ def build_router(
         return Response(
             content=composite.getvalue(),
             media_type="application/gzip",
-            headers={
-                "Content-Disposition": f'attachment; filename="{pin.lower()}.tar.gz"'
-            },
+            headers={"Content-Disposition": f'attachment; filename="{pin.lower()}.tar.gz"'},
         )
 
     return router
