@@ -12,9 +12,10 @@ override. See `0028_tenant_applications.sql` for the state model.
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from auspexai_platform.db.database import Database
@@ -46,6 +47,9 @@ class TenantApplication:
     resolved_by: str | None
     resolution_reason: str | None
     created_tenant_id: str | None
+    # Validated §11 research-class ids (migration 0029). NULL in the DB
+    # (pre-0029 rows / summary-only applications) surfaces as [].
+    research_classes: list[str] = field(default_factory=list)
 
 
 class TenantApplicationRepository:
@@ -62,6 +66,7 @@ class TenantApplicationRepository:
         affiliation: str,
         research_summary: str,
         pubkey_hex: str,
+        research_classes: list[str] | None = None,
     ) -> TenantApplication:
         application_id = _generate_application_id()
         created_at = datetime.now(UTC).isoformat()
@@ -70,8 +75,8 @@ class TenantApplicationRepository:
             INSERT INTO tenant_applications (
                 application_id, account_id, github_login, requested_tenant_id,
                 contact_name, affiliation, research_summary, pubkey_hex,
-                status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                status, created_at, research_classes_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
             (
                 application_id,
@@ -83,6 +88,7 @@ class TenantApplicationRepository:
                 research_summary,
                 pubkey_hex.lower(),
                 created_at,
+                json.dumps(research_classes) if research_classes else None,
             ),
         )
         got = self.get_by_id(application_id)
@@ -216,4 +222,7 @@ class TenantApplicationRepository:
             resolved_by=row["resolved_by"],
             resolution_reason=row["resolution_reason"],
             created_tenant_id=row["created_tenant_id"],
+            research_classes=(
+                json.loads(row["research_classes_json"]) if row["research_classes_json"] else []
+            ),
         )

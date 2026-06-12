@@ -236,6 +236,127 @@ def test_submit_validates_field_lengths(
     assert r.status_code == 422
 
 
+# ---- research classes (migration 0029) ----------------------------------------
+
+
+def test_submit_with_research_classes_stores_and_returns_them(
+    client: TestClient,
+    identity_verifier,
+    applicant_keypair,
+    application_repository,
+    maintainer_token,
+) -> None:
+    identity_verifier.register(_GH_TOKEN, _GH_CLAIM)
+    priv, pub = applicant_keypair
+    r = _signed_post(
+        client,
+        privkey=priv,
+        pubkey_hex=pub,
+        path=APPLY_PATH,
+        body=_apply_body(research_classes=["behavioral_drift", "eval_sweeps"]),
+    )
+    assert r.status_code == 201, r.text
+
+    # Stored on the row (alongside the summary)...
+    row = application_repository.get_by_id(r.json()["application_id"])
+    assert row.research_classes == ["behavioral_drift", "eval_sweeps"]
+    assert row.research_summary  # summary still stored when both are given
+
+    # ...and surfaced on the maintainer queue.
+    apps = client.get(APPLY_PATH, headers=_mtnr(maintainer_token)).json()["applications"]
+    assert apps[0]["research_classes"] == ["behavioral_drift", "eval_sweeps"]
+
+
+def test_submit_unknown_research_class_422(
+    client: TestClient, identity_verifier, applicant_keypair
+) -> None:
+    identity_verifier.register(_GH_TOKEN, _GH_CLAIM)
+    priv, pub = applicant_keypair
+    r = _signed_post(
+        client,
+        privkey=priv,
+        pubkey_hex=pub,
+        path=APPLY_PATH,
+        body=_apply_body(research_classes=["behavioral_drift", "weight_exfiltration"]),
+    )
+    assert r.status_code == 422
+    assert "weight_exfiltration" in r.text  # the message names the offender
+
+
+def test_submit_neither_classes_nor_summary_422(
+    client: TestClient, identity_verifier, applicant_keypair
+) -> None:
+    identity_verifier.register(_GH_TOKEN, _GH_CLAIM)
+    priv, pub = applicant_keypair
+    # Summary key absent entirely, no classes.
+    body = _apply_body()
+    del body["research_summary"]
+    r = _signed_post(client, privkey=priv, pubkey_hex=pub, path=APPLY_PATH, body=body)
+    assert r.status_code == 422
+    assert "at least one of" in r.text
+    # Empty-string summary + empty class list is equally rejected.
+    r = _signed_post(
+        client,
+        privkey=priv,
+        pubkey_hex=pub,
+        path=APPLY_PATH,
+        body=_apply_body(research_summary="", research_classes=[]),
+    )
+    assert r.status_code == 422
+
+
+def test_submit_classes_only_ok(
+    client: TestClient,
+    identity_verifier,
+    applicant_keypair,
+    application_repository,
+    maintainer_token,
+) -> None:
+    identity_verifier.register(_GH_TOKEN, _GH_CLAIM)
+    priv, pub = applicant_keypair
+    body = _apply_body(research_classes=["quantization_effects", "other"])
+    del body["research_summary"]
+    r = _signed_post(client, privkey=priv, pubkey_hex=pub, path=APPLY_PATH, body=body)
+    assert r.status_code == 201, r.text
+    row = application_repository.get_by_id(r.json()["application_id"])
+    assert row.research_classes == ["quantization_effects", "other"]
+    assert row.research_summary == ""  # 0028 NOT NULL column: '' = omitted
+
+    apps = client.get(APPLY_PATH, headers=_mtnr(maintainer_token)).json()["applications"]
+    assert apps[0]["research_classes"] == ["quantization_effects", "other"]
+    assert apps[0]["research_summary"] == ""
+
+
+def test_submit_summary_only_backward_compat(
+    client: TestClient, identity_verifier, applicant_keypair, maintainer_token
+) -> None:
+    """The pre-0029 body shape (no research_classes key) still 201s and the
+    maintainer view surfaces research_classes as []."""
+    identity_verifier.register(_GH_TOKEN, _GH_CLAIM)
+    priv, pub = applicant_keypair
+    r = _signed_post(client, privkey=priv, pubkey_hex=pub, path=APPLY_PATH, body=_apply_body())
+    assert r.status_code == 201, r.text
+    apps = client.get(APPLY_PATH, headers=_mtnr(maintainer_token)).json()["applications"]
+    assert apps[0]["research_classes"] == []
+
+
+def test_submit_research_classes_deduped(
+    client: TestClient, identity_verifier, applicant_keypair, application_repository
+) -> None:
+    identity_verifier.register(_GH_TOKEN, _GH_CLAIM)
+    priv, pub = applicant_keypair
+    r = _signed_post(
+        client,
+        privkey=priv,
+        pubkey_hex=pub,
+        path=APPLY_PATH,
+        body=_apply_body(research_classes=["other", "behavioral_drift", "other"]),
+    )
+    assert r.status_code == 201, r.text
+    row = application_repository.get_by_id(r.json()["application_id"])
+    assert row.research_classes == ["other", "behavioral_drift"]  # order-preserving dedupe
+
+
 def test_submit_rate_limited_per_ip(client: TestClient) -> None:
     """10/hour per IP on the submit route. Unsigned requests 401 inside the
     handler but still consume the bucket, so the 11th earns 429."""

@@ -39,7 +39,7 @@ import secrets
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.errors import AuthError
@@ -64,6 +64,24 @@ from auspexai_platform.oauth import (
 )
 from auspexai_platform.rate_limit import limiter
 
+# ---- research-class taxonomy --------------------------------------------------
+
+# The §11 research-envelope enabled-today classes. An application may declare
+# which of these its work falls under (validated, deduplicated); `other` is
+# the deliberate escape hatch for work the envelope does not yet name.
+RESEARCH_CLASSES: tuple[str, ...] = (
+    "behavioral_drift",
+    "eval_sweeps",
+    "refusal_boundary_mapping",
+    "cross_model_comparison",
+    "quantization_effects",
+    "prompt_sensitivity",
+    "other",
+)
+
+_RESEARCH_CLASS_SET = frozenset(RESEARCH_CLASSES)
+
+
 # ---- request / response models ----------------------------------------------
 
 
@@ -74,7 +92,33 @@ class TenantApplicationCreate(BaseModel):
     requested_tenant_id: str = Field(min_length=1, max_length=64)
     contact_name: str = Field(min_length=1, max_length=200)
     affiliation: str = Field(min_length=1, max_length=200)
-    research_summary: str = Field(min_length=1, max_length=4000)
+    research_summary: str | None = Field(default=None, max_length=4000)
+    research_classes: list[str] = Field(
+        default_factory=list,
+        description=f"Structured research classes; each must be one of {RESEARCH_CLASSES}",
+    )
+
+    @field_validator("research_classes")
+    @classmethod
+    def _validate_research_classes(cls, v: list[str]) -> list[str]:
+        unknown = [c for c in v if c not in _RESEARCH_CLASS_SET]
+        if unknown:
+            raise ValueError(
+                f"unknown research class(es) {unknown!r}; valid classes: {list(RESEARCH_CLASSES)}"
+            )
+        deduped = list(dict.fromkeys(v))  # order-preserving dedupe
+        if len(deduped) > len(RESEARCH_CLASSES):  # pragma: no cover — taxonomy-bounded
+            raise ValueError(f"at most {len(RESEARCH_CLASSES)} research classes")
+        return deduped
+
+    @model_validator(mode="after")
+    def _require_classes_or_summary(self) -> "TenantApplicationCreate":
+        if not self.research_classes and not self.research_summary:
+            raise ValueError(
+                "at least one of research_classes (non-empty list) or "
+                "research_summary (non-empty string) is required"
+            )
+        return self
 
 
 class TenantApplicationSubmitResponse(BaseModel):
@@ -98,6 +142,7 @@ class TenantApplicationResponse(BaseModel):
     contact_name: str
     affiliation: str
     research_summary: str
+    research_classes: list[str]
     pubkey_hex: str
     status: str
     created_at: datetime
@@ -210,6 +255,7 @@ def _to_response(a: TenantApplication) -> TenantApplicationResponse:
         contact_name=a.contact_name,
         affiliation=a.affiliation,
         research_summary=a.research_summary,
+        research_classes=a.research_classes,
         pubkey_hex=a.pubkey_hex,
         status=a.status,
         created_at=a.created_at,
@@ -332,8 +378,10 @@ def build_router(
             requested_tenant_id=body.requested_tenant_id,
             contact_name=body.contact_name,
             affiliation=body.affiliation,
-            research_summary=body.research_summary,
+            # The 0028 column is NOT NULL; '' = summary omitted (classes-only).
+            research_summary=body.research_summary or "",
             pubkey_hex=pubkey_hex,
+            research_classes=body.research_classes,
         )
         audit_repository.append(
             actor_class=CredentialClass.ANONYMOUS,
