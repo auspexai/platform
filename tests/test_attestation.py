@@ -117,20 +117,14 @@ def test_v1_leaves_bind_the_unit_payload_hash():
     assert merkle_root(a, schema_version=1) != merkle_root(b, schema_version=1)
     assert merkle_root(a) == merkle_root(b)  # v0: input hash not in the leaf
     # environment is predicate metadata, NEVER leaf material — same root.
-    c = [
-        ResultSetEntry(
-            "u1", "h1", "r1", unit_payload_sha256="aa" * 32, environment={"x": 1}
-        )
-    ]
+    c = [ResultSetEntry("u1", "h1", "r1", unit_payload_sha256="aa" * 32, environment={"x": 1})]
     assert merkle_root(a, schema_version=1) == merkle_root(c, schema_version=1)
 
 
 def test_unit_payload_sha256_is_canonical():
     """The input-hash convention is over the canonical re-serialization, so
     storage formatting differences don't change the hash."""
-    assert unit_payload_sha256('{"b": 1, "a": 2}') == unit_payload_sha256(
-        '{"a":2,"b":1}'
-    )
+    assert unit_payload_sha256('{"b": 1, "a": 2}') == unit_payload_sha256('{"a":2,"b":1}')
 
 
 def test_build_attestation_signature_rejects_wrong_key(tmp_path: Path):

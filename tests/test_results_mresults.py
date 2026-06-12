@@ -226,8 +226,14 @@ class TestExportBundle:
         assert experiment_repository.get_by_id(experiment.experiment_id).results_collected_at
 
     def _seed_receipted_unit(
-        self, per_job_factory, receipt_index_repository, experiment_id, *,
-        unit_id, payload, worker_id,
+        self,
+        per_job_factory,
+        receipt_index_repository,
+        experiment_id,
+        *,
+        unit_id,
+        payload,
+        worker_id,
     ):
         _repo, results = _seed_unit(
             per_job_factory, experiment_id, unit_id=unit_id, payloads=[payload]
@@ -263,9 +269,7 @@ class TestExportBundle:
                 payload={"v": i},
                 worker_id=worker.worker_id,
             )
-        experiment_repository.update_status(
-            experiment.experiment_id, ExperimentStatus.COMPLETED
-        )
+        experiment_repository.update_status(experiment.experiment_id, ExperimentStatus.COMPLETED)
         resp = _signed_get(
             client,
             privkey=privkey,
@@ -313,9 +317,7 @@ class TestExportBundle:
             payload={"v": 1},
             worker_id=worker.worker_id,
         )
-        experiment_repository.update_status(
-            experiment.experiment_id, ExperimentStatus.COMPLETED
-        )
+        experiment_repository.update_status(experiment.experiment_id, ExperimentStatus.COMPLETED)
         # First export persists the canonical attestation.
         ok = _signed_get(
             client,
@@ -365,9 +367,7 @@ class TestExportBundle:
         )
         assert resp.status_code == 200, resp.text
         bundle = resp.json()
-        assert {r["unit_id"] for r in bundle["consensus_results"]} == {
-            f"u{i}" for i in range(5)
-        }
+        assert {r["unit_id"] for r in bundle["consensus_results"]} == {f"u{i}" for i in range(5)}
         # The signed custody root must cover the FULL set, not the first page.
         items = sorted(
             (r["unit_id"], r.get("semantic_hash") or "") for r in bundle["consensus_results"]

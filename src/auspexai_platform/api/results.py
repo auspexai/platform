@@ -634,9 +634,7 @@ def build_router(
                                 "canonical attestation's merkle root — refusing to "
                                 "sign custody over a set that fails verification"
                             ),
-                            "details": {
-                                "attestation_id": attestation_record.attestation_id
-                            },
+                            "details": {"attestation_id": attestation_record.attestation_id},
                         }
                     },
                 )
@@ -719,9 +717,7 @@ def build_router(
                 "result_set_root": root,
                 "root_kind": root_kind,
                 "attestation_id": (
-                    attestation_record.attestation_id
-                    if attestation_record is not None
-                    else None
+                    attestation_record.attestation_id if attestation_record is not None else None
                 ),
                 "collected_at": collected_at.isoformat(),
                 "collected_by_pubkey": collected_by,

@@ -261,7 +261,5 @@ class ResultRepository:
             delivered_at=_dt(row["delivered_at"]),
             payload_expires_at=_dt(row["payload_expires_at"]),
             payload_aged_off_at=_dt(row["payload_aged_off_at"]),
-            environment=(
-                json.loads(row["environment_json"]) if row["environment_json"] else None
-            ),
+            environment=(json.loads(row["environment_json"]) if row["environment_json"] else None),
         )
