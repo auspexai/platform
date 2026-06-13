@@ -250,3 +250,37 @@ def test_assessment_queue_filter(
     auto_q = client.get("/api/v0/experiments?assessment=auto", headers=_hdr(maintainer_token))
     ids = {e["experiment_id"] for e in auto_q.json()["experiments"]}
     assert auto.experiment_id in ids and rev.experiment_id not in ids
+
+
+def test_assessment_provenance_on_list_and_detail(
+    client: TestClient,
+    maintainer_token,
+    account_repository,
+    tenant_repository,
+    manifest_repository,
+    experiment_repository,
+):
+    """#48 inc 3: the assessment verdict + provenance surface on the experiment
+    list (the console queues) and detail (the R-D lifecycle timeline)."""
+    _t2_tenant(account_repository, tenant_repository, "prov-lab")
+    exp = _submit_exp(
+        manifest_repository,
+        experiment_repository,
+        tenant_id="prov-lab",
+        label="prov-1",
+        research_class="behavioral_drift",
+    )
+    _assess(client, exp.experiment_id, maintainer_token)
+
+    rows = client.get("/api/v0/experiments", headers=_hdr(maintainer_token)).json()["experiments"]
+    row = next(e for e in rows if e["experiment_id"] == exp.experiment_id)
+    assert row["assessment_decision"] == "auto"
+    assert row["research_class"] == "behavioral_drift"
+    assert row["assessment_rationale"]
+    assert row["assessment_tier"] == 2
+
+    detail = client.get(
+        f"/api/v0/experiments/{exp.experiment_id}", headers=_hdr(maintainer_token)
+    ).json()
+    assert detail["assessment_decision"] == "auto"
+    assert detail["assessment_envelope"]  # the per-check list for the timeline/queue

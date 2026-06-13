@@ -104,6 +104,18 @@ class ExperimentResponse(BaseModel):
     raw_payload_ttl_days: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     consensus_ttl_days: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     raw_payload_age_off_at: Annotated[datetime | None, ExposureTag.OPERATOR_ONLY] = None
+    # §9 #48 admission-assessment provenance — the lifecycle-timeline (R-D) +
+    # review/auto-queue (console) inputs. TENANT_SCOPED: the owning tenant sees
+    # its OWN verdicts (ratified transparency = outcome + envelope always,
+    # rationale own-only) and the maintainer sees all. `assessed_by` (which
+    # maintainer/agent decided) is operator audit detail, not the tenant's.
+    research_class: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
+    assessment_decision: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
+    assessment_tier: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
+    assessment_rationale: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
+    assessment_envelope: Annotated[list[dict[str, Any]] | None, ExposureTag.TENANT_SCOPED] = None
+    assessed_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
+    assessed_by: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
 
 
 class ExperimentListResponse(BaseModel):
@@ -177,6 +189,13 @@ def _to_response(experiment) -> ExperimentResponse:
         raw_payload_ttl_days=getattr(experiment, "raw_payload_ttl_days", None),
         consensus_ttl_days=getattr(experiment, "consensus_ttl_days", None),
         raw_payload_age_off_at=projected_raw_age_off(experiment),
+        research_class=getattr(experiment, "research_class", None),
+        assessment_decision=getattr(experiment, "assessment_decision", None),
+        assessment_tier=getattr(experiment, "assessment_tier", None),
+        assessment_rationale=getattr(experiment, "assessment_rationale", None),
+        assessment_envelope=getattr(experiment, "assessment_envelope", None),
+        assessed_at=getattr(experiment, "assessed_at", None),
+        assessed_by=getattr(experiment, "assessed_by", None),
     )
 
 
