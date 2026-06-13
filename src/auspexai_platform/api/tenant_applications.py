@@ -132,6 +132,12 @@ class TenantApplicationCreate(BaseModel):
 class TenantApplicationSubmitResponse(BaseModel):
     application_id: str
     status: str
+    # #6 applicant-side multiplicity heads-up: tenant_ids the applicant's account
+    # already operates. Multi-tenancy is ALLOWED (§6.9 — review is the gate), so
+    # this is informational, not a block: the CLI warns that the application
+    # requests an ADDITIONAL tenant so an accidental second application is caught
+    # immediately (while it is still only pending). Empty for a first tenant.
+    account_existing_tenants: list[str] = Field(default_factory=list)
 
 
 class ApproveRequest(BaseModel):
@@ -424,8 +430,13 @@ def build_router(
                 "status": application.status,
             },
         )
+        existing_tenants = [
+            t.tenant_id for t in tenant_repository.list_for_account(account.account_id)
+        ]
         return TenantApplicationSubmitResponse(
-            application_id=application.application_id, status=application.status
+            application_id=application.application_id,
+            status=application.status,
+            account_existing_tenants=existing_tenants,
         )
 
     # NB: /mine is declared before any /{application_id} matcher would be —

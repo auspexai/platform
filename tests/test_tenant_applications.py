@@ -674,3 +674,42 @@ def test_mine_does_not_carry_account_existing_tenants(client: TestClient, applie
     assert r.status_code == 200
     for row in r.json()["applications"]:
         assert "account_existing_tenants" not in row
+
+
+# ---- #6: applicant-side multiplicity heads-up -------------------------------
+
+
+def test_submit_first_tenant_has_no_existing(applied: dict) -> None:
+    """A first application surfaces an empty existing-tenants list."""
+    assert applied["account_existing_tenants"] == []
+
+
+def test_submit_surfaces_existing_account_tenants(
+    client: TestClient,
+    identity_verifier,
+    applicant_keypair,
+    account_repository,
+    tenant_repository,
+) -> None:
+    """When the resolved account already operates a tenant, the submit response
+    lists it — the CLI warns that the application requests an ADDITIONAL tenant
+    (multi-tenancy is allowed; review is the gate)."""
+    identity_verifier.register(_GH_TOKEN, _GH_CLAIM)
+    acct = account_repository.create(
+        account_id="acct-existing",
+        idp=_GH_CLAIM.idp,
+        idp_sub=_GH_CLAIM.idp_sub,  # SAME github identity the applicant authenticates as
+    )
+    tenant_repository.register(
+        tenant_id="prior-lab", maintainer_pubkey="b" * 64, account_id=acct.account_id
+    )
+    priv, pub = applicant_keypair
+    r = _signed_post(
+        client,
+        privkey=priv,
+        pubkey_hex=pub,
+        path="/api/v0/tenant-applications",
+        body=_apply_body(requested_tenant_id="second-lab"),
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["account_existing_tenants"] == ["prior-lab"]
