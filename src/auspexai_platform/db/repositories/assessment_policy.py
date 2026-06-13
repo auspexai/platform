@@ -57,10 +57,10 @@ class AssessmentPolicyRepository:
         enabled: bool,
         min_tier: int,
         updated_by: str,
-        reason: str,
+        reason: str | None = None,
     ) -> AssessmentPolicy:
-        """Upsert the single policy row. `reason` is mandatory (governance
-        action — mirrors every other trust action's recorded reason)."""
+        """Upsert the single policy row. `reason` is an optional free-text note —
+        the audit trail records who/what/when/state regardless."""
         self.db.execute(
             """
             INSERT INTO assessment_policy

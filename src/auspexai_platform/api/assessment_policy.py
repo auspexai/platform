@@ -30,7 +30,10 @@ class PolicyUpdate(BaseModel):
     # Minimum account tier eligible for auto-approval when enabled. T2 or T3 only
     # — auto-approving T0/T1 tenants would defeat the trust gate.
     min_tier: int = Field(ge=2, le=3, default=2)
-    reason: str = Field(min_length=3, max_length=500)
+    # Optional free-text note. The audit row already records who/what/when/state;
+    # a reason is accepted but not required (this is the maintainer's own policy
+    # toggle, not an action against another party).
+    reason: str | None = Field(default=None, max_length=500)
 
 
 def _payload(policy) -> dict[str, Any]:

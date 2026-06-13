@@ -131,13 +131,14 @@ def test_post_policy_sets_and_persists(client, maintainer_token, db):
     assert AssessmentPolicyRepository(db).get().enabled is False
 
 
-def test_post_policy_requires_reason(client, maintainer_token):
+def test_post_policy_reason_optional(client, maintainer_token):
     r = client.post(
         "/api/v0/assessment-policy",
         headers=_hdr(maintainer_token),
-        json={"enabled": True, "min_tier": 2},
+        json={"enabled": True, "min_tier": 2},  # no reason
     )
-    assert r.status_code == 422
+    assert r.status_code == 200
+    assert r.json()["update_reason"] is None
 
 
 def test_post_policy_rejects_sub_t2_min_tier(client, maintainer_token):
