@@ -296,6 +296,10 @@ def build_router(
     tenant_tier: Callable[[str], int] | None = None,
     approved_classes: Callable[[str], list[str] | None] | None = None,
     served_model_ids: Callable[[], set[str] | None] | None = None,
+    # §9 #48 inc-4: the runtime auto-approval gate, read server-authoritatively
+    # at decision time. Returns (enabled, min_tier). Unwired (tests that don't
+    # exercise the gate) ⇒ the endpoint falls back to DISABLED — the safe default.
+    auto_approval_gate: Callable[[], tuple[bool, int]] | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -633,7 +637,19 @@ def build_router(
             tenant_approved_classes=approved,
             served_model_ids=served,
         )
-        verdict = decide(research_class=research_class, tenant_tier=tier, envelope=envelope)
+        if auto_approval_gate is not None:
+            gate_enabled, gate_min_tier = auto_approval_gate()
+        else:
+            # Unwired (a test that doesn't exercise the gate): DISABLED is the
+            # safe default — production always wires the reader in main.py.
+            gate_enabled, gate_min_tier = False, int(TrustTier.T2_TRUSTED)
+        verdict = decide(
+            research_class=research_class,
+            tenant_tier=tier,
+            envelope=envelope,
+            auto_tier=gate_min_tier,
+            auto_approval_enabled=gate_enabled,
+        )
         assessed_by = credential.maintainer_login or "maintainer"
         experiment = experiment_repository.set_assessment(
             experiment_id,

@@ -19,6 +19,7 @@ from auspexai_platform.db.models import IdentityProvider, Worker
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AccountRepository,
+    AssessmentPolicyRepository,
     AuditRepository,
     ExperimentRepository,
     ManifestRepository,
@@ -280,6 +281,12 @@ def client(
         tenant_registry=tenant_registry,
         db=db,
         identity_verifier=identity_verifier,
+    )
+    # §9 #48 inc-4: the auto-approval gate ships DISABLED (migration 0031). The
+    # end-to-end suite's baseline exercises auto-approval, so turn the gate on
+    # here — tests for the off path set it back off explicitly.
+    AssessmentPolicyRepository(db).set(
+        enabled=True, min_tier=2, updated_by="test-fixture", reason="suite baseline"
     )
     with TestClient(app) as c:
         yield c

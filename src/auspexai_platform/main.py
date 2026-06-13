@@ -29,6 +29,7 @@ from starlette.middleware.cors import CORSMiddleware
 from auspexai_platform import __version__
 from auspexai_platform.api import accounts as account_routes
 from auspexai_platform.api import activity as activity_routes
+from auspexai_platform.api import assessment_policy as assessment_policy_routes
 from auspexai_platform.api import assignments as assignment_routes
 from auspexai_platform.api import audit as audit_routes
 from auspexai_platform.api import auth as auth_routes
@@ -58,6 +59,7 @@ from auspexai_platform.db.models import TrustTier
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AccountRepository,
+    AssessmentPolicyRepository,
     AttestationRepository,
     AuditRepository,
     ExperimentRepository,
@@ -116,6 +118,7 @@ def create_app(
     MigrationRunner(db).apply_all()
 
     account_repository = AccountRepository(db)
+    assessment_policy_repository = AssessmentPolicyRepository(db)
     tenant_repository = TenantRepository(db)
     manifest_repository = ManifestRepository(db)
     experiment_repository = ExperimentRepository(db)
@@ -168,6 +171,12 @@ def create_app(
     def _approved_classes(tenant_id: str) -> list[str] | None:
         # §9 #48 envelope scope check: the classes the tenant was approved for.
         return tenant_application_repository.approved_classes_for_tenant(tenant_id)
+
+    def _auto_approval_gate() -> tuple[bool, int]:
+        # §9 #48 inc-4: the maintainer's runtime auto-approval gate, read at
+        # decision time so the console toggle is authoritative. Default DISABLED.
+        policy = assessment_policy_repository.get()
+        return policy.enabled, policy.min_tier
 
     scheduler = Scheduler(
         experiment_repository,
@@ -279,9 +288,19 @@ def create_app(
             attestation_repository=attestation_repository,
             tenant_tier=_tenant_tier,  # §9 #48 class-by-tier auto-approval
             approved_classes=_approved_classes,
+            auto_approval_gate=_auto_approval_gate,  # §9 #48 inc-4 runtime gate
         ),
         prefix="/api/v0",
         tags=["experiments"],
+    )
+    app.include_router(
+        assessment_policy_routes.build_router(
+            credential_dep,
+            assessment_policy_repository,
+            audit_repository,
+        ),
+        prefix="/api/v0",
+        tags=["assessment-policy"],
     )
     eligibility_thresholds = EligibilityThresholds(
         t2_receipt_threshold=config.tier_t2_receipt_threshold,

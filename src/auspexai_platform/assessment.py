@@ -172,15 +172,25 @@ def decide(
     research_class: str | None,
     tenant_tier: int,
     envelope: EnvelopeResult,
-    auto_tier: TrustTier = AUTO_APPROVE_TIER,
+    auto_tier: TrustTier | int = AUTO_APPROVE_TIER,
+    auto_approval_enabled: bool = True,
 ) -> AssessmentDecision:
-    """The authoritative admission decision. `auto` requires ALL of: routine
-    class, tenant tier >= auto_tier, every envelope check passing."""
+    """The authoritative admission decision. `auto` requires ALL of: the
+    maintainer's auto-approval gate ON, routine class, tenant tier >= auto_tier,
+    every envelope check passing.
+
+    `auto_approval_enabled` is the §9 #48-inc4 runtime gate (sourced from
+    `AssessmentPolicyRepository`). Default True keeps this pure function
+    policy-neutral for unit tests; the SAFE default (OFF) lives in the storage
+    row + the endpoint's no-reader fallback, so production can never auto-approve
+    until a maintainer turns the gate on from the console."""
     track = class_track(research_class)
     tier_ok = int(tenant_tier) >= int(auto_tier)
-    auto = track == "routine" and tier_ok and envelope.passed
+    auto = auto_approval_enabled and track == "routine" and tier_ok and envelope.passed
 
-    if track == "elevated":
+    if not auto_approval_enabled:
+        rationale = "auto-approval gate is off (maintainer) → human review"
+    elif track == "elevated":
         rationale = f"{research_class} is elevated-ethics → human review"
     elif track == "unknown":
         rationale = f"class {research_class!r} is not routine → human review"
