@@ -400,7 +400,9 @@ def test_picks_in_progress_unit_that_still_needs_replicas(
 # ---- §2.1 #8 dispatch-retry: refusal classification + re-offer ------------
 
 
-def _refused_assignment(*, kind: str | None, attempt_count: int = 1, result_id=None) -> Assignment:
+def _refused_assignment(
+    *, kind: str | None, attempt_count: int = 1, result_id=None, reason: str | None = None
+) -> Assignment:
     return Assignment(
         assignment_id="asg-x",
         unit_id="u1",
@@ -410,6 +412,7 @@ def _refused_assignment(*, kind: str | None, attempt_count: int = 1, result_id=N
         result_id=result_id,
         refused_at=(None if kind is None and result_id else datetime(2026, 6, 1, tzinfo=UTC)),
         refused_kind=kind,
+        refused_reason=reason,
         attempt_count=attempt_count,
     )
 
@@ -437,6 +440,36 @@ def test_is_retryable_refusal_classification():
     # Unknown / None default to terminal (no surprise retry loops).
     assert is_retryable_refusal("something_new") is False
     assert is_retryable_refusal(None) is False
+
+
+def test_is_retryable_refusal_by_reason_marker():
+    # `executor_refused` is terminal by KIND, but the worker tags transient
+    # availability failures in the REASON so the coordinator re-offers them (#40a).
+    assert (
+        is_retryable_refusal("executor_refused", "fetch failed: 404 (package_unavailable)") is True
+    )
+    assert (
+        is_retryable_refusal("executor_refused", "inference serving unavailable for gemma: timeout")
+        is True
+    )
+    # A real policy/integrity refusal on the SAME kind stays terminal.
+    assert (
+        is_retryable_refusal("executor_refused", "worker policy execute_tenant_code=off") is False
+    )
+    assert is_retryable_refusal("executor_refused", "manifest_swap: staged hash mismatch") is False
+    # No reason → kind-only (executor_refused is terminal).
+    assert is_retryable_refusal("executor_refused", None) is False
+
+
+def test_reoffer_eligible_by_availability_reason():
+    # executor_refused + a package_unavailable reason → re-offerable under the cap.
+    a = _refused_assignment(
+        kind="executor_refused", reason="fetch failed (package_unavailable)", attempt_count=1
+    )
+    assert reoffer_eligible(a) is True
+    # executor_refused + a policy reason → terminal (no re-offer).
+    b = _refused_assignment(kind="executor_refused", reason="tenant_deny", attempt_count=1)
+    assert reoffer_eligible(b) is False
 
 
 def test_reoffer_eligible_logic():

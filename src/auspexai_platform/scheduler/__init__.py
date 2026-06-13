@@ -84,16 +84,33 @@ _RETRYABLE_REFUSAL_KINDS = frozenset(
     }
 )
 
+# Some refusals carry the broad `executor_refused` kind but are actually
+# *availability* (transient) failures, not policy/integrity (terminal) ones. The
+# worker deliberately tags the reason so the coordinator can re-offer them (see
+# worker provisioning.PackageFetchError): a package that couldn't be FETCHED yet
+# (#40a) or a model that couldn't be SERVED yet may well succeed on a retry,
+# whereas tenant_deny / manifest_swap / sensitive will not. Matched as substrings
+# in the (lowercased) refusal reason; the per-worker attempt cap still bounds it.
+_RETRYABLE_REFUSAL_REASON_MARKERS = ("package_unavailable", "serving unavailable")
+
 # Per-(unit, worker) attempt ceiling: the initial offer + retries. A retryable
 # refusal that keeps recurring is bounded so a genuinely-broken pairing can't
 # loop forever; once exhausted the worker is excluded like a terminal refusal.
 MAX_ASSIGNMENT_ATTEMPTS = 3
 
 
-def is_retryable_refusal(kind: str | None) -> bool:
-    """True if a refusal of this `kind` should re-offer the unit (incl. to the
-    same worker). Unknown / None kinds are treated as terminal."""
-    return kind in _RETRYABLE_REFUSAL_KINDS
+def is_retryable_refusal(kind: str | None, reason: str | None = None) -> bool:
+    """True if a refusal should re-offer the unit (incl. to the same worker).
+    Retryable when the `kind` is a known-transient one, OR the `reason` carries
+    an availability marker (a package/serving that wasn't ready yet — the worker
+    tags these on the otherwise-terminal `executor_refused` kind). Unknown kinds
+    with no marker are terminal."""
+    if kind in _RETRYABLE_REFUSAL_KINDS:
+        return True
+    if reason:
+        low = reason.lower()
+        return any(m in low for m in _RETRYABLE_REFUSAL_REASON_MARKERS)
+    return False
 
 
 def worker_is_self_paused(worker: Worker) -> bool:
@@ -131,7 +148,7 @@ def reoffer_eligible(
         return False
     if assignment.refused_at is None:
         return False
-    if not is_retryable_refusal(assignment.refused_kind):
+    if not is_retryable_refusal(assignment.refused_kind, assignment.refused_reason):
         return False
     return assignment.attempt_count < max_attempts
 
