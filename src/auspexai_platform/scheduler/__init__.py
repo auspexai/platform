@@ -91,7 +91,13 @@ _RETRYABLE_REFUSAL_KINDS = frozenset(
 # (#40a) or a model that couldn't be SERVED yet may well succeed on a retry,
 # whereas tenant_deny / manifest_swap / sensitive will not. Matched as substrings
 # in the (lowercased) refusal reason; the per-worker attempt cap still bounds it.
-_RETRYABLE_REFUSAL_REASON_MARKERS = ("package_unavailable", "serving unavailable")
+_RETRYABLE_REFUSAL_REASON_MARKERS = (
+    "package_unavailable",
+    "serving unavailable",
+    # v0_2 M1: a version-skewed worker refuses a serving_version_pin'd unit; the
+    # unit re-offers to a version-matching peer (environmental, not the work).
+    "serving_version_mismatch",
+)
 
 # Per-(unit, worker) attempt ceiling: the initial offer + retries. A retryable
 # refusal that keeps recurring is bounded so a genuinely-broken pairing can't

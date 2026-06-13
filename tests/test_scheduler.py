@@ -452,6 +452,12 @@ def test_is_retryable_refusal_by_reason_marker():
         is_retryable_refusal("executor_refused", "inference serving unavailable for gemma: timeout")
         is True
     )
+    # v0_2 M1: a version-skewed worker refuses a serving_version_pin'd unit; the
+    # unit re-offers to a version-matching peer.
+    assert (
+        is_retryable_refusal("executor_refused", "serving_version_mismatch: serving 'ollama/0.18.2'")
+        is True
+    )
     # A real policy/integrity refusal on the SAME kind stays terminal.
     assert (
         is_retryable_refusal("executor_refused", "worker policy execute_tenant_code=off") is False
