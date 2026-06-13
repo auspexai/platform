@@ -27,15 +27,18 @@ Manifest submission flow:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from auspexai_platform.assessment import assess_envelope, decide
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.dependency import require_maintainer
-from auspexai_platform.db.models import ExperimentStatus
+from auspexai_platform.db.models import ExperimentStatus, TrustTier
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AttestationRepository,
@@ -123,6 +126,22 @@ class SetIntegrityPolicyRequest(BaseModel):
 
 
 # ---- helpers ---------------------------------------------------------------
+
+
+def _assessment_payload(experiment) -> dict[str, Any]:
+    """The §9 #48 assessment view: the decision + its provenance (class, tier,
+    envelope, rationale) and the resulting status (`approved` after an auto)."""
+    return {
+        "experiment_id": experiment.experiment_id,
+        "status": experiment.status.value,
+        "research_class": experiment.research_class,
+        "decision": experiment.assessment_decision,
+        "tier": experiment.assessment_tier,
+        "rationale": experiment.assessment_rationale,
+        "envelope": experiment.assessment_envelope,
+        "assessed_at": experiment.assessed_at.isoformat() if experiment.assessed_at else None,
+        "assessed_by": experiment.assessed_by,
+    }
 
 
 def _to_response(experiment) -> ExperimentResponse:
@@ -251,6 +270,13 @@ def build_router(
     receipt_index_repository: ReceiptIndexRepository | None = None,
     signing_key: SigningKey | None = None,
     attestation_repository: AttestationRepository | None = None,
+    # §9 #48: injected lookups (wired in main.py from the account/application
+    # repos, à la the scheduler's account_suspended_for_tenant). All optional so
+    # the router builds in tests without them — defaults make every experiment
+    # route to human review (tier T1, no scope, no catalog).
+    tenant_tier: Callable[[str], int] | None = None,
+    approved_classes: Callable[[str], list[str] | None] | None = None,
+    served_model_ids: Callable[[], set[str] | None] | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -427,6 +453,7 @@ def build_router(
         response_model_exclude_none=True,
     )
     async def list_experiments(
+        assessment: str | None = None,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ExperimentListResponse:
         # Tenant-private row scoping (§3): maintainer sees the whole fleet; a
@@ -434,8 +461,10 @@ def build_router(
         # worker) sees none. Field-level filtering still applies on top, but the
         # row scope is what stops cross-tenant existence/count leaking through a
         # list endpoint.
+        # §9 #48: `?assessment=review|auto` is the maintainer's review / auto
+        # queue (maintainer-only — a researcher's list stays their full set).
         if credential.is_maintainer():
-            experiments = experiment_repository.list_all()
+            experiments = experiment_repository.list_all(assessment_decision=assessment)
         elif credential.is_researcher() and credential.tenant_id is not None:
             experiments = experiment_repository.list_all(tenant_id=credential.tenant_id)
         else:
@@ -524,6 +553,109 @@ def build_router(
             audit_repository=audit_repository,
             event_bus=event_bus,
         )
+
+    @router.post("/experiments/{experiment_id}/assessment")
+    async def assess_experiment(
+        experiment_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> JSONResponse:
+        """§9 #48 — assess a submitted experiment (class-by-tier auto-approval).
+
+        Maintainer-credentialed (the future agent uses a scoped maintainer
+        token). The decision is computed SERVER-AUTHORITATIVELY here — the
+        caller cannot propose one — so a compromised agent cannot widen the
+        gate. `auto` reuses the maintainer approve transition; `review` records
+        the assessment and leaves the experiment in `submitted` for the human
+        queue. Idempotent: re-calling an already-assessed experiment returns the
+        prior assessment unchanged.
+        """
+        require_maintainer(credential)
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "experiment_not_found",
+                        "message": f"no experiment with id {experiment_id!r}",
+                    }
+                },
+            )
+        if experiment.assessment_decision is not None:
+            return JSONResponse(_assessment_payload(experiment))  # idempotent
+        if experiment.status != ExperimentStatus.SUBMITTED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": {
+                        "code": "not_assessable",
+                        "message": (
+                            "only a submitted experiment can be assessed "
+                            f"(status: {experiment.status.value})"
+                        ),
+                    }
+                },
+            )
+
+        manifest = manifest_repository.get(experiment.manifest_hash)
+        manifest_json = manifest.manifest_json if manifest else {}
+        research_class = manifest_json.get("research_class")
+        tier = (
+            tenant_tier(experiment.tenant_id)
+            if tenant_tier is not None
+            else int(TrustTier.T1_AUTHENTICATED)
+        )
+        approved = approved_classes(experiment.tenant_id) if approved_classes is not None else None
+        served = served_model_ids() if served_model_ids is not None else None
+
+        envelope = assess_envelope(
+            manifest_json=manifest_json,
+            research_class=research_class,
+            tenant_approved_classes=approved,
+            served_model_ids=served,
+        )
+        verdict = decide(research_class=research_class, tenant_tier=tier, envelope=envelope)
+        assessed_by = credential.maintainer_login or "maintainer"
+        experiment = experiment_repository.set_assessment(
+            experiment_id,
+            research_class=research_class,
+            decision=verdict.decision,
+            tier=tier,
+            envelope=envelope.as_json(),
+            rationale=verdict.rationale,
+            assessed_by=assessed_by,
+        )
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=assessed_by,
+            actor_tenant_id=None,
+            action="experiment.assess",
+            resource_type="experiment",
+            resource_id=experiment_id,
+            payload={
+                "research_class": research_class,
+                "decision": verdict.decision,
+                "track": verdict.track,
+                "tier": tier,
+                "envelope_failures": envelope.failures,
+                "rationale": verdict.rationale,
+            },
+        )
+        if verdict.decision == "auto":
+            # Reuse the maintainer approve transition; the assessment row records
+            # WHY. The distinct action keeps an auto-approval auditable as such.
+            _transition(
+                experiment_id=experiment_id,
+                new_status=ExperimentStatus.APPROVED,
+                credential=credential,
+                allow_researcher=False,
+                action="experiment.assess.auto",
+                experiment_repository=experiment_repository,
+                audit_repository=audit_repository,
+                event_bus=event_bus,
+            )
+            experiment = experiment_repository.get_by_id(experiment_id)
+        return JSONResponse(_assessment_payload(experiment))
 
     @router.post(
         "/experiments/{experiment_id}/actions/abort",

@@ -191,6 +191,16 @@ class Experiment(BaseModel):
     retention_hold: bool = False
     retention_hold_reason: str | None = None
     results_collected_at: datetime | None = None
+    # §9 #48: admission-assessment provenance (migration 0030). NULL = unassessed.
+    # research_class mirrors the manifest's declared class; assessment_decision is
+    # 'auto' | 'review' (| 'declined'); assessment_envelope is the per-check result.
+    research_class: str | None = None
+    assessment_decision: str | None = None
+    assessment_tier: int | None = None
+    assessment_envelope: list[dict[str, Any]] | None = None
+    assessment_rationale: str | None = None
+    assessed_at: datetime | None = None
+    assessed_by: str | None = None
 
 
 class IdentityVerificationMethod(StrEnum):

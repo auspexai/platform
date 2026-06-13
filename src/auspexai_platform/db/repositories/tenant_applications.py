@@ -125,6 +125,23 @@ class TenantApplicationRepository:
         )
         return [self._row(r) for r in rows]
 
+    def approved_classes_for_tenant(self, tenant_id: str) -> list[str] | None:
+        """The research classes the tenant was approved for (§9 #48 envelope
+        scope check). None when there is no approved application (a legacy
+        hand-created tenant) — None ⇒ the scope check is recorded as
+        not-evaluated rather than failing a tenant that never had an
+        application."""
+        rows = self.db.execute(
+            "SELECT research_classes_json FROM tenant_applications "
+            "WHERE created_tenant_id = ? AND status = 'approved' "
+            "ORDER BY resolved_at DESC LIMIT 1",
+            (tenant_id,),
+        )
+        if not rows:
+            return None
+        raw = rows[0]["research_classes_json"]
+        return json.loads(raw) if raw else None
+
     def has_pending_for_account(self, account_id: str) -> bool:
         """One pending application per account at a time (submit-side 409)."""
         rows = self.db.execute(

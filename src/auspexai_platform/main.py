@@ -54,6 +54,7 @@ from auspexai_platform.auth.tenant_registry import TenantRegistry
 from auspexai_platform.auth.worker_registry import WorkerRegistry
 from auspexai_platform.config import Config
 from auspexai_platform.db import Database, MigrationRunner
+from auspexai_platform.db.models import TrustTier
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AccountRepository,
@@ -153,6 +154,20 @@ def create_app(
             return False
         account = account_repository.get_by_id(tenant.account_id)
         return account is not None and account.suspended_at is not None
+
+    def _tenant_tier(tenant_id: str) -> int:
+        # §9 #48: tenant → account → trust_tier. A tenant without an account
+        # (legacy) has no earned trust, so it floors at T1 — below the T2
+        # auto-approval threshold, i.e. it always routes to human review.
+        tenant = tenant_repository.get_by_id(tenant_id)
+        if tenant is None or tenant.account_id is None:
+            return int(TrustTier.T1_AUTHENTICATED)
+        account = account_repository.get_by_id(tenant.account_id)
+        return int(account.trust_tier) if account is not None else int(TrustTier.T1_AUTHENTICATED)
+
+    def _approved_classes(tenant_id: str) -> list[str] | None:
+        # §9 #48 envelope scope check: the classes the tenant was approved for.
+        return tenant_application_repository.approved_classes_for_tenant(tenant_id)
 
     scheduler = Scheduler(
         experiment_repository,
@@ -262,6 +277,8 @@ def create_app(
             receipt_index_repository=receipt_index_repository,
             signing_key=receipt_signing_key,
             attestation_repository=attestation_repository,
+            tenant_tier=_tenant_tier,  # §9 #48 class-by-tier auto-approval
+            approved_classes=_approved_classes,
         ),
         prefix="/api/v0",
         tags=["experiments"],

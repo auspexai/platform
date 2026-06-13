@@ -62,6 +62,12 @@ def _generate_experiment_id() -> str:
     return f"exp-{secrets.token_urlsafe(6)[:8]}"
 
 
+def _col(row: sqlite3.Row, name: str) -> object | None:
+    """Column value, or None if the column is absent — keeps `_row_to_experiment`
+    robust to a row/fixture predating an additive migration (e.g. 0030)."""
+    return row[name] if name in row.keys() else None
+
+
 class ExperimentRepository:
     def __init__(self, db: Database):
         self.db = db
@@ -313,6 +319,41 @@ class ExperimentRepository:
             raise ExperimentNotFoundError(experiment_id)
         return got
 
+    def set_assessment(
+        self,
+        experiment_id: str,
+        *,
+        research_class: str | None,
+        decision: str,
+        tier: int,
+        envelope: list[dict[str, object]],
+        rationale: str,
+        assessed_by: str,
+    ) -> Experiment:
+        """Record the §9 #48 admission-assessment provenance (decision computed
+        server-authoritatively by `assessment.decide`). Metadata only — the
+        status transition (auto → approve) is the caller's concern."""
+        now = datetime.now(UTC).isoformat()
+        self.db.execute(
+            "UPDATE experiments SET research_class = ?, assessment_decision = ?, "
+            "assessment_tier = ?, assessment_envelope_json = ?, assessment_rationale = ?, "
+            "assessed_at = ?, assessed_by = ? WHERE experiment_id = ?",
+            (
+                research_class,
+                decision,
+                tier,
+                json.dumps(envelope),
+                rationale,
+                now,
+                assessed_by,
+                experiment_id,
+            ),
+        )
+        got = self.get_by_id(experiment_id)
+        if got is None:
+            raise ExperimentNotFoundError(experiment_id)
+        return got
+
     # ---- reads ----
 
     def get_by_id(self, experiment_id: str) -> Experiment | None:
@@ -327,6 +368,7 @@ class ExperimentRepository:
         *,
         tenant_id: str | None = None,
         status: ExperimentStatus | None = None,
+        assessment_decision: str | None = None,
     ) -> list[Experiment]:
         clauses: list[str] = []
         params: list[object] = []
@@ -336,6 +378,10 @@ class ExperimentRepository:
         if status is not None:
             clauses.append("status = ?")
             params.append(status.value)
+        if assessment_decision is not None:
+            # §9 #48 maintainer queues: ?assessment=review|auto.
+            clauses.append("assessment_decision = ?")
+            params.append(assessment_decision)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self.db.execute(
             f"SELECT * FROM experiments {where} ORDER BY submitted_at",
@@ -391,4 +437,21 @@ class ExperimentRepository:
                 if row["results_collected_at"]
                 else None
             ),
+            # §9 #48 assessment columns (0030). Defensive access so a pre-0030
+            # fixture/row maps cleanly to unassessed rather than KeyError.
+            research_class=_col(row, "research_class"),
+            assessment_decision=_col(row, "assessment_decision"),
+            assessment_tier=_col(row, "assessment_tier"),
+            assessment_envelope=(
+                json.loads(_col(row, "assessment_envelope_json"))
+                if _col(row, "assessment_envelope_json")
+                else None
+            ),
+            assessment_rationale=_col(row, "assessment_rationale"),
+            assessed_at=(
+                datetime.fromisoformat(_col(row, "assessed_at"))
+                if _col(row, "assessed_at")
+                else None
+            ),
+            assessed_by=_col(row, "assessed_by"),
         )
