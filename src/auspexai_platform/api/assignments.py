@@ -85,6 +85,7 @@ from auspexai_platform.receipts.attestation import (
 )
 from auspexai_platform.scheduler import Scheduler, reoffer_eligible
 from auspexai_platform.scheduler.conductor import plan_prestage_for_worker
+from auspexai_platform.weights import served_weights_verdict
 from auspexai_platform.worker_status import heartbeat_cutoff
 
 # ---- response models ------------------------------------------------------
@@ -480,14 +481,58 @@ def build_router(
         # per-result environment (gguf digest) rides a future worker release.
         environment: dict[str, Any] | None = None
         worker_row = worker_repository.get_by_id(worker_id)
+        served_digests: dict[str, str] | None = None
         if worker_row is not None:
             caps = worker_row.capabilities or {}
+            served_digests = caps.get("served_model_digests")  # v0_2 #13a (rolled worker)
             snapshot = {
                 "worker_version": caps.get("version"),
                 "ollama_version": caps.get("ollama_version"),
                 "served_models": caps.get("served_models"),
+                "served_model_digests": served_digests,  # M3 reproducibility leg
             }
             environment = {k: v for k, v in snapshot.items() if v is not None} or None
+
+        # M3 / #13b (v0_2): when a manifest model pins `expected_gguf_sha256`, the
+        # worker's served digest MUST match — else the declared model did not
+        # provably run. A mismatch refuses the unit terminally for THIS worker
+        # (excluded; re-offered to another eligible worker) + audits. Dormant
+        # unless a manifest pins a digest AND the rolled worker reports one.
+        if manifest_repository is not None:
+            exp = experiment_repository.get_by_id(experiment_id)
+            manifest = manifest_repository.get(exp.manifest_hash) if exp is not None else None
+            mismatch = (
+                served_weights_verdict(manifest.manifest_json, served_digests)
+                if manifest is not None
+                else None
+            )
+            if mismatch is not None:
+                assignments_repo.mark_refused(
+                    assignment_id=assignment.assignment_id,
+                    kind="served_weights_mismatch",
+                    reason=mismatch,
+                )
+                audit_repository.append(
+                    actor_class=CredentialClass.WORKER,
+                    actor_identifier=worker_id,
+                    action="result.served_weights_mismatch",
+                    resource_type="work_unit",
+                    resource_id=unit_id,
+                    payload={"experiment_id": experiment_id, "reason": mismatch},
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": {
+                            "code": "served_weights_mismatch",
+                            "message": (
+                                "result rejected: the served model weights do not match the "
+                                "manifest's declared digest (§9 #13b)"
+                            ),
+                            "details": {"reason": mismatch},
+                        }
+                    },
+                )
 
         result = results_repo.insert(
             result_id=_generate_result_id(),
