@@ -602,3 +602,41 @@ def test_worker_satisfies_requires_real_execution_gates_synthetic():
     # Flag off → both eligible (pre-existing behavior, unchanged).
     assert worker_satisfies(syn, {}, requires_real_execution=False) is True
     assert worker_satisfies(prov, {}, requires_real_execution=False) is True
+
+
+def test_scheduler_halts_suspended_account_experiments(
+    registered_tenant,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+    manifest_repository: ManifestRepository,
+) -> None:
+    """F5 (accountability cascade): a suspended account's already-APPROVED
+    experiment stops dispatching, and unsuspension resumes it. No experiment
+    state change — the scheduler routes around it while suspended."""
+    _, binding = registered_tenant
+    exp = _make_experiment(
+        manifest_repository=manifest_repository,
+        experiment_repository=experiment_repository,
+        tenant_id=binding.tenant_id,
+        label="susp-1",
+    )
+    db = per_job_factory.get_or_create(exp.experiment_id)
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+
+    suspended = {"value": False}
+    scheduler = Scheduler(
+        experiment_repository,
+        per_job_factory,
+        account_suspended_for_tenant=lambda tid: suspended["value"] and tid == binding.tenant_id,
+    )
+    w = _worker(worker_id="wkr-1", models=None)
+
+    # Not suspended → the unit is dispatched.
+    assert scheduler.pick_for_worker(w) is not None
+    # Suspended → routed around, experiment unchanged (still APPROVED).
+    suspended["value"] = True
+    assert scheduler.pick_for_worker(w) is None
+    assert experiment_repository.get_by_id(exp.experiment_id).status == ExperimentStatus.APPROVED
+    # Unsuspend → dispatch resumes.
+    suspended["value"] = False
+    assert scheduler.pick_for_worker(w) is not None

@@ -144,7 +144,21 @@ def create_app(
     tenant_registry = tenant_registry or TenantRegistry(tenant_repository)
     worker_registry = WorkerRegistry(worker_repository)
     credential_resolver = CredentialResolver(tenant_registry, worker_registry)
-    scheduler = Scheduler(experiment_repository, per_job_factory)
+
+    def _account_suspended_for_tenant(tenant_id: str) -> bool:
+        # F5: tenant → account → suspended? (legacy tenants without an account
+        # have no accountability root, so they never cascade.)
+        tenant = tenant_repository.get_by_id(tenant_id)
+        if tenant is None or tenant.account_id is None:
+            return False
+        account = account_repository.get_by_id(tenant.account_id)
+        return account is not None and account.suspended_at is not None
+
+    scheduler = Scheduler(
+        experiment_repository,
+        per_job_factory,
+        account_suspended_for_tenant=_account_suspended_for_tenant,
+    )
     # M8: in-process live-event bus. SSE endpoints subscribe; lifecycle /
     # result-submission routes publish. Process-local (single-process coord).
     event_bus = EventBus()

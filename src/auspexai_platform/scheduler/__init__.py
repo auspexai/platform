@@ -32,6 +32,7 @@ thin slice that makes BYOM routing real.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -237,9 +238,16 @@ class Scheduler:
         self,
         experiment_repository: ExperimentRepository,
         per_job_factory: PerJobDatabaseFactory,
+        account_suspended_for_tenant: Callable[[str], bool] | None = None,
     ):
         self._experiments = experiment_repository
         self._per_job_factory = per_job_factory
+        # F5 (accountability cascade): resolves an experiment's owning tenant to
+        # its account's suspension state. A suspended account's already-APPROVED
+        # experiments stop dispatching (no burning volunteer compute on a
+        # suspended account's work) — the dispatch-side complement to the
+        # researcher-surface 403. None ⇒ no cascade (legacy / tests).
+        self._account_suspended_for_tenant = account_suspended_for_tenant
 
     def pick_for_worker(self, worker: Worker) -> SchedulerPick | None:
         """Return the first eligible (experiment_id, work_unit) pair, or
@@ -269,6 +277,15 @@ class Scheduler:
                 worker,
                 experiment.required_capabilities,
                 requires_real_execution=experiment.requires_real_execution,
+            ):
+                continue
+            # F5: halt dispatch for a suspended account's experiments. Approval
+            # is not a forever-pass — if the accountability root is suspended,
+            # the network stops spending volunteer compute on its work until
+            # unsuspension (no experiment state change; resumes on unsuspend).
+            if (
+                self._account_suspended_for_tenant is not None
+                and self._account_suspended_for_tenant(experiment.tenant_id)
             ):
                 continue
             per_job_db = self._per_job_factory.get(experiment.experiment_id)
