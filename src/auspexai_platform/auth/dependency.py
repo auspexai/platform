@@ -103,6 +103,69 @@ def _enforce_account_not_suspended(
     )
 
 
+def enforce_worker_active(
+    credential: Credential,
+    worker_repository,
+    account_repository: AccountRepository | None,
+) -> None:
+    """Symmetric to `_enforce_account_not_suspended`, for the WORKER write
+    paths (result ingestion, vouching).
+
+    A QUARANTINED worker — or a worker whose linked account is SUSPENDED —
+    must not have its output ingested. Quarantine is the operator's
+    "stop trusting this worker's output" lever; account suspension is the
+    accountability-root cascade. Until now quarantine only gated assignment
+    DISPATCH (`GET /assignments` → 423), not the write paths, so a worker
+    quarantined while already holding an assignment could still POST a result
+    into consensus (and trigger receipt issuance + tier auto-promotion). This
+    closes that on the ingestion paths.
+
+    PAUSE is deliberately NOT enforced here: a paused worker is under a
+    no-fault operational hold, and discarding work it had already completed
+    in flight is the open M9 pause-integrity question (partial-result
+    collection from paused workers), not a trust decision.
+    """
+    worker_id = credential.worker_id
+    if worker_id is not None and worker_repository is not None:
+        worker = worker_repository.get_by_id(worker_id)
+        if worker is not None and worker.quarantined_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_423_LOCKED,
+                detail={
+                    "error": {
+                        "code": "worker_quarantined",
+                        "message": (
+                            "this worker is quarantined; its results are not "
+                            "accepted until unquarantine"
+                        ),
+                        "details": {
+                            "quarantined_at": worker.quarantined_at.isoformat(),
+                            "quarantine_reason": worker.quarantine_reason,
+                        },
+                    }
+                },
+            )
+    if account_repository is not None and credential.account_id is not None:
+        account = account_repository.get_by_id(credential.account_id)
+        if account is not None and account.suspended_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": {
+                        "code": "account_suspended",
+                        "message": (
+                            "this worker's account is suspended; its results "
+                            "are not accepted until unsuspension"
+                        ),
+                        "details": {
+                            "suspended_at": account.suspended_at.isoformat(),
+                            "suspension_reason": account.suspension_reason,
+                        },
+                    }
+                },
+            )
+
+
 def make_credential_dependency(
     token_store: TokenStore,
     resolver: CredentialResolver,

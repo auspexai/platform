@@ -49,7 +49,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
-from auspexai_platform.auth.dependency import require_worker
+from auspexai_platform.auth.dependency import enforce_worker_active, require_worker
 from auspexai_platform.db.models import ExperimentStatus, TrustTier
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
@@ -394,6 +394,12 @@ def build_router(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ResultSubmissionResponse:
         _require_self_worker(credential, worker_id)
+        # F1: quarantine/suspension must reach the INGESTION path, not just
+        # `GET /assignments`. A worker quarantined (or whose account is
+        # suspended) while holding an assignment otherwise still lands results
+        # into consensus. `refuse` is intentionally NOT gated — it releases a
+        # held unit back to the pool, which is harmless and better than a stall.
+        enforce_worker_active(credential, worker_repository, account_repository)
 
         if body.unit_id != unit_id:
             raise HTTPException(

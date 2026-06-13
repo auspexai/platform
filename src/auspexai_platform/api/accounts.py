@@ -42,6 +42,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
+from auspexai_platform.auth.dependency import enforce_worker_active
 from auspexai_platform.db.models import (
     IdentityProvider,
     IdentityVerificationMethod,
@@ -555,6 +556,10 @@ def build_router(
             raise HTTPException(
                 status_code=403, detail="must be an authenticated worker with account binding"
             )
+        # F3: vouching is the anti-Sybil chokepoint. A suspended account's (or
+        # quarantined worker's) vouch must not count — the tier on the
+        # credential alone is not enough.
+        enforce_worker_active(credential, worker_repository, account_repository)
         if credential.trust_tier is None or credential.trust_tier < int(TrustTier.T2_TRUSTED):
             raise HTTPException(status_code=403, detail="voucher must be T2+")
         # §6.2.2 anti-Sybil: the voucher must hold a real cross-tenant track
@@ -630,6 +635,8 @@ def build_router(
             raise HTTPException(
                 status_code=403, detail="must be an authenticated worker with account binding"
             )
+        # F3: a suspended/quarantined voucher cannot mutate the vouch graph.
+        enforce_worker_active(credential, worker_repository, account_repository)
 
         from auspexai_platform.db.repositories.vouches import VouchNotFoundError
 
