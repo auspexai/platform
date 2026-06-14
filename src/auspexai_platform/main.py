@@ -39,6 +39,7 @@ from auspexai_platform.api import github_webhook as github_webhook_routes
 from auspexai_platform.api import health
 from auspexai_platform.api import model_requests as model_request_routes
 from auspexai_platform.api import packages as package_routes
+from auspexai_platform.api import promotion_policy as promotion_policy_routes
 from auspexai_platform.api import receipts as receipt_routes
 from auspexai_platform.api import releases as release_routes
 from auspexai_platform.api import results as results_routes
@@ -66,6 +67,7 @@ from auspexai_platform.db.repositories import (
     ManifestRepository,
     ModelPrestageRepository,
     ModelRequestRepository,
+    PromotionPolicyRepository,
     ReceiptIndexRepository,
     ReleaseRepository,
     ResultTransferRepository,
@@ -119,6 +121,7 @@ def create_app(
 
     account_repository = AccountRepository(db)
     assessment_policy_repository = AssessmentPolicyRepository(db)
+    promotion_policy_repository = PromotionPolicyRepository(db)
     tenant_repository = TenantRepository(db)
     manifest_repository = ManifestRepository(db)
     experiment_repository = ExperimentRepository(db)
@@ -302,6 +305,23 @@ def create_app(
         prefix="/api/v0",
         tags=["assessment-policy"],
     )
+    app.include_router(
+        promotion_policy_routes.build_router(
+            credential_dep,
+            promotion_policy_repository,
+            audit_repository,
+        ),
+        prefix="/api/v0",
+        tags=["promotion-policy"],
+    )
+
+    def _promotion_auto_t1_t2() -> bool:
+        # §6.2: read the mode server-authoritatively at promotion time so the
+        # console toggle is the authority. Default = `manual` (human-in-the-loop,
+        # charter §6 decision 3): qualifying accounts wait in the promotion queue.
+        # Only `auto_with_override` lets the coordinator auto-promote.
+        return promotion_policy_repository.get().auto_promote_t1_t2
+
     eligibility_thresholds = EligibilityThresholds(
         t2_receipt_threshold=config.tier_t2_receipt_threshold,
         t2_distinct_experiments=config.tier_t2_distinct_experiments,
@@ -375,6 +395,7 @@ def create_app(
             manifest_repository=manifest_repository,
             prestage_repository=model_prestage_repository,
             attestation_repository=attestation_repository,
+            promotion_auto_t1_t2=_promotion_auto_t1_t2,
         ),
         prefix="/api/v0",
         tags=["assignments"],

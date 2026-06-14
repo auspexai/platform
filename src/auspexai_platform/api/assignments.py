@@ -225,6 +225,9 @@ def build_router(
     manifest_repository=None,  # M3b conductor: read acquisition coords from the manifest
     prestage_repository=None,  # M3b conductor: the model_prestage table
     attestation_repository: AttestationRepository | None = None,  # A1: persist on complete
+    # §6.2 promotion mode: () -> bool, True when T1->T2 auto-promotion is enabled
+    # (auto_with_override). Unwired (tests) defaults to True = behavior-preserving.
+    promotion_auto_t1_t2=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -662,6 +665,7 @@ def build_router(
                             eligibility_thresholds=eligibility_thresholds,
                             vouch_repository=vouch_repository,
                             audit_repository=audit_repository,
+                            promotion_auto_t1_t2=promotion_auto_t1_t2,
                         )
             except Exception:
                 import logging
@@ -1067,14 +1071,23 @@ def _maybe_auto_promote(
     eligibility_thresholds,
     vouch_repository,
     audit_repository: AuditRepository,
+    promotion_auto_t1_t2=None,
 ) -> None:
     """Auto-promote T1→T2 when both gates are satisfied after receipt issuance.
 
     Called from the result-submission path after receipts are issued. No-op
     when any prerequisite is missing (no account binding, already T2+, gates
     not met). Logs an audit entry with actor_class=SYSTEM.
+
+    `promotion_auto_t1_t2` is the §6.2 mode reader: () -> bool. When it returns
+    False (the maintainer set `manual`), the coordinator never auto-promotes —
+    the qualifying account waits in the promotion queue (the accounts-list
+    readiness signal still flags it) for a maintainer click. Unwired (tests)
+    defaults to auto, preserving the pre-toggle behavior.
     """
     if account_repository is None or eligibility_thresholds is None:
+        return
+    if promotion_auto_t1_t2 is not None and not promotion_auto_t1_t2():
         return
 
     worker = worker_repository.get_by_id(worker_id)
