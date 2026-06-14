@@ -44,7 +44,22 @@ from auspexai_platform.db.repositories import (
 from auspexai_platform.db.repositories.results import ResultRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.exposure import ExposureTag, is_visible
+from auspexai_platform.scheduler import worker_satisfies
 from auspexai_platform.worker_status import derive_worker_status, heartbeat_cutoff
+
+
+def _experiment_eligibility_reason(worker, required: dict, requires_real_execution: bool) -> str:
+    """Why an own-account worker can't serve THIS experiment (R-D #2). Mirrors the
+    `worker_satisfies` gates so the researcher sees the actionable reason."""
+    caps = worker.capabilities or {}
+    models = (required or {}).get("models") or []
+    if (models or requires_real_execution) and caps.get("execute_tenant_code") != "provisioned":
+        return "not in provisioned execution mode"
+    held = set(caps.get("models") or [])
+    missing = [m for m in models if m not in held]
+    if missing and caps.get("auto_acquire") is not True:
+        return f"doesn't hold {', '.join(missing)}; auto-acquire off"
+    return "not eligible for this experiment"
 
 
 class OwnWorkerActivity(BaseModel):
@@ -66,6 +81,13 @@ class OwnWorkerActivity(BaseModel):
     status: str | None = None
     quarantine_reason: str | None = None
     last_heartbeat_at: datetime | None = None
+    # R-D #2: this worker's role for THIS experiment, so an account worker that
+    # can't serve it shows WITH a reason instead of vanishing from the list.
+    #   backing    — has submitted >=1 result to this experiment
+    #   eligible   — could serve it (holds the models / auto-acquire) but hasn't yet
+    #   ineligible — can't serve it (see experiment_ineligible_reason)
+    experiment_eligibility: str | None = None
+    experiment_ineligible_reason: str | None = None
 
 
 class ExperimentActivityResponse(BaseModel):
@@ -119,31 +141,51 @@ def build_router(
 
         Returns ([], None) when the tenant isn't account-linked (b-lite
         `tenants.account_id` is NULL) — nothing to enrich, nothing to gate
-        against. Otherwise returns only workers bound to that account that have
-        contributed to this experiment; third-party contributors are excluded.
+        against. Otherwise returns ALL workers bound to that account (R-D #2),
+        each tagged with its role for THIS experiment (backing / eligible /
+        ineligible) so an account worker that can't serve it shows WITH a reason
+        rather than vanishing. Third-party contributors are never included.
         """
         tenant = tenant_repository.get_by_id(experiment.tenant_id)
         account_id = tenant.account_id if tenant is not None else None
         if account_id is None:
             return [], None
-        own_ids = {w.worker_id: w for w in worker_repository.list_for_account(account_id)}
-        if not own_ids:
+        account_workers = worker_repository.list_for_account(account_id)
+        if not account_workers:
             return [], account_id
+        # Contributions to THIS experiment, keyed by worker_id.
+        contribs = {
+            c["worker_id"]: c for c in ResultRepository(per_job_db).per_worker_contributions()
+        }
+        required = getattr(experiment, "required_capabilities", None) or {}
+        rre = bool(getattr(experiment, "requires_real_execution", False))
         own: list[OwnWorkerActivity] = []
-        for c in ResultRepository(per_job_db).per_worker_contributions():
-            worker = own_ids.get(c["worker_id"])
-            if worker is None:
-                continue  # third-party contributor → stays anonymized
+        for worker in account_workers:
+            c = contribs.get(worker.worker_id)
+            if c is not None:
+                eligibility, reason = "backing", None
+                result_count, last_activity = c["result_count"], c["last_received_at"]
+                pubkey = c["worker_pubkey_hex"]
+            else:
+                satisfies = worker_satisfies(worker, required, requires_real_execution=rre)
+                eligibility = "eligible" if satisfies else "ineligible"
+                reason = (
+                    None if satisfies else _experiment_eligibility_reason(worker, required, rre)
+                )
+                result_count, last_activity = 0, None
+                pubkey = worker.pubkey_hex
             own.append(
                 OwnWorkerActivity(
-                    worker_id=c["worker_id"],
-                    worker_pubkey_hex=c["worker_pubkey_hex"],
-                    result_count=c["result_count"],
+                    worker_id=worker.worker_id,
+                    worker_pubkey_hex=pubkey,
+                    result_count=result_count,
                     trust_tier=int(worker.trust_tier),
-                    last_activity_at=c["last_received_at"],
+                    last_activity_at=last_activity,
                     status=derive_worker_status(worker, now).value,
                     quarantine_reason=worker.quarantine_reason,
                     last_heartbeat_at=worker.last_heartbeat_at,
+                    experiment_eligibility=eligibility,
+                    experiment_ineligible_reason=reason,
                 )
             )
         own.sort(key=lambda w: w.worker_id)

@@ -181,6 +181,62 @@ class TestOwnWorkerEnrichment:
         assert tp_pub not in flat
         assert other not in flat
 
+    def test_lists_all_account_workers_with_eligibility(
+        self,
+        client,
+        account_repository,
+        tenant_repository,
+        worker_repository,
+        manifest_repository,
+        experiment_repository,
+        per_job_factory,
+    ) -> None:
+        # R-D #2: an account worker that can't serve THIS (model-gated) experiment
+        # still shows — tagged ineligible-with-reason — instead of vanishing.
+        account_repository.create(account_id="acct-e", idp=IdentityProvider.GITHUB, idp_sub="gh-e")
+        priv, pub = _new_keypair()
+        tenant_repository.register(tenant_id="t-e", maintainer_pubkey=pub, account_id="acct-e")
+        manifest = manifest_repository.insert(
+            tenant_id="t-e",
+            manifest_json={"tenant_id": "t-e", "experiment_id": "lbl-e"},
+            signature_json={},
+        )
+        exp = experiment_repository.create(
+            tenant_id="t-e",
+            tenant_experiment_label="lbl-e",
+            manifest_hash=manifest.manifest_hash,
+            required_capabilities={"models": ["m-x"]},
+        )
+        experiment_repository.update_status(exp.experiment_id, ExperimentStatus.APPROVED)
+        exp = experiment_repository.get_by_id(exp.experiment_id)
+
+        def enroll(wid: str, caps: dict) -> str:
+            _p, wp = _new_keypair()
+            worker_repository.enroll(worker_id=wid, pubkey_hex=wp, capabilities=caps)
+            worker_repository.bind_account(wid, account_id="acct-e", trust_tier=TrustTier.T2_TRUSTED)
+            return wp
+
+        prov = {"os": "linux", "execute_tenant_code": "provisioned"}
+        pk_back = enroll("w-back", {**prov, "models": ["m-x"]})  # holds + contributes
+        enroll("w-elig", {**prov, "models": ["m-x"]})  # holds, idle
+        enroll("w-inelig", {"os": "linux"})  # no model, not provisioned
+
+        _seed_results(per_job_factory, exp.experiment_id, [("r0", "u0", "w-back", pk_back)])
+
+        resp = _signed_get(
+            client,
+            privkey=priv,
+            pubkey_hex=pub,
+            path=f"/api/v0/experiments/{exp.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        own = {w["worker_id"]: w for w in resp.json()["own_workers"]}
+        assert set(own) == {"w-back", "w-elig", "w-inelig"}
+        assert own["w-back"]["experiment_eligibility"] == "backing"
+        assert own["w-elig"]["experiment_eligibility"] == "eligible"
+        assert own["w-inelig"]["experiment_eligibility"] == "ineligible"
+        assert own["w-inelig"]["experiment_ineligible_reason"]
+
     def test_maintainer_sees_own_workers(
         self,
         client,

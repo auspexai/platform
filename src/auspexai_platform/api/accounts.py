@@ -264,6 +264,38 @@ def build_router(
     ) -> dict:
         _require_maintainer(credential)
         accounts = account_repository.list_all()
+
+        def _t2_readiness(account) -> dict | None:
+            """Proactive promotion-readiness for a T1 account (the T1→T2 step):
+            receipts/distinct progress + identity-gate status, so the maintainer
+            sees WHO has earned it at a glance rather than learning post-hoc via a
+            gate-override warning. Only computed for T1 (the promotable tier)."""
+            if account.trust_tier != TrustTier.T1_AUTHENTICATED:
+                return None
+            if receipt_index_repository is None or eligibility_thresholds is None:
+                return None
+            from auspexai_platform.eligibility import compute_t2_eligibility
+
+            receipts = receipt_index_repository.list_for_account(account.account_id)
+            active_vouches = (
+                vouch_repository.list_for_target(account.account_id) if vouch_repository else []
+            )
+            elig = compute_t2_eligibility(
+                receipt_count=len(receipts),
+                distinct_experiments=len({e.experiment_id for e in receipts}),
+                thresholds=eligibility_thresholds,
+                account=account,
+                active_vouches=active_vouches,
+            )
+            return {
+                "receipts": elig.actuals["receipts"],
+                "receipts_required": elig.thresholds["receipts"],
+                "distinct_experiments": elig.actuals["distinct_experiments"],
+                "distinct_required": elig.thresholds["distinct_experiments"],
+                "identity_satisfied": elig.identity_gate.satisfied,
+                "ready": elig.ready_for_human_review,
+            }
+
         return {
             "accounts": [
                 {
@@ -283,6 +315,7 @@ def build_router(
                     "identity_verification_method": a.identity_verification_method.value
                     if a.identity_verification_method
                     else None,
+                    "t2_readiness": _t2_readiness(a),
                 }
                 for a in accounts
             ]
