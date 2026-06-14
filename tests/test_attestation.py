@@ -594,6 +594,12 @@ class TestAttestationRoute:
             path=f"/api/v0/experiments/{experiment.experiment_id}/attestation",
         )
         assert resp.status_code == 200, resp.text
+        # Firewall #2 researcher surface: the footprint is echoed in the RESPONSE
+        # (so the verbatim dashboard proxy carries it without a COSE decode)...
+        resp_fp = resp.json()["governance_footprint"]
+        assert resp_fp["schema_version"] == 1
+        assert resp_fp["integrity_basis"]["counts"]["within_cell_exact"] == 1
+        # ...and equals the authoritative signed predicate.
         from base64 import b64decode
 
         key = client.app.state.receipt_signing_key
@@ -601,6 +607,7 @@ class TestAttestationRoute:
             b64decode(resp.json()["cose_b64"]), expected_pubkey=key.public_key
         )
         fp = cbor2.loads(cbor2.loads(payload)["predicate"])["governance_footprint"]
+        assert fp == resp_fp
         assert fp["schema_version"] == 1
         assert fp["tenant"]["tier"].startswith("T")
         assert "integrity_policy" in fp["replication"]

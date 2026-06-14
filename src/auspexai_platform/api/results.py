@@ -25,6 +25,7 @@ from base64 import b64encode
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
+import cbor2
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
@@ -57,6 +58,20 @@ from auspexai_platform.receipts.attestation import (
 )
 from auspexai_platform.receipts.repository import ReceiptRepository
 from auspexai_platform.receipts.signing import SigningKey
+
+
+def _footprint_from_cose(cose_signed_blob: bytes) -> tuple[dict | None, list | None]:
+    """Decode the COSE-signed predicate to echo its `governance_footprint` +
+    `diverged_units` in the response (firewall #2 researcher-facing surface). The
+    signed `cose_b64` stays authoritative — this is a convenience decode. Returns
+    (None, None) on a pre-firewall attestation or an undecodable blob."""
+    try:
+        cose = cbor2.loads(cose_signed_blob)
+        predicate = cbor2.loads(cbor2.loads(cose[2])["predicate"])
+    except Exception:
+        return None, None
+    return predicate.get("governance_footprint"), (predicate.get("diverged_units") or None)
+
 
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 500
@@ -123,6 +138,12 @@ class ResultSetAttestationResponse(BaseModel):
     # (consensus-so-far). Always present so the tenant can branch on it; the same
     # flag lives in the COSE-signed predicate.
     partial: Annotated[bool | None, ExposureTag.PUBLIC] = None
+    # Firewall #2: the coordinator-asserted governance footprint (researcher-facing
+    # surface — F5). Echoed from the COSE-signed predicate; None on pre-firewall
+    # attestations. The signed cose_b64 stays the authoritative source.
+    governance_footprint: Annotated[dict[str, Any] | None, ExposureTag.PUBLIC] = None
+    # Firewall #1 (G4): units whose replicas diverged — signed predicate observations.
+    diverged_units: Annotated[list[dict[str, Any]] | None, ExposureTag.PUBLIC] = None
 
 
 def _require_researcher_own_tenant_or_maintainer(
@@ -283,6 +304,7 @@ def build_router(
         """Map a persisted canonical attestation row → the API response. The
         response's `experiment_id` is the tenant-facing label (receipt
         convention), matching the on-demand build path."""
+        footprint, diverged = _footprint_from_cose(record.cose_signed_blob)
         return ResultSetAttestationResponse(
             attestation_id=record.attestation_id,
             experiment_id=record.tenant_experiment_label,
@@ -301,6 +323,8 @@ def build_router(
                 else None
             ),
             partial=record.partial,
+            governance_footprint=footprint,
+            diverged_units=diverged,
         )
 
     @router.get(
@@ -530,6 +554,19 @@ def build_router(
             rekor_log_index=attestation.rekor_log_index,
             rekor_entry_uuid=attestation.rekor_entry_uuid,
             partial=attestation.partial,
+            governance_footprint=attestation.governance_footprint,
+            diverged_units=(
+                [
+                    {
+                        "unit_id": d.unit_id,
+                        "unit_payload_sha256": d.unit_payload_sha256,
+                        "result_hashes": d.result_hashes,
+                        "integrity_basis": d.integrity_basis,
+                    }
+                    for d in attestation.diverged_units
+                ]
+                or None
+            ),
         )
 
     @router.get(
