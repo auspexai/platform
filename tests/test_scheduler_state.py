@@ -491,7 +491,11 @@ def test_set_integrity_policy(
     )
     r = client.post(
         f"/api/v0/experiments/{exp.experiment_id}/actions/set-integrity-policy",
-        json={"integrity_policy": "trusted", "reason": "single-replica trusted run"},
+        json={
+            "integrity_policy": "trusted",
+            "reason": "single-replica trusted run",
+            "force": True,  # synth-doubler is a no-account T1 tenant → sub-floor
+        },
         headers=_mtnr(maintainer_token),
     )
     assert r.status_code == 200, r.text

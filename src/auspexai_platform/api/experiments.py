@@ -38,7 +38,12 @@ from pydantic import BaseModel, Field
 from auspexai_platform.assessment import assess_envelope, decide
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.dependency import require_maintainer
-from auspexai_platform.db.models import ExperimentStatus, TrustTier
+from auspexai_platform.db.models import (
+    INTEGRITY_POLICY_REPLICATION,
+    ExperimentStatus,
+    IntegrityPolicy,
+    TrustTier,
+)
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AttestationRepository,
@@ -56,7 +61,11 @@ from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.maintenance import projected_raw_age_off
 from auspexai_platform.receipts.signing import SigningKey
-from auspexai_platform.scheduler import integrity_policy_for_request
+from auspexai_platform.scheduler import (
+    integrity_policy_for_request,
+    is_sub_floor_policy,
+    policy_floor_for_tier,
+)
 
 # ---- response models -------------------------------------------------------
 
@@ -132,10 +141,16 @@ class ExperimentSubmissionRequest(BaseModel):
 
 class SetIntegrityPolicyRequest(BaseModel):
     """M4 scheduler override: change an experiment's integrity policy (the
-    replication target). `reason` is mandatory + audited."""
+    replication target). `reason` is mandatory + audited. `force` is required to
+    set a policy BELOW the tenant's tier floor (A' approve-time clamp)."""
 
     integrity_policy: str = Field(description="standard | high | trusted")
     reason: str = Field(min_length=1, max_length=2000)
+    force: bool = Field(
+        default=False,
+        description="override the tenant tier floor (set a sub-floor / repl-1 policy "
+        "the account hasn't earned); requires reason; loudly audited",
+    )
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -274,6 +289,77 @@ def _experiment_not_found(experiment_id: str) -> HTTPException:
             }
         },
     )
+
+
+def _enforce_policy_floor(
+    *,
+    experiment,
+    policy: IntegrityPolicy,
+    tenant_tier: Callable[[str], int] | None,
+    force: bool,
+    reason: str | None,
+) -> dict[str, Any]:
+    """A' approve-time clamp (§9 trust-economics). The submit path already seeds
+    an experiment's integrity policy floored by the tenant's tier; this guards
+    the two MANUAL maintainer overrides (approve `?integrity_policy=` and
+    set-integrity-policy) so they can't silently re-open the hole.
+
+    A maintainer may RAISE integrity above the floor freely. Lowering it BELOW
+    the floor (fewer replicas / less consensus than the account has earned) is a
+    deliberate, audited exception, not a silent default:
+
+      - no override          → 409 sub_floor_integrity_policy
+      - force=true, no reason → 422 force_requires_reason
+      - force=true + reason   → allowed; returns the audit-extra dict
+        (forced_below_floor / floor_policy / tenant_tier / force_reason) for the
+        caller to fold into the action's audit payload.
+
+    No-op (returns {}) when `tenant_tier` is unwired (tests) or the requested
+    policy already sits at/above the floor — the common case."""
+    if tenant_tier is None:
+        return {}
+    tier = tenant_tier(experiment.tenant_id)
+    if tier is None or not is_sub_floor_policy(policy, tier):
+        return {}
+    floor = policy_floor_for_tier(tier)
+    if not force:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": {
+                    "code": "sub_floor_integrity_policy",
+                    "message": (
+                        f"{policy.value} (repl-{INTEGRITY_POLICY_REPLICATION[policy]}) is below "
+                        f"the tier floor {floor.value!r} "
+                        f"(repl-{INTEGRITY_POLICY_REPLICATION[floor]}) for tenant tier "
+                        f"T{int(tier)}; pass force=true with a reason to override for this "
+                        f"experiment, or promote the account to lower replication"
+                    ),
+                    "details": {
+                        "requested_policy": policy.value,
+                        "floor_policy": floor.value,
+                        "tenant_tier": int(tier),
+                    },
+                }
+            },
+        )
+    if not (reason and reason.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "code": "force_requires_reason",
+                    "message": "force=true requires a non-empty reason for a sub-floor "
+                    "integrity-policy override",
+                }
+            },
+        )
+    return {
+        "forced_below_floor": True,
+        "floor_policy": floor.value,
+        "tenant_tier": int(tier),
+        "force_reason": reason,
+    }
 
 
 # ---- router ----------------------------------------------------------------
@@ -556,12 +642,13 @@ def build_router(
         max_units: int | None = None,
         max_concurrent_assignments: int | None = None,
         max_payload_bytes: int | None = None,
+        force: bool = False,
+        reason: str | None = None,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ExperimentResponse:
         require_maintainer(credential)
+        override_audit: dict[str, Any] = {}
         if integrity_policy is not None:
-            from auspexai_platform.db.models import IntegrityPolicy
-
             try:
                 policy = IntegrityPolicy(integrity_policy)
             except ValueError:
@@ -570,6 +657,17 @@ def build_router(
                     detail=f"invalid integrity_policy: {integrity_policy!r}; "
                     f"must be one of: standard, high, trusted",
                 ) from None
+            experiment = experiment_repository.get_by_id(experiment_id)
+            if experiment is None:
+                raise _experiment_not_found(experiment_id)
+            # A' approve-time clamp: a sub-floor policy needs force=true + reason.
+            override_audit = _enforce_policy_floor(
+                experiment=experiment,
+                policy=policy,
+                tenant_tier=tenant_tier,
+                force=force,
+                reason=reason,
+            )
             experiment_repository.set_integrity_policy(experiment_id, policy)
         if any(
             v is not None
@@ -596,6 +694,7 @@ def build_router(
             experiment_repository=experiment_repository,
             audit_repository=audit_repository,
             event_bus=event_bus,
+            extra_payload=override_audit or None,
         )
 
     @router.post("/experiments/{experiment_id}/assessment")
@@ -948,7 +1047,6 @@ def build_router(
         at submit, so this changes FUTURE units' target, not units already
         submitted. Mandatory reason; audited."""
         require_maintainer(credential)
-        from auspexai_platform.db.models import IntegrityPolicy
 
         try:
             policy = IntegrityPolicy(body.integrity_policy)
@@ -966,6 +1064,14 @@ def build_router(
         experiment = experiment_repository.get_by_id(experiment_id)
         if experiment is None:
             raise _experiment_not_found(experiment_id)
+        # A' approve-time clamp: a sub-floor policy needs force=true + reason.
+        override_audit = _enforce_policy_floor(
+            experiment=experiment,
+            policy=policy,
+            tenant_tier=tenant_tier,
+            force=body.force,
+            reason=body.reason,
+        )
         experiment_repository.set_integrity_policy(experiment_id, policy)
         updated = experiment_repository.get_by_id(experiment_id)
         audit_repository.append(
@@ -975,7 +1081,7 @@ def build_router(
             action="experiment.set_integrity_policy",
             resource_type="experiment",
             resource_id=experiment_id,
-            payload={"integrity_policy": policy.value, "reason": body.reason},
+            payload={"integrity_policy": policy.value, "reason": body.reason, **override_audit},
         )
         return filter_for_credential(
             _to_response(updated), credential, resource_tenant_id=updated.tenant_id
@@ -1023,9 +1129,11 @@ def _transition(
     experiment_repository: ExperimentRepository,
     audit_repository: AuditRepository,
     event_bus: EventBus | None = None,
+    extra_payload: dict[str, Any] | None = None,
 ) -> ExperimentResponse:
     """Common path for the action endpoints. Authorization + transition +
-    audit + response filter."""
+    audit + response filter. `extra_payload` merges into the audit payload —
+    used by approve to record an A' sub-floor integrity-policy override."""
     experiment = experiment_repository.get_by_id(experiment_id)
     if experiment is None:
         raise HTTPException(
@@ -1065,7 +1173,11 @@ def _transition(
         action=action,
         resource_type="experiment",
         resource_id=experiment_id,
-        payload={"from_status": experiment.status.value, "to_status": new_status.value},
+        payload={
+            "from_status": experiment.status.value,
+            "to_status": new_status.value,
+            **(extra_payload or {}),
+        },
     )
     if event_bus is not None:
         event_bus.publish(

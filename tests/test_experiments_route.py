@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from auspexai_platform.auth.signature import sign_request
+from auspexai_platform.db.models import IdentityProvider, TrustTier
 from auspexai_platform.events import GLOBAL
 
 
@@ -423,6 +424,156 @@ def test_approve_advances_to_approved(
     )
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "approved"
+
+
+# ---- A' approve-time clamp (sub-floor integrity-policy override) ------------
+#
+# These lock in the declarative-vs-enforcement guarantee: the tier floor that
+# submit seeds must also be CONSULTED at the two manual maintainer overrides
+# (approve `?integrity_policy=` and set-integrity-policy), so a sub-floor policy
+# can't be re-opened silently. `submitted_experiment` uses the no-account
+# "synth-doubler" tenant → tier T1 → floor `standard` (repl-3); `trusted`
+# (repl-1) is therefore sub-floor for it.
+
+_AUTH = lambda tok: {"Authorization": f"Bearer {tok}"}  # noqa: E731
+
+
+def _promote_tenant_to_t2(account_repository, tenant_repository, tenant_id: str) -> None:
+    acct = account_repository.create(
+        account_id="acct-clamp-t2",
+        idp=IdentityProvider.GITHUB,
+        idp_sub="clamp-t2-sub",
+        trust_tier=TrustTier.T2_TRUSTED,
+    )
+    tenant_repository.set_account(tenant_id, acct.account_id)
+
+
+def test_approve_subfloor_policy_rejected_without_force(
+    client: TestClient, submitted_experiment, maintainer_token: str
+) -> None:
+    _, _, experiment_id = submitted_experiment
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/approve",
+        params={"integrity_policy": "trusted"},
+        headers=_AUTH(maintainer_token),
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"]["code"] == "sub_floor_integrity_policy"
+    # the refusal happens BEFORE any state change — still submitted, untouched.
+    detail = client.get(
+        f"/api/v0/experiments/{experiment_id}", headers=_AUTH(maintainer_token)
+    ).json()
+    assert detail["status"] == "submitted"
+
+
+def test_approve_subfloor_policy_with_force_and_reason_succeeds_and_audits(
+    client: TestClient, submitted_experiment, maintainer_token: str, audit_repository
+) -> None:
+    _, _, experiment_id = submitted_experiment
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/approve",
+        params={"integrity_policy": "trusted", "force": "true", "reason": "one-off trusted run"},
+        headers=_AUTH(maintainer_token),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "approved"
+    assert r.json()["integrity_policy"] == "trusted"
+    rows = [
+        a
+        for a in audit_repository.latest(limit=30)
+        if a.action == "experiment.approve" and a.resource_id == experiment_id
+    ]
+    assert rows, "approve audit row missing"
+    payload = rows[0].payload
+    assert payload["forced_below_floor"] is True
+    assert payload["floor_policy"] == "standard"
+    assert payload["tenant_tier"] == int(TrustTier.T1_AUTHENTICATED)
+    assert payload["force_reason"] == "one-off trusted run"
+
+
+def test_approve_force_without_reason_rejected(
+    client: TestClient, submitted_experiment, maintainer_token: str
+) -> None:
+    _, _, experiment_id = submitted_experiment
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/approve",
+        params={"integrity_policy": "trusted", "force": "true"},
+        headers=_AUTH(maintainer_token),
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["error"]["code"] == "force_requires_reason"
+
+
+def test_approve_at_floor_policy_is_not_gated(
+    client: TestClient, submitted_experiment, maintainer_token: str, audit_repository
+) -> None:
+    # `standard` is exactly the T1 floor — allowed with no force, no override audit.
+    _, _, experiment_id = submitted_experiment
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/approve",
+        params={"integrity_policy": "standard"},
+        headers=_AUTH(maintainer_token),
+    )
+    assert r.status_code == 200, r.text
+    rows = [
+        a
+        for a in audit_repository.latest(limit=30)
+        if a.action == "experiment.approve" and a.resource_id == experiment_id
+    ]
+    assert "forced_below_floor" not in (rows[0].payload or {})
+
+
+def test_approve_subfloor_allowed_without_force_for_t2_tenant(
+    client: TestClient,
+    submitted_experiment,
+    maintainer_token: str,
+    account_repository,
+    tenant_repository,
+) -> None:
+    # The floor moves with earned trust: once the tenant's account is T2,
+    # `trusted`/repl-1 is no longer sub-floor and needs no force.
+    _, binding, experiment_id = submitted_experiment
+    _promote_tenant_to_t2(account_repository, tenant_repository, binding.tenant_id)
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/approve",
+        params={"integrity_policy": "trusted"},
+        headers=_AUTH(maintainer_token),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["integrity_policy"] == "trusted"
+
+
+def test_set_integrity_policy_subfloor_rejected_without_force(
+    client: TestClient, submitted_experiment, maintainer_token: str
+) -> None:
+    _, _, experiment_id = submitted_experiment
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/set-integrity-policy",
+        json={"integrity_policy": "trusted", "reason": "want repl-1"},
+        headers=_AUTH(maintainer_token),
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"]["code"] == "sub_floor_integrity_policy"
+
+
+def test_set_integrity_policy_subfloor_with_force_succeeds_and_audits(
+    client: TestClient, submitted_experiment, maintainer_token: str, audit_repository
+) -> None:
+    _, _, experiment_id = submitted_experiment
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/set-integrity-policy",
+        json={"integrity_policy": "trusted", "reason": "deliberate repl-1", "force": True},
+        headers=_AUTH(maintainer_token),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["integrity_policy"] == "trusted"
+    rows = [
+        a
+        for a in audit_repository.latest(limit=30)
+        if a.action == "experiment.set_integrity_policy" and a.resource_id == experiment_id
+    ]
+    assert rows and rows[0].payload["forced_below_floor"] is True
+    assert rows[0].payload["force_reason"] == "deliberate repl-1"
 
 
 # ---- POST /actions/abort — operator OR own researcher ----------------------

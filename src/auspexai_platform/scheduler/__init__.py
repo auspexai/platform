@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from auspexai_platform.db.models import (
+    INTEGRITY_POLICY_REPLICATION,
     Assignment,
     ExperimentStatus,
     IntegrityPolicy,
@@ -80,6 +81,27 @@ def integrity_policy_for_request(
     if effective <= 3:
         return IntegrityPolicy.STANDARD
     return IntegrityPolicy.HIGH
+
+
+def policy_floor_for_tier(tenant_tier: TrustTier | int) -> IntegrityPolicy:
+    """A' approve-time clamp: the most-permissive (lowest-replication) integrity
+    policy a tenant of this tier is ALLOWED to run at — the manual-override
+    floor. Equivalent to seeding from a repl-1 request: the tier floor clamps it
+    up. T0/T1 floor at STANDARD (repl-3); only T2+ may reach TRUSTED (repl-1).
+
+    Reuses `integrity_policy_for_request` so the submit-time seed and the
+    approve-time clamp can never disagree about where the floor sits."""
+    return integrity_policy_for_request(replication_factor=1, tenant_tier=tenant_tier)
+
+
+def is_sub_floor_policy(policy: IntegrityPolicy, tenant_tier: TrustTier | int) -> bool:
+    """True when `policy` requests FEWER replicas (less consensus cross-check)
+    than the tenant's tier floor allows — i.e. more trust than the account has
+    earned. Raising replication ABOVE the floor is always permitted; only
+    lowering BELOW it is gated (the A' approve-time clamp). Replication ordering
+    comes from `INTEGRITY_POLICY_REPLICATION`: trusted=1 < standard=3 < high=5."""
+    floor = policy_floor_for_tier(tenant_tier)
+    return INTEGRITY_POLICY_REPLICATION[policy] < INTEGRITY_POLICY_REPLICATION[floor]
 
 
 # §2.1 #8 (dispatch-retry): a refused assignment used to permanently bar the

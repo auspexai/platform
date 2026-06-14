@@ -213,7 +213,9 @@ class TestOwnWorkerEnrichment:
         def enroll(wid: str, caps: dict) -> str:
             _p, wp = _new_keypair()
             worker_repository.enroll(worker_id=wid, pubkey_hex=wp, capabilities=caps)
-            worker_repository.bind_account(wid, account_id="acct-e", trust_tier=TrustTier.T2_TRUSTED)
+            worker_repository.bind_account(
+                wid, account_id="acct-e", trust_tier=TrustTier.T2_TRUSTED
+            )
             return wp
 
         prov = {"os": "linux", "execute_tenant_code": "provisioned"}

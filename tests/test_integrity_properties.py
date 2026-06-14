@@ -224,7 +224,7 @@ class World:
             r = self.client.post(
                 f"/api/v0/experiments/{exp_id}/actions/set-integrity-policy",
                 headers=self.maintainer_headers,
-                json={"integrity_policy": "trusted", "reason": "soak fixture"},
+                json={"integrity_policy": "trusted", "reason": "soak fixture", "force": True},
             )
             assert r.status_code == 200, r.text
             units = [f"soak-u{i}-{j}" for j in range(2)]
@@ -319,7 +319,7 @@ class ResultAcceptanceMachine(RuleBasedStateMachine):
             r = self.w.client.post(
                 f"/api/v0/experiments/{exp_id}/actions/set-integrity-policy",
                 headers=self.w.maintainer_headers,
-                json={"integrity_policy": "trusted", "reason": "property pass: N=1"},
+                json={"integrity_policy": "trusted", "reason": "property pass: N=1", "force": True},
             )
             assert r.status_code == 200, r.text
         self.exps[exp_id] = {

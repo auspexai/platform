@@ -23,6 +23,8 @@ from auspexai_platform.scheduler import (
     Scheduler,
     integrity_policy_for_request,
     is_retryable_refusal,
+    is_sub_floor_policy,
+    policy_floor_for_tier,
     reoffer_eligible,
     worker_is_degraded,
     worker_is_self_paused,
@@ -44,6 +46,32 @@ def test_integrity_policy_for_request_floors_by_tenant_tier():
     assert f(replication_factor=5, tenant_tier=tier.T2_TRUSTED) == IntegrityPolicy.HIGH
     # int tier accepted; unknown defaults to the safe (standard) floor.
     assert f(replication_factor=1, tenant_tier=2) == IntegrityPolicy.TRUSTED
+
+
+def test_policy_floor_for_tier_matches_submit_seed():
+    # The manual-override floor must agree with the submit-time seed (both reuse
+    # integrity_policy_for_request) so the two paths can't drift apart.
+    tier = TrustTier
+    assert policy_floor_for_tier(tier.T0_ANONYMOUS) == IntegrityPolicy.STANDARD
+    assert policy_floor_for_tier(tier.T1_AUTHENTICATED) == IntegrityPolicy.STANDARD
+    assert policy_floor_for_tier(tier.T2_TRUSTED) == IntegrityPolicy.TRUSTED
+    assert policy_floor_for_tier(tier.T3_VETTED) == IntegrityPolicy.TRUSTED
+
+
+def test_is_sub_floor_policy_gates_only_lowering_below_floor():
+    p, tier = IntegrityPolicy, TrustTier
+    # trusted (repl-1) is below the T0/T1 floor (standard/repl-3) -> sub-floor.
+    assert is_sub_floor_policy(p.TRUSTED, tier.T1_AUTHENTICATED) is True
+    assert is_sub_floor_policy(p.TRUSTED, tier.T0_ANONYMOUS) is True
+    # T2+ have EARNED trusted/repl-1 -> not sub-floor.
+    assert is_sub_floor_policy(p.TRUSTED, tier.T2_TRUSTED) is False
+    assert is_sub_floor_policy(p.TRUSTED, tier.T3_VETTED) is False
+    # At or above the floor is always fine (raising consensus is never gated).
+    assert is_sub_floor_policy(p.STANDARD, tier.T1_AUTHENTICATED) is False
+    assert is_sub_floor_policy(p.HIGH, tier.T1_AUTHENTICATED) is False
+    assert is_sub_floor_policy(p.HIGH, tier.T2_TRUSTED) is False
+    # int tier accepted.
+    assert is_sub_floor_policy(p.TRUSTED, int(tier.T1_AUTHENTICATED)) is True
 
 
 def _make_experiment(
