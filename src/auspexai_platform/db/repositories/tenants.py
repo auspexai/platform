@@ -75,6 +75,21 @@ class TenantRepository:
             cur.execute("DELETE FROM tenants WHERE tenant_id = ?", (tenant_id,))
             return cur.rowcount > 0
 
+    def set_account(self, tenant_id: str, account_id: str | None) -> Tenant | None:
+        """Link (or unlink, `account_id=None`) an EXISTING tenant to an account —
+        the post-registration linkage the trust model depends on (the tier floor
+        for A' replication, own-worker enrichment, promotion). `account_id` is
+        NOT validated here (the route checks the account exists). Returns the
+        updated Tenant, or None if the tenant_id is unknown."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                "UPDATE tenants SET account_id = ?, revision = revision + 1 WHERE tenant_id = ?",
+                (account_id, tenant_id),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_by_id(tenant_id)
+
     # ---- reads ----
 
     def get_by_id(self, tenant_id: str) -> Tenant | None:

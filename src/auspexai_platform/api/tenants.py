@@ -75,6 +75,14 @@ class TenantCreateRequest(BaseModel):
     account_id: str | None = None
 
 
+class TenantLinkRequest(BaseModel):
+    """POST /api/v0/tenants/{id}/actions/link — set (or clear) the account a tenant
+    is linked to, post-registration. `account_id=null` unlinks."""
+
+    account_id: str | None = None
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 # ---- linkage view (ops worker↔tenant association) --------------------------
 #
 # The operator's all-linkages view: for one tenant, its bound account and the
@@ -214,6 +222,45 @@ def build_router(
             credential,
             resource_tenant_id=tenant.tenant_id,
         )
+
+    @router.post("/tenants/{tenant_id}/actions/link", status_code=status.HTTP_200_OK)
+    async def link_tenant(
+        tenant_id: str,
+        body: TenantLinkRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> dict:
+        """Maintainer: link (or unlink) an EXISTING tenant to an account — the
+        post-registration linkage the trust model needs (registration-only until
+        now). `account_id=null` unlinks. Mandatory, audited reason."""
+        require_maintainer(credential)
+        if tenant_repository.get_by_id(tenant_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": {"code": "unknown_tenant", "message": f"no tenant {tenant_id!r}"}},
+            )
+        if body.account_id is not None and account_repository.get_by_id(body.account_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": {
+                        "code": "unknown_account",
+                        "message": f"no account with id {body.account_id!r}",
+                        "details": {"account_id": body.account_id},
+                    }
+                },
+            )
+        updated = tenant_repository.set_account(tenant_id, body.account_id)
+        assert updated is not None
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=credential.maintainer_login or "maintainer",
+            actor_tenant_id=None,
+            action="tenant.link",
+            resource_type="tenant",
+            resource_id=tenant_id,
+            payload={"account_id": body.account_id, "reason": body.reason},
+        )
+        return {"tenant_id": tenant_id, "account_id": updated.account_id}
 
     @router.get(
         "/tenants",

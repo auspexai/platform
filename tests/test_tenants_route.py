@@ -44,6 +44,64 @@ def test_create_tenant_succeeds_for_maintainer(client: TestClient, maintainer_to
     assert body["contact_email"] == "contact@example.org"
 
 
+# ---- POST /tenants/{id}/actions/link — operator only -----------------------
+
+
+def _mk_tenant(client, h, tenant_id, pubkey):
+    client.post(
+        "/api/v0/tenants", headers=h, json={"tenant_id": tenant_id, "maintainer_pubkey": pubkey}
+    )
+
+
+def test_link_tenant_to_account_and_unlink(
+    client: TestClient, maintainer_token: str, account_repository
+) -> None:
+    from auspexai_platform.db.models import IdentityProvider
+
+    h = {"Authorization": f"Bearer {maintainer_token}"}
+    account_repository.create(account_id="acct-x", idp=IdentityProvider.GITHUB, idp_sub="gh-x")
+    _mk_tenant(client, h, "t-link", "b" * 64)
+    r = client.post(
+        "/api/v0/tenants/t-link/actions/link",
+        headers=h,
+        json={"account_id": "acct-x", "reason": "onboard"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["account_id"] == "acct-x"
+    assert client.get("/api/v0/tenants/t-link/linkage", headers=h).json()["account_id"] == "acct-x"
+    # unlink
+    r2 = client.post(
+        "/api/v0/tenants/t-link/actions/link",
+        headers=h,
+        json={"account_id": None, "reason": "detach"},
+    )
+    assert r2.json()["account_id"] is None
+
+
+def test_link_unknown_account_is_400(client: TestClient, maintainer_token: str) -> None:
+    h = {"Authorization": f"Bearer {maintainer_token}"}
+    _mk_tenant(client, h, "t-link2", "c" * 64)
+    r = client.post(
+        "/api/v0/tenants/t-link2/actions/link",
+        headers=h,
+        json={"account_id": "nope", "reason": "x"},
+    )
+    assert r.status_code == 400
+
+
+def test_link_unknown_tenant_is_404(client: TestClient, maintainer_token: str) -> None:
+    h = {"Authorization": f"Bearer {maintainer_token}"}
+    r = client.post(
+        "/api/v0/tenants/ghost/actions/link", headers=h, json={"account_id": None, "reason": "x"}
+    )
+    assert r.status_code == 404
+
+
+def test_link_requires_maintainer(client: TestClient) -> None:
+    r = client.post("/api/v0/tenants/t/actions/link", json={"account_id": None, "reason": "x"})
+    assert r.status_code == 403
+
+
 def test_create_tenant_duplicate_id_returns_409(client: TestClient, maintainer_token: str) -> None:
     headers = {"Authorization": f"Bearer {maintainer_token}"}
     body = {"tenant_id": "synth-doubler", "maintainer_pubkey": "a" * 64}
