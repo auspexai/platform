@@ -156,6 +156,8 @@ def build_router(
     vouch_repository: VouchRepository | None = None,
     receipt_index_repository=None,
     eligibility_thresholds=None,
+    vouch_min_receipts: int = VOUCH_MIN_RECEIPTS,
+    vouch_min_distinct_tenants: int = VOUCH_MIN_DISTINCT_TENANTS,
 ) -> APIRouter:
     """Build /accounts router bound to repository instances + verifier."""
 
@@ -276,13 +278,15 @@ def build_router(
                 return None
             from auspexai_platform.eligibility import compute_t2_eligibility
 
-            receipts = receipt_index_repository.list_for_account(account.account_id)
+            receipt_count, distinct_tenants = receipt_index_repository.account_receipt_summary(
+                account.account_id
+            )
             active_vouches = (
                 vouch_repository.list_for_target(account.account_id) if vouch_repository else []
             )
             elig = compute_t2_eligibility(
-                receipt_count=len(receipts),
-                distinct_experiments=len({e.experiment_id for e in receipts}),
+                receipt_count=receipt_count,
+                distinct_tenants=distinct_tenants,
                 thresholds=eligibility_thresholds,
                 account=account,
                 active_vouches=active_vouches,
@@ -290,8 +294,10 @@ def build_router(
             return {
                 "receipts": elig.actuals["receipts"],
                 "receipts_required": elig.thresholds["receipts"],
-                "distinct_experiments": elig.actuals["distinct_experiments"],
-                "distinct_required": elig.thresholds["distinct_experiments"],
+                "distinct_tenants": elig.actuals["distinct_tenants"],
+                "distinct_required": elig.thresholds["distinct_tenants"],
+                "account_age_days": elig.actuals["account_age_days"],
+                "min_account_age_days": elig.thresholds["min_account_age_days"],
                 "identity_satisfied": elig.identity_gate.satisfied,
                 "ready": elig.ready_for_human_review,
             }
@@ -363,15 +369,14 @@ def build_router(
             active_vouches = (
                 vouch_repository.list_for_target(account_id) if vouch_repository else []
             )
+            _rc, _dt = (
+                receipt_index_repository.account_receipt_summary(account_id)
+                if receipt_index_repository
+                else (0, 0)
+            )
             elig = compute_t2_eligibility(
-                receipt_count=len(receipt_index_repository.list_for_account(account_id))
-                if receipt_index_repository
-                else 0,
-                distinct_experiments=len(
-                    {e.experiment_id for e in receipt_index_repository.list_for_account(account_id)}
-                )
-                if receipt_index_repository
-                else 0,
+                receipt_count=_rc,
+                distinct_tenants=_dt,
                 thresholds=eligibility_thresholds,
                 account=account,
                 active_vouches=active_vouches,
@@ -380,9 +385,13 @@ def build_router(
                 gate_warnings.append(
                     f"receipt threshold not met ({elig.actuals['receipts']}/{elig.thresholds['receipts']})"
                 )
-            if not elig.distinct_experiments_threshold_met:
+            if not elig.distinct_tenants_threshold_met:
                 gate_warnings.append(
-                    f"distinct experiments threshold not met ({elig.actuals['distinct_experiments']}/{elig.thresholds['distinct_experiments']})"
+                    f"distinct-tenants breadth not met ({elig.actuals['distinct_tenants']}/{elig.thresholds['distinct_tenants']})"
+                )
+            if not elig.account_age_threshold_met:
+                gate_warnings.append(
+                    f"account-age window not met ({elig.actuals['account_age_days']}/{elig.thresholds['min_account_age_days']} days)"
                 )
             if not elig.identity_gate.satisfied:
                 gate_warnings.append("identity gate not satisfied (no verification or vouching)")
@@ -604,12 +613,12 @@ def build_router(
         # target's identity gate, so this is the Sybil chokepoint).
         if receipt_index_repository is not None:
             total, tenants = receipt_index_repository.account_receipt_summary(credential.account_id)
-            if total < VOUCH_MIN_RECEIPTS or tenants < VOUCH_MIN_DISTINCT_TENANTS:
+            if total < vouch_min_receipts or tenants < vouch_min_distinct_tenants:
                 raise HTTPException(
                     status_code=403,
                     detail=(
-                        f"voucher must hold ≥{VOUCH_MIN_RECEIPTS} receipts across "
-                        f"≥{VOUCH_MIN_DISTINCT_TENANTS} tenants (anti-Sybil, §6.2.2); "
+                        f"voucher must hold ≥{vouch_min_receipts} receipts across "
+                        f"≥{vouch_min_distinct_tenants} tenants (anti-Sybil, §6.2.2); "
                         f"has {total} across {tenants}"
                     ),
                 )

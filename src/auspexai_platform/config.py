@@ -37,7 +37,17 @@ DEFAULT_REKOR_URL = "https://rekor.sigstore.dev"
 # tier-bump endpoint itself ship with the vouching / identity-verification
 # milestone(s).
 DEFAULT_TIER_T2_RECEIPT_THRESHOLD = 50
-DEFAULT_TIER_T2_DISTINCT_EXPERIMENTS = 3
+# Firewall #3 (inc-2): breadth is now distinct TENANTS, not distinct experiments —
+# an account earns T2 by corroborating *diverse* tenants' work (independence),
+# not by one tenant running many experiments (which a single operator can farm).
+DEFAULT_TIER_T2_DISTINCT_TENANTS = 3
+# Anti-burst (inc-2): minimum account age before T2 is reachable, so an account
+# cannot spin up and farm trust in a single sprint. 0 disables the gate.
+DEFAULT_TIER_T2_MIN_ACCOUNT_AGE_DAYS = 7
+# §6.2.2 anti-Sybil vouching bars (inc-2 — moved from hardcoded to config): a
+# voucher must already hold this many receipts across this many distinct tenants.
+DEFAULT_VOUCH_MIN_RECEIPTS = 20
+DEFAULT_VOUCH_MIN_DISTINCT_TENANTS = 2
 
 
 @dataclass(frozen=True)
@@ -47,7 +57,10 @@ class Config:
     state_dir: Path
     receipts_mode: str = DEFAULT_RECEIPTS_MODE
     tier_t2_receipt_threshold: int = DEFAULT_TIER_T2_RECEIPT_THRESHOLD
-    tier_t2_distinct_experiments: int = DEFAULT_TIER_T2_DISTINCT_EXPERIMENTS
+    tier_t2_distinct_tenants: int = DEFAULT_TIER_T2_DISTINCT_TENANTS
+    tier_t2_min_account_age_days: int = DEFAULT_TIER_T2_MIN_ACCOUNT_AGE_DAYS
+    vouch_min_receipts: int = DEFAULT_VOUCH_MIN_RECEIPTS
+    vouch_min_distinct_tenants: int = DEFAULT_VOUCH_MIN_DISTINCT_TENANTS
     rekor_url: str = DEFAULT_REKOR_URL
 
     def __post_init__(self) -> None:
@@ -59,9 +72,13 @@ class Config:
             raise ValueError(
                 f"tier_t2_receipt_threshold must be >=1, got {self.tier_t2_receipt_threshold}"
             )
-        if self.tier_t2_distinct_experiments < 1:
+        if self.tier_t2_distinct_tenants < 1:
             raise ValueError(
-                f"tier_t2_distinct_experiments must be >=1, got {self.tier_t2_distinct_experiments}"
+                f"tier_t2_distinct_tenants must be >=1, got {self.tier_t2_distinct_tenants}"
+            )
+        if self.tier_t2_min_account_age_days < 0:
+            raise ValueError(
+                f"tier_t2_min_account_age_days must be >=0, got {self.tier_t2_min_account_age_days}"
             )
 
     @property
@@ -128,10 +145,24 @@ class Config:
                 DEFAULT_TIER_T2_RECEIPT_THRESHOLD,
             )
         )
-        t2_experiments = int(
+        t2_tenants = int(
             os.environ.get(
-                "AUSPEXAI_TIER_T2_DISTINCT_EXPERIMENTS",
-                DEFAULT_TIER_T2_DISTINCT_EXPERIMENTS,
+                "AUSPEXAI_TIER_T2_DISTINCT_TENANTS",
+                DEFAULT_TIER_T2_DISTINCT_TENANTS,
+            )
+        )
+        t2_min_age = int(
+            os.environ.get(
+                "AUSPEXAI_TIER_T2_MIN_ACCOUNT_AGE_DAYS",
+                DEFAULT_TIER_T2_MIN_ACCOUNT_AGE_DAYS,
+            )
+        )
+        vouch_min_receipts = int(
+            os.environ.get("AUSPEXAI_VOUCH_MIN_RECEIPTS", DEFAULT_VOUCH_MIN_RECEIPTS)
+        )
+        vouch_min_tenants = int(
+            os.environ.get(
+                "AUSPEXAI_VOUCH_MIN_DISTINCT_TENANTS", DEFAULT_VOUCH_MIN_DISTINCT_TENANTS
             )
         )
         rekor_url = os.environ.get("AUSPEXAI_REKOR_URL", DEFAULT_REKOR_URL)
@@ -139,6 +170,9 @@ class Config:
             state_dir=resolved_state_dir,
             receipts_mode=receipts_mode,
             tier_t2_receipt_threshold=t2_receipts,
-            tier_t2_distinct_experiments=t2_experiments,
+            tier_t2_distinct_tenants=t2_tenants,
+            tier_t2_min_account_age_days=t2_min_age,
+            vouch_min_receipts=vouch_min_receipts,
+            vouch_min_distinct_tenants=vouch_min_tenants,
             rekor_url=rekor_url,
         )

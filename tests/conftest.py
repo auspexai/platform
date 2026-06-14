@@ -59,7 +59,9 @@ def state_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def config(state_dir: Path) -> Config:
-    return Config(state_dir=state_dir)
+    # inc-2: disable the anti-burst account-age gate in tests (it's unit-tested
+    # explicitly); integration tests seed fresh accounts and assert promotion.
+    return Config(state_dir=state_dir, tier_t2_min_account_age_days=0)
 
 
 @pytest.fixture

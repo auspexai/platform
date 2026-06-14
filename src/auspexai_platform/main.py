@@ -373,7 +373,8 @@ def create_app(
 
     eligibility_thresholds = EligibilityThresholds(
         t2_receipt_threshold=config.tier_t2_receipt_threshold,
-        t2_distinct_experiments=config.tier_t2_distinct_experiments,
+        t2_distinct_tenants=config.tier_t2_distinct_tenants,
+        t2_min_account_age_days=config.tier_t2_min_account_age_days,
     )
     app.include_router(
         account_routes.build_router(
@@ -385,6 +386,8 @@ def create_app(
             vouch_repository=vouch_repository,
             receipt_index_repository=receipt_index_repository,
             eligibility_thresholds=eligibility_thresholds,
+            vouch_min_receipts=config.vouch_min_receipts,
+            vouch_min_distinct_tenants=config.vouch_min_distinct_tenants,
         ),
         prefix="/api/v0",
         tags=["accounts"],

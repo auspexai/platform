@@ -170,7 +170,8 @@ class TierEligibilityResponse(BaseModel):
     tier: Annotated[int | None, ExposureTag.PUBLIC] = None
     tier_name: Annotated[str | None, ExposureTag.PUBLIC] = None
     receipt_threshold_met: Annotated[bool | None, ExposureTag.PUBLIC] = None
-    distinct_experiments_threshold_met: Annotated[bool | None, ExposureTag.PUBLIC] = None
+    distinct_tenants_threshold_met: Annotated[bool | None, ExposureTag.PUBLIC] = None
+    account_age_threshold_met: Annotated[bool | None, ExposureTag.PUBLIC] = None
     thresholds: Annotated[dict[str, int] | None, ExposureTag.PUBLIC] = None
     actuals: Annotated[dict[str, int] | None, ExposureTag.PUBLIC] = None
     identity_check_pending: Annotated[bool | None, ExposureTag.PUBLIC] = None
@@ -694,7 +695,8 @@ def build_router(
                         tier=e.tier,
                         tier_name=e.tier_name,
                         receipt_threshold_met=e.receipt_threshold_met,
-                        distinct_experiments_threshold_met=e.distinct_experiments_threshold_met,
+                        distinct_tenants_threshold_met=e.distinct_tenants_threshold_met,
+                        account_age_threshold_met=e.account_age_threshold_met,
                         thresholds=e.thresholds,
                         actuals=e.actuals,
                         identity_check_pending=e.identity_check_pending,

@@ -20,9 +20,10 @@ Eligibility shape returned for each future tier:
         "tier": 2,
         "tier_name": "T2 vouched",
         "receipt_threshold_met": bool,
-        "distinct_experiments_threshold_met": bool,
-        "thresholds": {"receipts": int, "distinct_experiments": int},
-        "actuals": {"receipts": int, "distinct_experiments": int},
+        "distinct_tenants_threshold_met": bool,   # firewall #3: breadth = tenants
+        "account_age_threshold_met": bool,        # anti-burst
+        "thresholds": {"receipts": int, "distinct_tenants": int, "min_account_age_days": int},
+        "actuals": {"receipts": int, "distinct_tenants": int, "account_age_days": int},
         "identity_check_pending": True,   # always True pre-§6.1 milestones
         "vouching_pending": True,         # always True pre-vouching milestone
         "ready_for_human_review": bool,
@@ -36,6 +37,7 @@ Eligibility shape returned for each future tier:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from auspexai_platform.db.models import Account, TrustTier, Vouch
 from auspexai_platform.db.repositories import ReceiptIndexRepository
@@ -46,7 +48,8 @@ class EligibilityThresholds:
     """Threshold values per tier, sourced from Config."""
 
     t2_receipt_threshold: int
-    t2_distinct_experiments: int
+    t2_distinct_tenants: int  # firewall #3 (inc-2): breadth = distinct tenants
+    t2_min_account_age_days: int = 0  # anti-burst; 0 = no age requirement
 
 
 @dataclass(frozen=True)
@@ -71,7 +74,8 @@ class TierEligibility:
     tier: int
     tier_name: str
     receipt_threshold_met: bool
-    distinct_experiments_threshold_met: bool
+    distinct_tenants_threshold_met: bool  # firewall #3: breadth over distinct tenants
+    account_age_threshold_met: bool  # anti-burst: account old enough
     thresholds: dict[str, int]
     actuals: dict[str, int]
     identity_check_pending: bool
@@ -133,35 +137,60 @@ def _compute_identity_gate(
     return IdentityGateStatus(satisfied=False)
 
 
+def _account_age_days(account: Account | None, now: datetime) -> int | None:
+    """Whole days since the account was created. None when there is no account
+    (the age gate then cannot be satisfied)."""
+    if account is None or account.created_at is None:
+        return None
+    created = account.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return max(0, (now - created).days)
+
+
 def compute_t2_eligibility(
     *,
     receipt_count: int,
-    distinct_experiments: int,
+    distinct_tenants: int,
     thresholds: EligibilityThresholds,
     account: Account | None = None,
     active_vouches: list[Vouch] | None = None,
+    now: datetime | None = None,
 ) -> TierEligibility:
-    """Compute T1→T2 eligibility given an account's aggregates + identity state."""
+    """Compute T1→T2 eligibility given an account's aggregates + identity state.
+
+    Firewall #3 (inc-2): breadth is measured over distinct TENANTS, and an
+    anti-burst account-age gate must also pass. `ready_for_human_review` is the
+    automated AND of receipts + distinct-tenants + account-age + the identity gate.
+    """
+    now = now or datetime.now(UTC)
     receipt_met = receipt_count >= thresholds.t2_receipt_threshold
-    distinct_met = distinct_experiments >= thresholds.t2_distinct_experiments
+    distinct_met = distinct_tenants >= thresholds.t2_distinct_tenants
+    age_days = _account_age_days(account, now)
+    age_met = age_days is not None and age_days >= thresholds.t2_min_account_age_days
     identity_gate = _compute_identity_gate(account, active_vouches or [])
     return TierEligibility(
         tier=int(TrustTier.T2_TRUSTED),
         tier_name=_tier_name(int(TrustTier.T2_TRUSTED)),
         receipt_threshold_met=receipt_met,
-        distinct_experiments_threshold_met=distinct_met,
+        distinct_tenants_threshold_met=distinct_met,
+        account_age_threshold_met=age_met,
         thresholds={
             "receipts": thresholds.t2_receipt_threshold,
-            "distinct_experiments": thresholds.t2_distinct_experiments,
+            "distinct_tenants": thresholds.t2_distinct_tenants,
+            "min_account_age_days": thresholds.t2_min_account_age_days,
         },
         actuals={
             "receipts": receipt_count,
-            "distinct_experiments": distinct_experiments,
+            "distinct_tenants": distinct_tenants,
+            "account_age_days": age_days if age_days is not None else 0,
         },
         identity_check_pending=account is None or account.identity_verified_at is None,
         vouching_pending=not bool(active_vouches),
         identity_gate=identity_gate,
-        ready_for_human_review=(receipt_met and distinct_met and identity_gate.satisfied),
+        ready_for_human_review=(
+            receipt_met and distinct_met and age_met and identity_gate.satisfied
+        ),
     )
 
 
@@ -180,7 +209,9 @@ def compute_receipt_stats(
     """
     entries = receipt_index_repository.list_for_account(account_id)
     distinct_experiment_ids = {e.experiment_id for e in entries}
-    distinct_tenant_count = len(distinct_experiment_ids)  # upper-bound placeholder
+    # Firewall #3 (inc-2): the AUTHORITATIVE distinct-tenant count (receipt_index ⨝
+    # workers ⨝ experiments), replacing the old experiments-as-upper-bound placeholder.
+    _total, distinct_tenant_count = receipt_index_repository.account_receipt_summary(account_id)
 
     first_at = entries[-1].issued_at.isoformat() if entries else None
     last_at = entries[0].issued_at.isoformat() if entries else None
@@ -190,7 +221,7 @@ def compute_receipt_stats(
         eligibility_by_tier.append(
             compute_t2_eligibility(
                 receipt_count=len(entries),
-                distinct_experiments=len(distinct_experiment_ids),
+                distinct_tenants=distinct_tenant_count,
                 thresholds=thresholds,
                 account=account,
                 active_vouches=active_vouches,

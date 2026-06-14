@@ -1118,12 +1118,13 @@ def _maybe_auto_promote(
     if vouch_repository is not None:
         active_vouches = vouch_repository.list_for_target(worker.account_id)
 
-    entries = receipt_index_repository.list_for_account(worker.account_id)
-    distinct_experiments = len({e.experiment_id for e in entries})
+    receipt_count, distinct_tenants = receipt_index_repository.account_receipt_summary(
+        worker.account_id
+    )
 
     elig = compute_t2_eligibility(
-        receipt_count=len(entries),
-        distinct_experiments=distinct_experiments,
+        receipt_count=receipt_count,
+        distinct_tenants=distinct_tenants,
         thresholds=eligibility_thresholds,
         account=account,
         active_vouches=active_vouches,
@@ -1157,9 +1158,10 @@ def _maybe_auto_promote(
         payload={
             "old_tier": int(TrustTier.T1_AUTHENTICATED),
             "new_tier": int(TrustTier.T2_TRUSTED),
-            "trigger": "receipt_threshold_and_identity_gate_satisfied",
-            "receipt_count": len(entries),
-            "distinct_experiments": distinct_experiments,
+            "trigger": "receipt_breadth_age_and_identity_gate_satisfied",
+            "receipt_count": receipt_count,
+            "distinct_tenants": distinct_tenants,
+            "account_age_days": elig.actuals["account_age_days"],
             "identity_gate_method": elig.identity_gate.method,
         },
     )
