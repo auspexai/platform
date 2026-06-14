@@ -353,6 +353,7 @@ def create_app(
             approved_classes=_approved_classes,
             auto_approval_gate=_auto_approval_gate,  # §9 #48 inc-4 runtime gate
             containment_strict_below_tier=config.containment_strict_below_tier,  # §41 floor
+            governance_footprint_builder=_governance_footprint_for,  # firewall #2 (finalize emit)
         ),
         prefix="/api/v0",
         tags=["experiments"],

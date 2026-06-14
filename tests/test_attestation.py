@@ -617,6 +617,52 @@ class TestAttestationRoute:
         assert fp["integrity_basis"]["counts"]["within_cell_exact"] == 1
         assert fp["integrity_basis"]["counts"]["diverged"] == 0
 
+    def test_finalize_path_persists_governance_footprint(
+        self,
+        client: TestClient,
+        approved_experiment,
+        enrolled_worker,
+        per_job_factory: PerJobDatabaseFactory,
+        receipt_index_repository,
+    ):
+        """Regression (live D6 run, 2026-06-14): the finalize-submissions emit path
+        — not just the on-demand route — must persist the governance_footprint.
+        finalize → auto-complete → emit-on-complete via the EXPERIMENTS router."""
+        privkey, binding, experiment, _ = approved_experiment
+        _, worker = enrolled_worker
+        _seed_consensus_unit(
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u1",
+            payload={"v": 1},
+            worker_id=worker.worker_id,
+            replication_target=2,
+        )
+        path = f"/api/v0/experiments/{experiment.experiment_id}/actions/finalize-submissions"
+        headers = sign_request(
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            method="POST",
+            path=path,
+            authority=AUTHORITY,
+            body=b"",
+        )
+        resp = client.post(path, headers=headers)
+        assert resp.status_code == 200, resp.text
+        # The now-PERSISTED attestation (served by the on-demand GET) MUST carry the
+        # footprint — the bug was the finalize emit dropping it.
+        att = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/attestation",
+        ).json()
+        assert att.get("governance_footprint") is not None, (
+            "finalize-path attestation lacks footprint"
+        )
+        assert att["governance_footprint"]["integrity_basis"]["counts"]["within_cell_exact"] == 1
+
     def test_checkpoint_partial_attestation_when_not_completed(
         self,
         client: TestClient,

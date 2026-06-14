@@ -391,6 +391,9 @@ def build_router(
     # §41 containment floor: tenants below this tier require strict sandboxing.
     # 0 = disabled (Phase-1 default). Wired from config.containment_strict_below_tier.
     containment_strict_below_tier: int = 0,
+    # firewall #2: (experiment, entries, diverged, db) -> dict | None. The finalize
+    # path also persists the canonical attestation, so it needs the footprint builder.
+    governance_footprint_builder=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -995,6 +998,10 @@ def build_router(
                         audit_repository=audit_repository,
                         attestation_repository=attestation_repository,
                         event_bus=event_bus,
+                        # firewall #2: the finalize path persists the canonical
+                        # attestation too — it MUST carry the footprint (the
+                        # bug a live D6 run surfaced: emit here lacked it).
+                        governance_footprint_builder=governance_footprint_builder,
                     )
                 updated = experiment_repository.get_by_id(experiment_id) or updated
         return filter_for_credential(
