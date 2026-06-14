@@ -408,7 +408,9 @@ def build_router(
             )
 
         try:
-            account = account_repository.promote(account_id, target_tier=target)
+            account = account_repository.promote(
+                account_id, target_tier=target, set_by_class=CredentialClass.MAINTAINER
+            )
         except AccountNotFoundError:
             raise HTTPException(status_code=404, detail="account not found") from None
 
@@ -468,7 +470,9 @@ def build_router(
             )
 
         try:
-            account = account_repository.demote(account_id, target_tier=target)
+            account = account_repository.demote(
+                account_id, target_tier=target, set_by_class=CredentialClass.MAINTAINER
+            )
         except AccountNotFoundError:
             raise HTTPException(status_code=404, detail="account not found") from None
 

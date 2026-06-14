@@ -181,6 +181,55 @@ def create_app(
         policy = assessment_policy_repository.get()
         return policy.enabled, policy.min_tier
 
+    def _governance_footprint_for(experiment, entries, diverged_units, per_job_db):
+        # Firewall #2: assemble the COSE-signed governance footprint for an
+        # experiment's attestation from control + per-job state (the asserted half;
+        # the recomputable integrity_basis half comes from entries/diverged_units).
+        from auspexai_platform.footprint import (
+            assemble_governance_footprint,
+            compute_independence,
+        )
+
+        tenant = tenant_repository.get_by_id(experiment.tenant_id)
+        account = (
+            account_repository.get_by_id(tenant.account_id)
+            if tenant is not None and tenant.account_id is not None
+            else None
+        )
+        tier = int(account.trust_tier) if account is not None else int(TrustTier.T1_AUTHENTICATED)
+        identity_gate = (
+            "verified"
+            if account is not None and account.identity_verified_at is not None
+            else "unsatisfied"
+        )
+        decision = experiment.assessment_decision
+        assessment = (
+            {
+                "research_class": experiment.research_class,
+                "tier": experiment.assessment_tier,
+                "envelope": experiment.assessment_envelope,
+            }
+            if decision is not None
+            else None
+        )
+
+        def _resolver(worker_id):
+            w = worker_repository.get_by_id(worker_id)
+            return w.account_id if w is not None else None
+
+        return assemble_governance_footprint(
+            tenant_tier=tier,
+            identity_gate=identity_gate,
+            integrity_policy=experiment.integrity_policy,
+            # 'auto' only when #48 auto-approved; review/None both routed through a human.
+            approval_experiment="auto" if decision == "auto" else "human",
+            assessment=assessment,
+            promotion_tier_set_by=account.tier_set_by_class if account is not None else None,
+            independence=compute_independence(per_job_db, _resolver),
+            entries=entries,
+            diverged_units=diverged_units,
+        )
+
     scheduler = Scheduler(
         experiment_repository,
         per_job_factory,
@@ -396,6 +445,7 @@ def create_app(
             prestage_repository=model_prestage_repository,
             attestation_repository=attestation_repository,
             promotion_auto_t1_t2=_promotion_auto_t1_t2,
+            governance_footprint_builder=_governance_footprint_for,
         ),
         prefix="/api/v0",
         tags=["assignments"],
@@ -426,6 +476,7 @@ def create_app(
             signing_key=receipt_signing_key,
             audit_repository=audit_repository,
             attestation_repository=attestation_repository,
+            governance_footprint_builder=_governance_footprint_for,
         ),
         prefix="/api/v0",
         tags=["results"],

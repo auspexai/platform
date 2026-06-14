@@ -102,17 +102,20 @@ class AccountRepository:
         account_id: str,
         *,
         target_tier: TrustTier,
+        set_by_class: object | None = None,
     ) -> Account:
         """Bump trust_tier to target_tier. Caller is responsible for gate
         validation (receipt thresholds, identity gate). Raises AccountNotFoundError
-        if account_id is unknown or retired."""
+        if account_id is unknown or retired. `set_by_class` (F4) records WHO did it
+        ('system' auto / 'maintainer' manual) for the governance footprint."""
+        set_by = getattr(set_by_class, "value", set_by_class)
         with self.db.transaction() as cur:
             cur.execute(
                 """
-                UPDATE accounts SET trust_tier = ?
+                UPDATE accounts SET trust_tier = ?, tier_set_by_class = ?
                 WHERE account_id = ? AND retired_at IS NULL AND suspended_at IS NULL
                 """,
-                (int(target_tier), account_id),
+                (int(target_tier), set_by, account_id),
             )
             if cur.rowcount == 0:
                 raise AccountNotFoundError(account_id)
@@ -125,30 +128,34 @@ class AccountRepository:
         account_id: str,
         *,
         target_tier: TrustTier,
+        set_by_class: object | None = None,
     ) -> Account:
         """Drop trust_tier to target_tier. Revokes identity verification if
-        crossing below T2. Raises AccountNotFoundError if unknown/retired."""
+        crossing below T2. Raises AccountNotFoundError if unknown/retired.
+        `set_by_class` (F4) records WHO did it for the governance footprint."""
+        set_by = getattr(set_by_class, "value", set_by_class)
         with self.db.transaction() as cur:
             if target_tier < TrustTier.T2_TRUSTED:
                 cur.execute(
                     """
                     UPDATE accounts
                     SET trust_tier = ?,
+                        tier_set_by_class = ?,
                         identity_verified_at = NULL,
                         identity_verified_by = NULL,
                         identity_verification_method = NULL,
                         identity_verification_note = NULL
                     WHERE account_id = ? AND retired_at IS NULL
                     """,
-                    (int(target_tier), account_id),
+                    (int(target_tier), set_by, account_id),
                 )
             else:
                 cur.execute(
                     """
-                    UPDATE accounts SET trust_tier = ?
+                    UPDATE accounts SET trust_tier = ?, tier_set_by_class = ?
                     WHERE account_id = ? AND retired_at IS NULL
                     """,
-                    (int(target_tier), account_id),
+                    (int(target_tier), set_by, account_id),
                 )
             if cur.rowcount == 0:
                 raise AccountNotFoundError(account_id)
@@ -367,6 +374,9 @@ class AccountRepository:
                 datetime.fromisoformat(row["suspended_at"]) if row["suspended_at"] else None
             ),
             suspension_reason=row["suspension_reason"],
+            tier_set_by_class=(
+                row["tier_set_by_class"] if "tier_set_by_class" in row.keys() else None
+            ),
         )
 
     @staticmethod

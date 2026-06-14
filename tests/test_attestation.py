@@ -8,10 +8,16 @@ import cbor2
 import pytest
 
 from auspexai_platform.receipts.attestation import (
+    INTEGRITY_BASIS_DIVERGED,
+    INTEGRITY_BASIS_EXACT,
+    INTEGRITY_BASIS_PROCESS_ONLY,
     RESULT_SET_ALGORITHM,
     RESULT_SET_ALGORITHM_V1,
+    DivergedUnitEntry,
     ResultSetEntry,
     build_result_set_attestation,
+    classify_consensus_basis,
+    collect_diverged_units,
     merkle_root,
     unit_payload_sha256,
 )
@@ -84,6 +90,94 @@ def test_build_attestation_signs_and_round_trips(tmp_path: Path):
     assert [u["unit_id"] for u in body["units"]] == ["u1", "u2"]
     # v1 predicate units carry the input-binding hash (empty-string when unknown).
     assert all("unit_payload_sha256" in u for u in body["units"])
+
+
+def test_classify_consensus_basis():
+    """Firewall #1: >=2 corroborating replicas → exact; repl-1 → process_only
+    (a worker cannot corroborate itself, D3)."""
+    assert classify_consensus_basis(3) == INTEGRITY_BASIS_EXACT
+    assert classify_consensus_basis(2) == INTEGRITY_BASIS_EXACT
+    assert classify_consensus_basis(1) == INTEGRITY_BASIS_PROCESS_ONLY
+    assert classify_consensus_basis(0) == INTEGRITY_BASIS_PROCESS_ONLY
+
+
+def test_integrity_basis_rides_predicate_not_leaf(tmp_path: Path):
+    """The per-unit integrity_basis is coordinator-asserted predicate metadata:
+    it appears in the signed predicate units but does NOT change the Merkle root
+    (leaf-bound fields are unchanged), so a verifier's root recompute is stable."""
+    key = load_or_generate_signing_key(tmp_path / "sign.key")
+    bare = [ResultSetEntry("u1", "h1", "r1", unit_payload_sha256="aa" * 32)]
+    tagged = [
+        ResultSetEntry(
+            "u1",
+            "h1",
+            "r1",
+            unit_payload_sha256="aa" * 32,
+            integrity_basis=INTEGRITY_BASIS_EXACT,
+        )
+    ]
+    # root identical — integrity_basis is not leaf-bound
+    assert merkle_root(bare, schema_version=1) == merkle_root(tagged, schema_version=1)
+
+    att = build_result_set_attestation(
+        attestation_id="att-basis",
+        tenant_experiment_label="exp-label",
+        tenant_id="tenant-a",
+        entries=tagged,
+        signing_key=key,
+    )
+    assert att.merkle_root == merkle_root(bare, schema_version=1)
+    payload, _ = cose_sign1_decode(att.cose_signed_blob, expected_pubkey=key.public_key)
+    body = cbor2.loads(cbor2.loads(payload)["predicate"])
+    assert body["units"][0]["integrity_basis"] == INTEGRITY_BASIS_EXACT
+
+
+def test_diverged_units_ride_predicate_without_touching_root(tmp_path: Path):
+    """Firewall #1 G4: diverged units appear in the signed predicate but never in
+    the Merkle set — the root over the agreed entries is unchanged, divergence is
+    recorded alongside, never adjudicated."""
+    key = load_or_generate_signing_key(tmp_path / "sign.key")
+    entries = [ResultSetEntry("u1", "h1", "r1", unit_payload_sha256="aa" * 32)]
+    diverged = [
+        DivergedUnitEntry(unit_id="u2", unit_payload_sha256="bb" * 32, result_hashes=["c0", "c1"])
+    ]
+    att = build_result_set_attestation(
+        attestation_id="att-div",
+        tenant_experiment_label="exp-label",
+        tenant_id="tenant-a",
+        entries=entries,
+        signing_key=key,
+        diverged_units=diverged,
+    )
+    # root is over `entries` only — diverged units do not move it
+    assert att.merkle_root == merkle_root(entries, schema_version=1)
+    assert att.unit_count == 1
+    payload, _ = cose_sign1_decode(att.cose_signed_blob, expected_pubkey=key.public_key)
+    body = cbor2.loads(cbor2.loads(payload)["predicate"])
+    assert [u["unit_id"] for u in body["units"]] == ["u1"]  # agreed set only
+    assert len(body["diverged_units"]) == 1
+    d = body["diverged_units"][0]
+    assert d["unit_id"] == "u2"
+    assert d["integrity_basis"] == INTEGRITY_BASIS_DIVERGED
+    assert d["result_hashes"] == ["c0", "c1"]
+
+
+def test_empty_diverged_units_omits_predicate_key(tmp_path: Path):
+    """An all-agreeing run's predicate stays byte-identical to the pre-firewall
+    format — the diverged_units key is omitted entirely, not emitted empty."""
+    key = load_or_generate_signing_key(tmp_path / "sign.key")
+    entries = [ResultSetEntry("u1", "h1", "r1", unit_payload_sha256="aa" * 32)]
+    att = build_result_set_attestation(
+        attestation_id="att-none",
+        tenant_experiment_label="exp-label",
+        tenant_id="tenant-a",
+        entries=entries,
+        signing_key=key,
+        diverged_units=[],
+    )
+    payload, _ = cose_sign1_decode(att.cose_signed_blob, expected_pubkey=key.public_key)
+    body = cbor2.loads(cbor2.loads(payload)["predicate"])
+    assert "diverged_units" not in body
 
 
 def test_build_attestation_schema_version_0_reproduces_legacy_format(tmp_path: Path):
@@ -253,6 +347,7 @@ def _seed_consensus_unit(
     unit_id: str,
     payload: dict,
     worker_id: str,  # must be an enrolled worker (receipt_index FKs workers)
+    replication_target: int = 1,
 ) -> tuple[str, str, str]:
     """Completed unit + consensus result + the authoritative per-job receipt
     row + a receipt-index entry. Returns (unit_id, consensus semantic_hash,
@@ -262,8 +357,8 @@ def _seed_consensus_unit(
     db.execute(
         "INSERT OR IGNORE INTO work_units "
         "(unit_id, payload_json, status, replication_target, completions_so_far, created_at) "
-        "VALUES (?, '{}', 'completed', 1, 1, ?)",
-        (unit_id, now.isoformat()),
+        "VALUES (?, '{}', 'completed', ?, ?, ?)",
+        (unit_id, replication_target, replication_target, now.isoformat()),
     )
     repo = ResultRepository(db)
     result = repo.insert(
@@ -287,6 +382,69 @@ def _seed_consensus_unit(
         result_id=result.result_id,
     )
     return unit_id, result.semantic_hash, receipt_id
+
+
+def _seed_diverged_unit(
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_id: str,
+    *,
+    unit_id: str,
+    worker_ids: list[str],
+) -> None:
+    """A completed unit whose replicas DISAGREED: distinct-payload results
+    inserted, but NO consensus promotion and NO receipt (the reducer's
+    disagreement branch). This is the state collect_diverged_units detects."""
+    db = per_job_factory.get_or_create(experiment_id)
+    now = datetime.now(UTC)
+    db.execute(
+        "INSERT OR IGNORE INTO work_units "
+        "(unit_id, payload_json, status, replication_target, completions_so_far, created_at) "
+        "VALUES (?, '{}', 'completed', ?, ?, ?)",
+        (unit_id, len(worker_ids), len(worker_ids), now.isoformat()),
+    )
+    repo = ResultRepository(db)
+    for i, wid in enumerate(worker_ids):
+        repo.insert(
+            result_id=f"res-{unit_id}-{i}",
+            unit_id=unit_id,
+            worker_id=wid,
+            worker_pubkey_hex=f"{i:02x}" * 32,
+            exit_code=0,
+            payload={"v": i},  # distinct payloads → distinct semantic_hash → disagree
+            worker_signature="c2ln",
+            completed_at=now,
+        )
+    # deliberately: no promote_consensus, no receipt
+
+
+class TestDivergedUnits:
+    def test_collect_diverged_excludes_consensus(
+        self, approved_experiment, enrolled_worker, per_job_factory, receipt_index_repository
+    ):
+        """Firewall #1 G4: a disagreed unit is collected as diverged; an agreeing
+        unit (consensus + receipt) is NOT — divergence ≠ consensus."""
+        _, _, experiment, _ = approved_experiment
+        _, worker = enrolled_worker
+        _seed_consensus_unit(
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u_agree",
+            payload={"v": 1},
+            worker_id=worker.worker_id,
+            replication_target=2,
+        )
+        _seed_diverged_unit(
+            per_job_factory,
+            experiment.experiment_id,
+            unit_id="u_div",
+            worker_ids=["w-a", "w-b"],
+        )
+        per_job_db = per_job_factory.get(experiment.experiment_id)
+        diverged = collect_diverged_units(per_job_db)
+        assert [d.unit_id for d in diverged] == ["u_div"]
+        assert diverged[0].integrity_basis == INTEGRITY_BASIS_DIVERGED
+        assert len(diverged[0].result_hashes) == 2  # two distinct hashes recorded
 
 
 class TestAttestationRoute:
@@ -361,6 +519,96 @@ class TestAttestationRoute:
         assert cbor2.loads(statement["predicate"])["merkle_root"] == expected
         # A completed attestation is not partial.
         assert body.get("partial") in (False, None)
+
+    def test_collect_classifies_integrity_basis_by_replication(
+        self,
+        approved_experiment,
+        enrolled_worker,
+        per_job_factory: PerJobDatabaseFactory,
+        receipt_index_repository,
+    ):
+        """Firewall #1: collect_result_set_entries tags each consensus unit's
+        integrity_basis from its replication_target — >=2 → exact, repl-1 →
+        process_only — straight onto the entries the predicate carries."""
+        from auspexai_platform.receipts.attestation import (
+            collect_result_set_entries,
+            receipt_map_from_per_job,
+        )
+
+        _, _, experiment, _ = approved_experiment
+        _, worker = enrolled_worker
+        _seed_consensus_unit(
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u_exact",
+            payload={"v": 1},
+            worker_id=worker.worker_id,
+            replication_target=3,
+        )
+        _seed_consensus_unit(
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u_solo",
+            payload={"v": 2},
+            worker_id=worker.worker_id,
+            replication_target=1,
+        )
+        per_job_db = per_job_factory.get(experiment.experiment_id)
+        entries = collect_result_set_entries(
+            per_job_db, receipt_id_by_result=receipt_map_from_per_job(per_job_db)
+        )
+        basis = {e.unit_id: e.integrity_basis for e in entries}
+        assert basis["u_exact"] == INTEGRITY_BASIS_EXACT
+        assert basis["u_solo"] == INTEGRITY_BASIS_PROCESS_ONLY
+
+    def test_governance_footprint_in_signed_predicate(
+        self,
+        client: TestClient,
+        approved_experiment,
+        enrolled_worker,
+        per_job_factory: PerJobDatabaseFactory,
+        receipt_index_repository,
+        experiment_repository,
+    ):
+        """Firewall #2 end-to-end: the attestation route's signed predicate carries
+        a governance_footprint whose recomputable integrity_basis counts match the
+        attested set (the main.py builder + the sign-time F6 guard are wired)."""
+        privkey, binding, experiment, _ = approved_experiment
+        _, worker = enrolled_worker
+        _seed_consensus_unit(
+            per_job_factory,
+            receipt_index_repository,
+            experiment.experiment_id,
+            unit_id="u1",
+            payload={"v": 1},
+            worker_id=worker.worker_id,
+            replication_target=2,
+        )
+        experiment_repository.update_status(experiment.experiment_id, ExperimentStatus.COMPLETED)
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/attestation",
+        )
+        assert resp.status_code == 200, resp.text
+        from base64 import b64decode
+
+        key = client.app.state.receipt_signing_key
+        payload, _ = cose_sign1_decode(
+            b64decode(resp.json()["cose_b64"]), expected_pubkey=key.public_key
+        )
+        fp = cbor2.loads(cbor2.loads(payload)["predicate"])["governance_footprint"]
+        assert fp["schema_version"] == 1
+        assert fp["tenant"]["tier"].startswith("T")
+        assert "integrity_policy" in fp["replication"]
+        assert fp["approval"]["experiment"] in ("auto", "human")
+        assert fp["independence"]["basis"] == "account-level"
+        # one repl-2 consensus unit → exactly one within_cell_exact, no diverged
+        assert fp["integrity_basis"]["counts"]["within_cell_exact"] == 1
+        assert fp["integrity_basis"]["counts"]["diverged"] == 0
 
     def test_checkpoint_partial_attestation_when_not_completed(
         self,

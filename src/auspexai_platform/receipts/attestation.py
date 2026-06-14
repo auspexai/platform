@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cbor2
 
@@ -47,6 +47,37 @@ RESULT_SET_ALGORITHM_V1 = "sha256-merkle-v1"
 _LEAF_PREFIX = b"\x00"
 _NODE_PREFIX = b"\x01"
 
+# Firewall #1 (firewall_1_divergence_receipt_design.md): the per-unit corroboration
+# basis. A COORDINATOR-ASSERTED classification carried in the signed PREDICATE (not
+# the leaf, not the receipt wire contract) — recomputable by a verifier from each
+# receipt's quorum_agreement + the result-set, which is firewall #2's F6
+# recomputable half. `within_cell_tolerance` is produced only by the v0_3
+# declared-envelope reducer (deferred); until then a consensus unit is `exact`
+# (>=2 corroborating replicas) or `process_only` (repl-1 — nothing to corroborate
+# against; D3: a worker cannot corroborate itself), and a unit whose replicas
+# diverged is `diverged` (evidentiary, no receipt).
+INTEGRITY_BASIS_EXACT = "within_cell_exact"
+INTEGRITY_BASIS_TOLERANCE = "within_cell_tolerance"
+INTEGRITY_BASIS_PROCESS_ONLY = "process_only"
+INTEGRITY_BASIS_DIVERGED = "diverged"
+INTEGRITY_BASES = frozenset(
+    {
+        INTEGRITY_BASIS_EXACT,
+        INTEGRITY_BASIS_TOLERANCE,
+        INTEGRITY_BASIS_PROCESS_ONLY,
+        INTEGRITY_BASIS_DIVERGED,
+    }
+)
+
+
+def classify_consensus_basis(replication_target: int) -> str:
+    """Integrity basis for a CONSENSUS unit (reached agreement, holds a receipt).
+    >=2 independent corroborating replicas -> `within_cell_exact`; a repl-1 unit
+    has no peer -> `process_only` (firewall #1 D3). The reducer only issues a
+    receipt when ALL replicas agree, so a consensus unit's agreeing_workers equals
+    its replication_target — making the target a faithful corroboration count."""
+    return INTEGRITY_BASIS_EXACT if replication_target >= 2 else INTEGRITY_BASIS_PROCESS_ONLY
+
 
 @dataclass(frozen=True)
 class ResultSetEntry:
@@ -60,6 +91,9 @@ class ResultSetEntry:
     receipt_id: str
     unit_payload_sha256: str | None = None
     environment: dict[str, object] | None = None
+    # Firewall #1: coordinator-asserted corroboration basis (predicate-only, like
+    # `environment` — never in the leaf). None on legacy v0 rebuild paths.
+    integrity_basis: str | None = None
 
 
 def unit_payload_sha256(payload_json: str) -> str:
@@ -109,6 +143,14 @@ def _unit_payload_hashes(per_job_db) -> dict[str, str]:
     convention."""
     rows = per_job_db.execute("SELECT unit_id, payload_json FROM work_units")
     return {r["unit_id"]: unit_payload_sha256(r["payload_json"]) for r in rows}
+
+
+def _unit_replication_targets(per_job_db) -> dict[str, int]:
+    """{unit_id: replication_target} over the experiment's work units — drives the
+    firewall #1 consensus integrity basis (>=2 corroborating replicas → exact vs
+    repl-1 → process_only)."""
+    rows = per_job_db.execute("SELECT unit_id, replication_target FROM work_units")
+    return {r["unit_id"]: int(r["replication_target"]) for r in rows}
 
 
 class IncompleteAttestationSetError(Exception):
@@ -165,6 +207,60 @@ def receipt_map_from_per_job(per_job_db) -> dict[str, str]:
     return out
 
 
+@dataclass(frozen=True)
+class DivergedUnitEntry:
+    """A unit whose independent replicas diverged — no agreement, no receipt
+    (firewall #1's disagreement-as-signed-observation, G4). Coordinator-asserted
+    PREDICATE metadata, NOT leaf-bound: the Merkle root stays over the agreed
+    consensus set; divergence is recorded alongside, never adjudicated. The
+    distinct result hashes make the divergence legible and recomputable from the
+    result set (firewall #2's recomputable half). Evidentiary only while the
+    equal-trust gate (M3 + B1) is closed — it earns no receipt and no trust."""
+
+    unit_id: str
+    unit_payload_sha256: str | None
+    result_hashes: list[str]  # the distinct semantic hashes the replicas produced
+    integrity_basis: str = INTEGRITY_BASIS_DIVERGED
+
+
+def collect_diverged_units(per_job_db) -> list[DivergedUnitEntry]:
+    """Completed units that have results but reached NO consensus (the reducer
+    disagreed → `promote_consensus` never fired → no is_consensus row, no
+    receipt). Deliberately distinct from an issuance failure (which DOES carry a
+    consensus row, awaiting a re-issue sweep — that stays excluded, not relabeled
+    diverged). Sorted by unit_id for a deterministic predicate so every build
+    path produces byte-identical bytes."""
+    payload_hashes = _unit_payload_hashes(per_job_db)
+    rows = per_job_db.execute(
+        """
+        SELECT wu.unit_id AS unit_id
+        FROM work_units wu
+        WHERE wu.status = 'completed'
+          AND EXISTS (SELECT 1 FROM results r WHERE r.unit_id = wu.unit_id)
+          AND NOT EXISTS (
+            SELECT 1 FROM results r WHERE r.unit_id = wu.unit_id AND r.is_consensus = 1
+          )
+        ORDER BY wu.unit_id
+        """
+    )
+    out: list[DivergedUnitEntry] = []
+    for row in rows:
+        uid = row["unit_id"]
+        hrows = per_job_db.execute(
+            "SELECT DISTINCT semantic_hash FROM results "
+            "WHERE unit_id = ? AND semantic_hash IS NOT NULL ORDER BY semantic_hash",
+            (uid,),
+        )
+        out.append(
+            DivergedUnitEntry(
+                unit_id=uid,
+                unit_payload_sha256=payload_hashes.get(uid),
+                result_hashes=[hr["semantic_hash"] for hr in hrows],
+            )
+        )
+    return out
+
+
 def assert_entries_cover_consensus(per_job_db, entries: list[ResultSetEntry]) -> None:
     """Independent persist-time recount (D1-family guard): every consensus unit
     for which ANY receipt row exists must appear in the attested entries, and
@@ -208,6 +304,7 @@ def collect_result_set_entries(
 
     repo = ResultRepository(per_job_db)
     payload_hashes = _unit_payload_hashes(per_job_db)
+    replication_targets = _unit_replication_targets(per_job_db)
     entries: list[ResultSetEntry] = []
     after_completed_at: str | None = None
     after_result_id: str | None = None
@@ -228,6 +325,7 @@ def collect_result_set_entries(
                     receipt_id=receipt_id,
                     unit_payload_sha256=payload_hashes.get(r.unit_id),
                     environment=r.environment,
+                    integrity_basis=classify_consensus_basis(replication_targets.get(r.unit_id, 0)),
                 )
             )
         if len(rows) < page_size:
@@ -254,6 +352,12 @@ class ResultSetAttestation:
     signing_key_pubkey_hex: str
     rekor_log_index: int
     rekor_entry_uuid: str
+    # Firewall #1 (G4): units whose replicas diverged — signed observations,
+    # predicate-only (not in `entries`/the Merkle set). Empty for an all-agreeing run.
+    diverged_units: list[DivergedUnitEntry] = field(default_factory=list)
+    # Firewall #2: the coordinator-asserted governance footprint (predicate block);
+    # None when the build site didn't assemble one (legacy/unwired paths).
+    governance_footprint: dict | None = None
     # M9 leg 2: True for a checkpoint/partial attestation (the experiment had not
     # COMPLETED — the set is a consensus-so-far snapshot, not the final set). The
     # flag is part of the COSE-signed predicate (tamper-evident), so a verifier
@@ -271,6 +375,8 @@ def build_result_set_attestation(
     rekor_client: RekorClient | NoOpRekorClient | None = None,
     partial: bool = False,
     schema_version: int = 1,
+    diverged_units: list[DivergedUnitEntry] | None = None,
+    governance_footprint: dict | None = None,
 ) -> ResultSetAttestation:
     """Build + COSE-sign (+ Rekor-anchor) the result-set attestation. Pure given
     its inputs — the same set yields a byte-identical root, so the endpoint can
@@ -301,6 +407,10 @@ def build_result_set_attestation(
             unit["unit_payload_sha256"] = e.unit_payload_sha256 or ""
             if e.environment is not None:
                 unit["environment"] = e.environment
+            # Firewall #1: per-unit corroboration basis, coordinator-asserted
+            # (predicate-only, never the leaf — the root stays reproducible).
+            if e.integrity_basis is not None:
+                unit["integrity_basis"] = e.integrity_basis
         units.append(unit)
     predicate = {
         "merkle_root": root,
@@ -312,6 +422,29 @@ def build_result_set_attestation(
     }
     if partial:
         predicate["partial"] = True
+    # Firewall #1 (G4): diverged units ride the predicate (coordinator-asserted,
+    # not leaf-bound — the root is unchanged). Omitted entirely when empty so an
+    # all-agreeing run's predicate stays byte-identical to the pre-firewall format.
+    diverged_ordered = sorted(diverged_units or [], key=lambda d: d.unit_id)
+    if schema_version >= 1 and diverged_ordered:
+        predicate["diverged_units"] = [
+            {
+                "unit_id": d.unit_id,
+                "unit_payload_sha256": d.unit_payload_sha256 or "",
+                "result_hashes": list(d.result_hashes),
+                "integrity_basis": d.integrity_basis,
+            }
+            for d in diverged_ordered
+        ]
+    # Firewall #2: the coordinator-asserted governance footprint rides the
+    # predicate (researcher-facing). F6 guard at the signing chokepoint — a fresh
+    # recount of the recomputable half must match the footprint's claim or we
+    # refuse to sign. Local import breaks the footprint↔attestation cycle.
+    if schema_version >= 1 and governance_footprint is not None:
+        from auspexai_platform.footprint import assert_footprint_recomputable
+
+        assert_footprint_recomputable(governance_footprint, ordered, diverged_ordered)
+        predicate["governance_footprint"] = governance_footprint
     predicate_cbor = cbor2.dumps(predicate, canonical=True)
     statement_kwargs: dict = {}
     if schema_version >= 1:
@@ -340,4 +473,6 @@ def build_result_set_attestation(
         rekor_log_index=entry.log_index,
         rekor_entry_uuid=entry.entry_uuid,
         partial=partial,
+        diverged_units=diverged_ordered,
+        governance_footprint=governance_footprint,
     )

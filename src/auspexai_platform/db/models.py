@@ -234,6 +234,9 @@ class Account(BaseModel):
     # account self-view), never to third parties — mirrors worker
     # quarantine_reason.
     suspension_reason: str | None = None
+    # Firewall #2 (F4): who set the CURRENT tier — 'system' (auto-promotion) or
+    # 'maintainer' (manual). NULL = birth tier. Feeds the footprint promotion path.
+    tier_set_by_class: str | None = None
 
 
 class Vouch(BaseModel):

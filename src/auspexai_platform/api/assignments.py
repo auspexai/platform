@@ -80,6 +80,7 @@ from auspexai_platform.receipts.attestation import (
     IncompleteAttestationSetError,
     assert_entries_cover_consensus,
     build_result_set_attestation,
+    collect_diverged_units,
     collect_result_set_entries,
     receipt_map_from_per_job,
 )
@@ -228,6 +229,8 @@ def build_router(
     # §6.2 promotion mode: () -> bool, True when T1->T2 auto-promotion is enabled
     # (auto_with_override). Unwired (tests) defaults to True = behavior-preserving.
     promotion_auto_t1_t2=None,
+    # firewall #2: (experiment, entries, diverged, db) -> dict | None
+    governance_footprint_builder=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -696,6 +699,7 @@ def build_router(
                 audit_repository=audit_repository,
                 attestation_repository=attestation_repository,
                 event_bus=event_bus,
+                governance_footprint_builder=governance_footprint_builder,
             )
 
         return ResultSubmissionResponse(
@@ -896,6 +900,7 @@ def _maybe_emit_completion_attestation(
     audit_repository: AuditRepository,
     attestation_repository: AttestationRepository | None = None,
     event_bus=None,
+    governance_footprint_builder=None,
 ) -> None:
     """If the experiment is now COMPLETED, build + PERSIST (+ audit + emit) the
     canonical result-set completion attestation (#34 §6.3, M7-tail / A1).
@@ -940,6 +945,7 @@ def _maybe_emit_completion_attestation(
                 },
             )
             raise
+        emit_diverged = collect_diverged_units(per_job_db)
         attestation = build_result_set_attestation(
             attestation_id=f"att-{secrets.token_urlsafe(9)}",
             tenant_experiment_label=experiment.tenant_experiment_label,
@@ -947,6 +953,12 @@ def _maybe_emit_completion_attestation(
             entries=entries,
             signing_key=signing_key,
             rekor_client=None,
+            diverged_units=emit_diverged,
+            governance_footprint=(
+                governance_footprint_builder(experiment, entries, emit_diverged, per_job_db)
+                if governance_footprint_builder is not None
+                else None
+            ),
         )
         if attestation_repository is not None:
             try:
@@ -1121,7 +1133,11 @@ def _maybe_auto_promote(
         return
 
     try:
-        account_repository.promote(worker.account_id, target_tier=TrustTier.T2_TRUSTED)
+        account_repository.promote(
+            worker.account_id,
+            target_tier=TrustTier.T2_TRUSTED,
+            set_by_class=CredentialClass.SYSTEM,
+        )
         worker_repository.update_tier_for_account(
             worker.account_id, trust_tier=TrustTier.T2_TRUSTED
         )

@@ -50,6 +50,7 @@ from auspexai_platform.receipts.attestation import (
     ResultSetEntry,
     assert_entries_cover_consensus,
     build_result_set_attestation,
+    collect_diverged_units,
     collect_result_set_entries,
     merkle_root,
     receipt_map_from_per_job,
@@ -229,6 +230,7 @@ def build_router(
     signing_key: SigningKey,
     audit_repository,
     attestation_repository: AttestationRepository | None = None,
+    governance_footprint_builder=None,  # firewall #2: (experiment, entries, diverged, db) -> dict
 ) -> APIRouter:
     router = APIRouter()
 
@@ -456,6 +458,12 @@ def build_router(
                     },
                 ) from e
 
+        diverged = collect_diverged_units(per_job_db) if per_job_db is not None else None
+        footprint = (
+            governance_footprint_builder(experiment, entries, diverged or [], per_job_db)
+            if governance_footprint_builder is not None and per_job_db is not None
+            else None
+        )
         attestation = build_result_set_attestation(
             attestation_id=_generate_attestation_id(),
             tenant_experiment_label=experiment.tenant_experiment_label,
@@ -464,6 +472,8 @@ def build_router(
             signing_key=signing_key,
             rekor_client=None,
             partial=partial,
+            diverged_units=diverged,
+            governance_footprint=footprint,
         )
 
         # A1 lazy canonicalize-on-read: persist a freshly-built FINAL attestation
@@ -615,6 +625,7 @@ def build_router(
             # Same recount guard as the attestation route: never canonicalize
             # a set that diverges from the consensus table.
             assert_entries_cover_consensus(per_job_db, lazy_entries)
+            lazy_diverged = collect_diverged_units(per_job_db)
             built = build_result_set_attestation(
                 attestation_id=_generate_attestation_id(),
                 tenant_experiment_label=experiment.tenant_experiment_label,
@@ -623,6 +634,14 @@ def build_router(
                 signing_key=signing_key,
                 rekor_client=None,
                 partial=False,
+                diverged_units=lazy_diverged,
+                governance_footprint=(
+                    governance_footprint_builder(
+                        experiment, lazy_entries, lazy_diverged, per_job_db
+                    )
+                    if governance_footprint_builder is not None
+                    else None
+                ),
             )
             try:
                 return attestation_repository.insert(
