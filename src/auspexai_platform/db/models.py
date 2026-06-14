@@ -169,6 +169,10 @@ class Experiment(BaseModel):
     last_action_at: datetime | None = None
     last_action_by_class: CredentialClass | None = None
     integrity_policy: IntegrityPolicy = IntegrityPolicy.STANDARD
+    # §41 containment floor: minimum sandbox isolation a worker must run this
+    # experiment's code under (seeded at submit from the tenant tier). 'permissive'
+    # | 'strict'. The scheduler matches worker.capabilities['sandbox_policy'].
+    required_containment: str = "permissive"
     max_unit_duration_seconds: int | None = None
     max_units: int | None = None
     max_concurrent_assignments: int | None = None

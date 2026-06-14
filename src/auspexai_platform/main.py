@@ -187,6 +187,7 @@ def create_app(
         # the recomputable integrity_basis half comes from entries/diverged_units).
         from auspexai_platform.footprint import (
             assemble_governance_footprint,
+            collect_ran_under_containment,
             compute_independence,
         )
 
@@ -217,6 +218,12 @@ def create_app(
             w = worker_repository.get_by_id(worker_id)
             return w.account_id if w is not None else None
 
+        def _policy_resolver(worker_id):
+            # §41: a worker that doesn't report a sandbox policy (old worker) reads
+            # as permissive — the fail-safe assumption.
+            w = worker_repository.get_by_id(worker_id)
+            return (w.capabilities.get("sandbox_policy") if w is not None else None) or "permissive"
+
         return assemble_governance_footprint(
             tenant_tier=tier,
             identity_gate=identity_gate,
@@ -226,6 +233,10 @@ def create_app(
             assessment=assessment,
             promotion_tier_set_by=account.tier_set_by_class if account is not None else None,
             independence=compute_independence(per_job_db, _resolver),
+            containment={
+                "required": experiment.required_containment,
+                "ran_under": collect_ran_under_containment(per_job_db, _policy_resolver),
+            },
             entries=entries,
             diverged_units=diverged_units,
         )
@@ -341,6 +352,7 @@ def create_app(
             tenant_tier=_tenant_tier,  # §9 #48 class-by-tier auto-approval
             approved_classes=_approved_classes,
             auto_approval_gate=_auto_approval_gate,  # §9 #48 inc-4 runtime gate
+            containment_strict_below_tier=config.containment_strict_below_tier,  # §41 floor
         ),
         prefix="/api/v0",
         tags=["experiments"],

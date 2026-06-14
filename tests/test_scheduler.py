@@ -106,6 +106,7 @@ def _worker(
     models: list[str] | None,
     tier: TrustTier = TrustTier.T2_TRUSTED,
     execute_tenant_code: str | None = "provisioned",
+    sandbox_policy: str | None = None,
 ):
     # M9 leg 4: a model-holding worker that's meant to RUN real units declares
     # provisioned mode (the default here); pass execute_tenant_code="synthetic"/None
@@ -115,6 +116,8 @@ def _worker(
         caps["models"] = models
     if execute_tenant_code is not None:
         caps["execute_tenant_code"] = execute_tenant_code
+    if sandbox_policy is not None:
+        caps["sandbox_policy"] = sandbox_policy
     return Worker(
         worker_id=worker_id,
         pubkey_hex="a" * 64,
@@ -122,6 +125,35 @@ def _worker(
         capabilities=caps,
         registered_at=datetime(2026, 6, 1, tzinfo=UTC),
     )
+
+
+# ---- §41 containment floor ------------------------------------------------
+
+
+def test_required_containment_for_tier():
+    from auspexai_platform.scheduler import required_containment_for_tier
+
+    # strict_below_tier=0 disables the floor (Phase-1): everyone permissive.
+    assert required_containment_for_tier(TrustTier.T0_ANONYMOUS, 0) == "permissive"
+    # strict_below_tier=2: T0/T1 tenant code must run strict; T2+ may run permissive.
+    assert required_containment_for_tier(TrustTier.T0_ANONYMOUS, 2) == "strict"
+    assert required_containment_for_tier(TrustTier.T1_AUTHENTICATED, 2) == "strict"
+    assert required_containment_for_tier(TrustTier.T2_TRUSTED, 2) == "permissive"
+
+
+def test_worker_satisfies_containment_floor():
+    # permissive-required (the Phase-1 norm): every worker eligible.
+    assert worker_satisfies(_worker(worker_id="w", models=[]), {}) is True
+    # strict-required: a permissive (or unreporting) worker is INELIGIBLE...
+    perm = _worker(worker_id="w", models=[], sandbox_policy="permissive")
+    unreported = _worker(worker_id="w", models=[])  # old worker, no policy
+    assert worker_satisfies(perm, {}, required_containment="strict") is False
+    assert worker_satisfies(unreported, {}, required_containment="strict") is False
+    # ...but a strict worker IS eligible for strict-required work...
+    strict = _worker(worker_id="w", models=[], sandbox_policy="strict")
+    assert worker_satisfies(strict, {}, required_containment="strict") is True
+    # ...and a strict worker is also eligible for permissive work (always tighter-OK).
+    assert worker_satisfies(strict, {}, required_containment="permissive") is True
 
 
 # ---- #30 (M1) capability matching -----------------------------------------

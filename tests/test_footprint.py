@@ -71,6 +71,7 @@ def test_assemble_governance_footprint_shape():
         assessment={"research_class": "drift", "tier": 2, "envelope": []},
         promotion_tier_set_by="system",
         independence={"basis": INDEPENDENCE_BASIS_ACCOUNT, "distinct_accounts": 1},
+        containment={"required": "permissive", "ran_under": ["strict"]},
         entries=[_entry("u1", INTEGRITY_BASIS_EXACT)],
         diverged_units=[DivergedUnitEntry("u2", None, ["a", "b"])],
     )
@@ -79,6 +80,7 @@ def test_assemble_governance_footprint_shape():
     assert fp["replication"]["integrity_policy"] == "trusted"
     assert fp["approval"]["experiment"] == "auto"
     assert fp["approval"]["promotion"]["tier_set_by"] == "system"
+    assert fp["containment"] == {"required": "permissive", "ran_under": ["strict"]}
     assert fp["integrity_basis"]["counts"][INTEGRITY_BASIS_EXACT] == 1
     assert fp["integrity_basis"]["counts"][INTEGRITY_BASIS_DIVERGED] == 1
 

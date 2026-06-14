@@ -48,6 +48,12 @@ DEFAULT_TIER_T2_MIN_ACCOUNT_AGE_DAYS = 7
 # voucher must already hold this many receipts across this many distinct tenants.
 DEFAULT_VOUCH_MIN_RECEIPTS = 20
 DEFAULT_VOUCH_MIN_DISTINCT_TENANTS = 2
+# §41 containment floor: a tenant whose trust tier is BELOW this requires its
+# code to run under STRICT host isolation (the scheduler routes such units only
+# to strict-sandbox workers). 0 = disabled (Phase-1 default: vetted tenants +
+# operator-owned fleet → permissive acceptable). Raise (e.g. 2) when untrusted
+# tenants arrive so T0/T1 code is forced onto hardened workers.
+DEFAULT_CONTAINMENT_STRICT_BELOW_TIER = 0
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,7 @@ class Config:
     tier_t2_min_account_age_days: int = DEFAULT_TIER_T2_MIN_ACCOUNT_AGE_DAYS
     vouch_min_receipts: int = DEFAULT_VOUCH_MIN_RECEIPTS
     vouch_min_distinct_tenants: int = DEFAULT_VOUCH_MIN_DISTINCT_TENANTS
+    containment_strict_below_tier: int = DEFAULT_CONTAINMENT_STRICT_BELOW_TIER
     rekor_url: str = DEFAULT_REKOR_URL
 
     def __post_init__(self) -> None:
@@ -165,6 +172,11 @@ class Config:
                 "AUSPEXAI_VOUCH_MIN_DISTINCT_TENANTS", DEFAULT_VOUCH_MIN_DISTINCT_TENANTS
             )
         )
+        containment_strict_below_tier = int(
+            os.environ.get(
+                "AUSPEXAI_CONTAINMENT_STRICT_BELOW_TIER", DEFAULT_CONTAINMENT_STRICT_BELOW_TIER
+            )
+        )
         rekor_url = os.environ.get("AUSPEXAI_REKOR_URL", DEFAULT_REKOR_URL)
         return cls(
             state_dir=resolved_state_dir,
@@ -174,5 +186,6 @@ class Config:
             tier_t2_min_account_age_days=t2_min_age,
             vouch_min_receipts=vouch_min_receipts,
             vouch_min_distinct_tenants=vouch_min_tenants,
+            containment_strict_below_tier=containment_strict_below_tier,
             rekor_url=rekor_url,
         )

@@ -443,6 +443,7 @@ class TestConfigEligibilityFields:
         assert config.tier_t2_min_account_age_days == 7
         assert config.vouch_min_receipts == 20
         assert config.vouch_min_distinct_tenants == 2
+        assert config.containment_strict_below_tier == 0
 
     def test_invalid_threshold_rejected(self, tmp_path) -> None:
         with pytest.raises(ValueError, match="tier_t2_receipt_threshold"):

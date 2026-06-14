@@ -104,6 +104,33 @@ def is_sub_floor_policy(policy: IntegrityPolicy, tenant_tier: TrustTier | int) -
     return INTEGRITY_POLICY_REPLICATION[policy] < INTEGRITY_POLICY_REPLICATION[floor]
 
 
+# §41 containment floor — the sandbox-isolation analogue of the A' replication
+# floor. Less-trusted tenant CODE must run under stricter host isolation
+# (protecting the volunteer's machine from the executor), and the scheduler
+# routes such units only to workers whose sandbox policy meets the floor.
+# Ordering: permissive < strict.
+CONTAINMENT_PERMISSIVE = "permissive"
+CONTAINMENT_STRICT = "strict"
+_CONTAINMENT_RANK = {CONTAINMENT_PERMISSIVE: 0, CONTAINMENT_STRICT: 1}
+
+
+def containment_rank(level: str | None) -> int:
+    """Isolation-strength ordering; unknown/None (e.g. an old worker that doesn't
+    yet report its policy) reads as permissive (0). A worker is eligible for
+    required level R iff `rank(worker) >= rank(R)` — a worker may always be
+    STRICTER than required, never weaker."""
+    return _CONTAINMENT_RANK.get(level or CONTAINMENT_PERMISSIVE, 0)
+
+
+def required_containment_for_tier(tenant_tier: TrustTier | int, strict_below_tier: int) -> str:
+    """The minimum sandbox containment a tenant of this tier's CODE must run
+    under. Mirrors `integrity_policy_for_request`: lower tenant trust → stricter
+    requirement (the volunteer's host is protected from less-vetted code).
+    `strict_below_tier == 0` disables the floor — the Phase-1 default (vetted
+    tenants + operator-owned fleet → permissive acceptable)."""
+    return CONTAINMENT_STRICT if int(tenant_tier) < strict_below_tier else CONTAINMENT_PERMISSIVE
+
+
 # §2.1 #8 (dispatch-retry): a refused assignment used to permanently bar the
 # worker from the unit (`already_assigned` skip), which on a small fleet
 # stranded the unit when every worker refused — exactly what M0 hit (the
@@ -242,6 +269,7 @@ def worker_satisfies(
     required_capabilities: dict[str, list[str]],
     *,
     requires_real_execution: bool = False,
+    required_containment: str = CONTAINMENT_PERMISSIVE,
 ) -> bool:
     """True if the worker is eligible for an experiment with these requirements
     (#30, M1; + M9 leg 4 execute-mode gate). `required_capabilities` is keyed by
@@ -273,7 +301,17 @@ def worker_satisfies(
     bound still caps how many such workers ever get the unit, so the acquisition
     fan-out is naturally sized (≤ replication_target pull). If the manifest carries
     no acquisition coords, the worker refuses on assignment (model_not_acquirable)
-    — surfaced as demand, not a silent stall."""
+    — surfaced as demand, not a silent stall.
+
+    **§41 containment floor.** A worker is eligible only if its host isolation
+    (`capabilities["sandbox_policy"]`) is at least as strict as the experiment's
+    tenant tier requires (`required_containment`). An old worker that doesn't
+    report a policy reads as permissive, so it's excluded from strict-required
+    work — fail-safe. Default permissive ⇒ no gate (the Phase-1 norm)."""
+    if containment_rank(worker.capabilities.get("sandbox_policy")) < containment_rank(
+        required_containment
+    ):
+        return False
     required_models = set(required_capabilities.get("models", []))
     if not required_models:
         # No model requirement: every worker eligible UNLESS the experiment
@@ -348,6 +386,7 @@ class Scheduler:
                 worker,
                 experiment.required_capabilities,
                 requires_real_execution=experiment.requires_real_execution,
+                required_containment=experiment.required_containment,
             ):
                 continue
             # F5: halt dispatch for a suspended account's experiments. Approval

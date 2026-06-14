@@ -145,6 +145,19 @@ def _served_model_digest(environment_json: str | None) -> str | None:
     return str(val) if val else None
 
 
+def collect_ran_under_containment(per_job_db, policy_resolver) -> list[str]:
+    """§41 / firewall #2: the distinct sandbox policies the consensus workers
+    actually ran this experiment under — so the footprint records WHICH
+    containment produced the evidence, not just the consensus. `policy_resolver`
+    maps worker_id → its reported sandbox policy ('permissive' for an old worker
+    that doesn't report one)."""
+    rows = per_job_db.execute(
+        "SELECT DISTINCT worker_id FROM results "
+        "WHERE unit_id IN (SELECT unit_id FROM results WHERE is_consensus = 1)"
+    )
+    return sorted({policy_resolver(r["worker_id"]) or "permissive" for r in rows})
+
+
 def tier_label(tenant_tier: TrustTier | int) -> str:
     """`T0`..`T3` from the int-valued TrustTier."""
     return f"T{int(tenant_tier)}"
@@ -159,6 +172,7 @@ def assemble_governance_footprint(
     assessment: dict[str, Any] | None,
     promotion_tier_set_by: str | None,
     independence: dict[str, Any],
+    containment: dict[str, Any],
     entries,
     diverged_units,
 ) -> dict[str, Any]:
@@ -175,6 +189,9 @@ def assemble_governance_footprint(
             "promotion": {"tier_set_by": promotion_tier_set_by},  # "system"|"maintainer"|None
         },
         "independence": independence,
+        # §41: the sandbox isolation REQUIRED of this experiment + what it actually
+        # RAN under, so a researcher can correct for containment as apparatus.
+        "containment": containment,
         "integrity_basis": {"counts": integrity_basis_counts(entries, diverged_units)},
     }
 

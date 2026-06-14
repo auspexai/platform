@@ -65,6 +65,7 @@ from auspexai_platform.scheduler import (
     integrity_policy_for_request,
     is_sub_floor_policy,
     policy_floor_for_tier,
+    required_containment_for_tier,
 )
 
 # ---- response models -------------------------------------------------------
@@ -387,6 +388,9 @@ def build_router(
     # at decision time. Returns (enabled, min_tier). Unwired (tests that don't
     # exercise the gate) ⇒ the endpoint falls back to DISABLED — the safe default.
     auto_approval_gate: Callable[[], tuple[bool, int]] | None = None,
+    # §41 containment floor: tenants below this tier require strict sandboxing.
+    # 0 = disabled (Phase-1 default). Wired from config.containment_strict_below_tier.
+    containment_strict_below_tier: int = 0,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -521,12 +525,20 @@ def build_router(
         # (§9 #48) inherits this floored seed so it can never clear a sub-tier
         # experiment at trusted/repl-1.
         if tenant_tier is not None:
+            tier = tenant_tier(manifest_tenant)
             experiment_repository.set_integrity_policy(
                 experiment.experiment_id,
                 integrity_policy_for_request(
                     replication_factor=int(body.manifest.get("replication_factor", 1) or 1),
-                    tenant_tier=tenant_tier(manifest_tenant),
+                    tenant_tier=tier,
                 ),
+            )
+            # §41 containment floor: seed the minimum sandbox isolation from the
+            # tenant tier (the host-isolation analogue of the A' replication floor).
+            # The scheduler then routes units only to workers that meet it.
+            experiment_repository.set_required_containment(
+                experiment.experiment_id,
+                required_containment_for_tier(tier, containment_strict_below_tier),
             )
             experiment = experiment_repository.get_by_id(experiment.experiment_id)
 

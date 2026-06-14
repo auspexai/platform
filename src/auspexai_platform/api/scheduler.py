@@ -189,7 +189,10 @@ def build_router(
                 w
                 for w in workforce
                 if worker_satisfies(
-                    w, required, requires_real_execution=exp.requires_real_execution
+                    w,
+                    required,
+                    requires_real_execution=exp.requires_real_execution,
+                    required_containment=exp.required_containment,
                 )
             ]
             eligible = [w for w in capable if replication_floor_for_tier(w.trust_tier) <= repl]

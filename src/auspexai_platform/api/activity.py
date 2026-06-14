@@ -167,7 +167,12 @@ def build_router(
                 result_count, last_activity = c["result_count"], c["last_received_at"]
                 pubkey = c["worker_pubkey_hex"]
             else:
-                satisfies = worker_satisfies(worker, required, requires_real_execution=rre)
+                satisfies = worker_satisfies(
+                    worker,
+                    required,
+                    requires_real_execution=rre,
+                    required_containment=getattr(experiment, "required_containment", "permissive"),
+                )
                 eligibility = "eligible" if satisfies else "ineligible"
                 reason = (
                     None if satisfies else _experiment_eligibility_reason(worker, required, rre)

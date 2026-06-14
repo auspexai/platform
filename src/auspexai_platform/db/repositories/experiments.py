@@ -319,6 +319,18 @@ class ExperimentRepository:
             raise ExperimentNotFoundError(experiment_id)
         return got
 
+    def set_required_containment(self, experiment_id: str, level: str) -> Experiment:
+        """§41 containment floor: set the minimum sandbox isolation this
+        experiment's units must run under. Seeded at submit from the tenant tier."""
+        self.db.execute(
+            "UPDATE experiments SET required_containment = ? WHERE experiment_id = ?",
+            (level, experiment_id),
+        )
+        got = self.get_by_id(experiment_id)
+        if got is None:
+            raise ExperimentNotFoundError(experiment_id)
+        return got
+
     def set_assessment(
         self,
         experiment_id: str,
@@ -418,6 +430,11 @@ class ExperimentRepository:
             integrity_policy=IntegrityPolicy(row["integrity_policy"])
             if row["integrity_policy"]
             else IntegrityPolicy.STANDARD,
+            required_containment=(
+                row["required_containment"]
+                if "required_containment" in row.keys()
+                else "permissive"
+            ),
             max_unit_duration_seconds=row["max_unit_duration_seconds"],
             max_units=row["max_units"],
             max_concurrent_assignments=row["max_concurrent_assignments"],

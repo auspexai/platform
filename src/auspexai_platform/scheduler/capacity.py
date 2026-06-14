@@ -73,11 +73,17 @@ def _eligible(
     repl: int,
     *,
     requires_real_execution: bool = False,
+    required_containment: str = "permissive",
 ) -> list[Worker]:
     return [
         w
         for w in workforce
-        if worker_satisfies(w, required, requires_real_execution=requires_real_execution)
+        if worker_satisfies(
+            w,
+            required,
+            requires_real_execution=requires_real_execution,
+            required_containment=required_containment,
+        )
         and replication_floor_for_tier(w.trust_tier) <= repl
     ]
 
@@ -114,8 +120,11 @@ def experiments_collapsed_by_removing(
         repl = INTEGRITY_POLICY_REPLICATION.get(exp.integrity_policy, 3)
         required = exp.required_capabilities or {}
         rre = exp.requires_real_execution
-        if _eligible(before, required, repl, requires_real_execution=rre) and not _eligible(
-            after, required, repl, requires_real_execution=rre
+        rc = exp.required_containment
+        if _eligible(
+            before, required, repl, requires_real_execution=rre, required_containment=rc
+        ) and not _eligible(
+            after, required, repl, requires_real_execution=rre, required_containment=rc
         ):
             collapsed.append(
                 BlockedExperiment(
