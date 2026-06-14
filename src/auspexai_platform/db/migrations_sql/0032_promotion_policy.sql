@@ -4,7 +4,7 @@
 -- Single-row policy table (id = 1). `_maybe_auto_promote` reads `t1_t2_mode`
 -- server-authoritatively; the operator console writes it. Two modes:
 --
---   auto_with_override  -- (default) the system auto-promotes a T1 account to T2
+--   auto_with_override  -- the system auto-promotes a T1 account to T2
 --                          when ALL automated gates pass (receipts + breadth +
 --                          time window) AND the identity gate is satisfied; the
 --                          maintainer may still block / reverse / hand-promote.
