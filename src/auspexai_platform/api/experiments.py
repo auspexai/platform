@@ -56,6 +56,7 @@ from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.maintenance import projected_raw_age_off
 from auspexai_platform.receipts.signing import SigningKey
+from auspexai_platform.scheduler import integrity_policy_for_request
 
 # ---- response models -------------------------------------------------------
 
@@ -426,6 +427,23 @@ def build_router(
                 },
             ) from e
 
+        # A' (§9): seed the integrity policy from the researcher's requested
+        # replication (manifest.replication_factor), FLOORED by the tenant's trust
+        # tier — reciprocity: a tenant earns lower replication (less consensus
+        # cross-check) only as its account earns trust. The maintainer can still
+        # RAISE it at approve; the floor caps how LOW it can go, and auto-approval
+        # (§9 #48) inherits this floored seed so it can never clear a sub-tier
+        # experiment at trusted/repl-1.
+        if tenant_tier is not None:
+            experiment_repository.set_integrity_policy(
+                experiment.experiment_id,
+                integrity_policy_for_request(
+                    replication_factor=int(body.manifest.get("replication_factor", 1) or 1),
+                    tenant_tier=tenant_tier(manifest_tenant),
+                ),
+            )
+            experiment = experiment_repository.get_by_id(experiment.experiment_id)
+
         audit_repository.append(
             actor_class=CredentialClass.RESEARCHER,
             actor_identifier=credential.pubkey_hex,
@@ -436,6 +454,9 @@ def build_router(
             payload={
                 "tenant_experiment_label": experiment.tenant_experiment_label,
                 "manifest_hash": experiment.manifest_hash,
+                "integrity_policy": experiment.integrity_policy.value
+                if experiment.integrity_policy
+                else None,
             },
         )
 

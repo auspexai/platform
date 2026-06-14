@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from auspexai_platform.db.models import Assignment, ExperimentStatus, TrustTier, Worker
+from auspexai_platform.db.models import (
+    Assignment,
+    ExperimentStatus,
+    IntegrityPolicy,
+    TrustTier,
+    Worker,
+)
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AssignmentRepository,
@@ -15,12 +21,29 @@ from auspexai_platform.db.repositories import (
 from auspexai_platform.scheduler import (
     MAX_ASSIGNMENT_ATTEMPTS,
     Scheduler,
+    integrity_policy_for_request,
     is_retryable_refusal,
     reoffer_eligible,
     worker_is_degraded,
     worker_is_self_paused,
     worker_satisfies,
 )
+
+
+def test_integrity_policy_for_request_floors_by_tenant_tier():
+    f = integrity_policy_for_request
+    tier = TrustTier
+    # T0/T1 can't reach trusted even asking for repl-1 -> floored to standard.
+    assert f(replication_factor=1, tenant_tier=tier.T0_ANONYMOUS) == IntegrityPolicy.STANDARD
+    assert f(replication_factor=1, tenant_tier=tier.T1_AUTHENTICATED) == IntegrityPolicy.STANDARD
+    # T2/T3 earn trusted/repl-1 when they request it.
+    assert f(replication_factor=1, tenant_tier=tier.T2_TRUSTED) == IntegrityPolicy.TRUSTED
+    assert f(replication_factor=1, tenant_tier=tier.T3_VETTED) == IntegrityPolicy.TRUSTED
+    # A higher requested replication is always honored, regardless of tier.
+    assert f(replication_factor=3, tenant_tier=tier.T2_TRUSTED) == IntegrityPolicy.STANDARD
+    assert f(replication_factor=5, tenant_tier=tier.T2_TRUSTED) == IntegrityPolicy.HIGH
+    # int tier accepted; unknown defaults to the safe (standard) floor.
+    assert f(replication_factor=1, tenant_tier=2) == IntegrityPolicy.TRUSTED
 
 
 def _make_experiment(
@@ -455,7 +478,9 @@ def test_is_retryable_refusal_by_reason_marker():
     # v0_2 M1: a version-skewed worker refuses a serving_version_pin'd unit; the
     # unit re-offers to a version-matching peer.
     assert (
-        is_retryable_refusal("executor_refused", "serving_version_mismatch: serving 'ollama/0.18.2'")
+        is_retryable_refusal(
+            "executor_refused", "serving_version_mismatch: serving 'ollama/0.18.2'"
+        )
         is True
     )
     # A real policy/integrity refusal on the SAME kind stays terminal.

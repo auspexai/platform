@@ -36,7 +36,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from auspexai_platform.db.models import Assignment, ExperimentStatus, TrustTier, Worker, WorkUnit
+from auspexai_platform.db.models import (
+    Assignment,
+    ExperimentStatus,
+    IntegrityPolicy,
+    TrustTier,
+    Worker,
+    WorkUnit,
+)
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AssignmentRepository,
@@ -54,6 +61,25 @@ _TIER_REPLICATION_FLOOR = {
 
 def replication_floor_for_tier(tier: TrustTier) -> int:
     return _TIER_REPLICATION_FLOOR.get(tier, 3)
+
+
+def integrity_policy_for_request(
+    *, replication_factor: int, tenant_tier: TrustTier | int
+) -> IntegrityPolicy:
+    """A' (§9): seed an experiment's integrity policy from the researcher's
+    requested replication, FLOORED by the tenant's trust tier — the same
+    `_TIER_REPLICATION_FLOOR` that gates worker eligibility, applied to the
+    tenant. A tenant earns lower replication (less consensus cross-check) only as
+    its account earns trust (receipts). Effective replication = max(requested,
+    tier floor), rounded UP to a policy tier (1 trusted / 3 standard / 5 high).
+    Net: only T2+ tenants reach trusted/repl-1; T0/T1 floor at standard."""
+    floor = _TIER_REPLICATION_FLOOR.get(TrustTier(int(tenant_tier)), 3)
+    effective = max(int(replication_factor), floor)
+    if effective <= 1:
+        return IntegrityPolicy.TRUSTED
+    if effective <= 3:
+        return IntegrityPolicy.STANDARD
+    return IntegrityPolicy.HIGH
 
 
 # §2.1 #8 (dispatch-retry): a refused assignment used to permanently bar the
