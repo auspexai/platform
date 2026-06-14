@@ -363,6 +363,23 @@ class WorkerRepository:
                 n += 1
         return n
 
+    def count_auto_acquire(self, *, heartbeat_cutoff: datetime) -> int:
+        """Count active workers that have opted into M3 lazy auto-acquire — they
+        can run ANY model whose manifest carries hf coords by pulling it in-line
+        (#44, proven live). Backs the model-request triage: an acquirable model
+        reads as `acquirable` rather than escalating to maintainer review."""
+        rows = self.db.execute(
+            "SELECT capabilities_json FROM workers "
+            "WHERE retired_at IS NULL AND quarantined_at IS NULL AND paused_at IS NULL "
+            "AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?",
+            (heartbeat_cutoff.isoformat(),),
+        )
+        return sum(
+            1
+            for r in rows
+            if json.loads(r["capabilities_json"] or "{}").get("auto_acquire") is True
+        )
+
     def model_inventory_counts(self, *, heartbeat_cutoff: datetime) -> dict[str, int]:
         """The network's bottom-up model catalog (M2): {model_id: how many active
         workers declare it}, aggregated across the active set (same predicate as

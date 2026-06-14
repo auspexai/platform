@@ -91,6 +91,56 @@ def test_request_is_available_when_a_worker_holds_it(
     assert r.json()["status"] == "available"  # an active worker already holds it
 
 
+def _active_auto_acquire_worker(worker_repository, *, worker_id: str, pubkey: str):
+    worker_repository.enroll(worker_id=worker_id, pubkey_hex=pubkey)
+    worker_repository.record_heartbeat(
+        worker_id, capabilities={"os": "linux", "models": [], "auto_acquire": True}
+    )
+
+
+def test_request_is_acquirable_with_auto_acquire_worker_and_coords(
+    client: TestClient,
+    registered_tenant: tuple[Ed25519PrivateKey, object],
+    worker_repository,
+) -> None:
+    # Tier B (#44): no worker holds it, but an auto_acquire worker can pull the
+    # supplied coords in-line — acquirable, not maintainer review.
+    _active_auto_acquire_worker(worker_repository, worker_id="w-auto", pubkey="2" * 64)
+    privkey, binding = registered_tenant
+    r = _signed_post(
+        client,
+        privkey=privkey,
+        pubkey_hex=binding.pubkey_hex,
+        path="/api/v0/model-requests",
+        body={
+            "model_id": "gemma-3-1b-it-q4",
+            "hf_repo": "unsloth/gemma-3-1b-it-GGUF",
+            "reason": "auto-acquire it",
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["status"] == "acquirable"
+
+
+def test_request_without_coords_stays_pending_even_with_auto_acquire_worker(
+    client: TestClient,
+    registered_tenant: tuple[Ed25519PrivateKey, object],
+    worker_repository,
+) -> None:
+    # auto_acquire worker present, but no coords to pull from → still pending.
+    _active_auto_acquire_worker(worker_repository, worker_id="w-auto2", pubkey="3" * 64)
+    privkey, binding = registered_tenant
+    r = _signed_post(
+        client,
+        privkey=privkey,
+        pubkey_hex=binding.pubkey_hex,
+        path="/api/v0/model-requests",
+        body={"model_id": "no-coords-model", "reason": "no coords"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["status"] == "pending"
+
+
 def test_request_requires_researcher(client: TestClient, maintainer_token: str) -> None:
     # A maintainer bearer is not a researcher → cannot signal demand.
     r = client.post(

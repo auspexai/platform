@@ -144,12 +144,22 @@ def build_router(
                     }
                 },
             )
-        # Match-or-escalate: available if an active worker already holds it,
-        # else pending (the maintainer review queue).
+        # Feasibility triage (the Tier A/B/C model-supply gate):
+        #   A: a worker already holds it                  -> available
+        #   B: no holder, but an auto_acquire worker can   -> acquirable (#44: it
+        #      pull it in-line from the request's coords      pulls when the
+        #      when the experiment runs                       experiment runs)
+        #   C: neither                                     -> pending (maintainer)
+        cutoff = heartbeat_cutoff(datetime.now(UTC))
         capable = worker_repository.count_capable(
-            required_models=[body.model_id], heartbeat_cutoff=heartbeat_cutoff(datetime.now(UTC))
+            required_models=[body.model_id], heartbeat_cutoff=cutoff
         )
-        new_status = "available" if capable > 0 else "pending"
+        if capable > 0:
+            new_status = "available"
+        elif body.hf_repo and worker_repository.count_auto_acquire(heartbeat_cutoff=cutoff) > 0:
+            new_status = "acquirable"
+        else:
+            new_status = "pending"
         req = model_request_repository.create(
             tenant_id=credential.tenant_id,
             model_id=body.model_id,
