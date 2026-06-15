@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from auspexai_platform.auth.signature import sign_request
+from tests._result_helpers import sign_result_body
 
 AUTHORITY = "testserver"
 
@@ -206,7 +207,14 @@ def test_full_flow_researcher_to_auto_complete(
                 "completed_at": "2026-05-19T12:00:00+00:00",
                 "exit_code": 0,
                 "payload": {"output": 10},
-                "worker_signature": "ZmFrZS1zaWc=",
+                "worker_signature": sign_result_body(
+                    wp,
+                    wpub,
+                    unit_id="u-double-5",
+                    completed_at="2026-05-19T12:00:00+00:00",
+                    exit_code=0,
+                    payload={"output": 10},
+                ),
             },
         )
         assert response.status_code == 201, response.text
@@ -415,7 +423,14 @@ def test_pause_mid_flow_stops_new_assignments_but_accepts_in_flight(
             "completed_at": "2026-05-19T12:00:00+00:00",
             "exit_code": 0,
             "payload": {"out": 1},
-            "worker_signature": "Zm9v",
+            "worker_signature": sign_result_body(
+                wa_priv,
+                wa_pub,
+                unit_id=a_unit_id,
+                completed_at="2026-05-19T12:00:00+00:00",
+                exit_code=0,
+                payload={"out": 1},
+            ),
         },
     )
     assert submit_response.status_code == 201, submit_response.text
@@ -584,7 +599,14 @@ def test_every_state_changing_action_in_full_flow_writes_audit(
             "completed_at": "2026-05-19T12:00:00+00:00",
             "exit_code": 0,
             "payload": {},
-            "worker_signature": "Zm9v",
+            "worker_signature": sign_result_body(
+                wpriv,
+                wpub,
+                unit_id="uc",
+                completed_at="2026-05-19T12:00:00+00:00",
+                exit_code=0,
+                payload={},
+            ),
         },
     )
     # Pause + resume + finalize.

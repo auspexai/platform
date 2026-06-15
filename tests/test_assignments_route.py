@@ -12,6 +12,7 @@ from auspexai_platform.auth.signature import sign_request
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories.assignments import AssignmentRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
+from tests._result_helpers import sign_result_body
 
 AUTHORITY = "testserver"
 
@@ -172,6 +173,7 @@ def _get_then_submit(
     ).json()
     unit_id = pick["work_unit"]["unit_id"]
     path = f"/api/v0/workers/{worker_id}/assignments/{unit_id}/result"
+    completed_at = "2026-05-19T12:00:00+00:00"
     return _signed_post(
         client,
         privkey=privkey,
@@ -180,10 +182,18 @@ def _get_then_submit(
         payload={
             "unit_id": unit_id,
             "worker_pubkey": pubkey_hex,
-            "completed_at": "2026-05-19T12:00:00+00:00",
+            "completed_at": completed_at,
             "exit_code": exit_code,
             "payload": result_payload,
-            "worker_signature": "ZmFrZS1zaWc=",  # base64 placeholder
+            # §9 #13a: the coordinator now verifies the body signature at submit.
+            "worker_signature": sign_result_body(
+                privkey,
+                pubkey_hex,
+                unit_id=unit_id,
+                completed_at=completed_at,
+                exit_code=exit_code,
+                payload=result_payload,
+            ),
         },
     )
 
@@ -211,6 +221,53 @@ def test_submit_result_first_completion(
     assert body["replication_target"] == 3
     # 1 of 3 → still pending status-wise
     assert body["unit_status_after"] in {"pending", "in_progress"}
+
+
+def test_submit_result_rejects_invalid_body_signature(
+    client: TestClient,
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+) -> None:
+    """§9 #13a: a body whose worker_signature does not verify is refused at
+    submit — kept out of the consensus set — with worker_signature_invalid."""
+    privkey, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    _seed_units(per_job_factory, experiment.experiment_id, ["u1"])
+    pick = _signed_get(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments",
+    ).json()
+    unit_id = pick["work_unit"]["unit_id"]
+    completed_at = "2026-05-19T12:00:00+00:00"
+    # A real Ed25519 signature, but over a DIFFERENT payload than the one sent —
+    # valid base64, wrong bytes → must not verify.
+    bad_sig = sign_result_body(
+        privkey,
+        worker.pubkey_hex,
+        unit_id=unit_id,
+        completed_at=completed_at,
+        exit_code=0,
+        payload={"tampered": True},
+    )
+    r = _signed_post(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{worker.worker_id}/assignments/{unit_id}/result",
+        payload={
+            "unit_id": unit_id,
+            "worker_pubkey": worker.pubkey_hex,
+            "completed_at": completed_at,
+            "exit_code": 0,
+            "payload": {"output": 10},  # differs from the signed payload
+            "worker_signature": bad_sig,
+        },
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["error"]["code"] == "worker_signature_invalid"
 
 
 def test_submit_results_until_target_completes_unit(
@@ -549,7 +606,14 @@ def test_refuse_returns_409_when_result_already_attached(
             "completed_at": "2026-05-19T12:00:00+00:00",
             "exit_code": 0,
             "payload": {"out": 0},
-            "worker_signature": "Zm9v",
+            "worker_signature": sign_result_body(
+                privkey,
+                worker.pubkey_hex,
+                unit_id=unit_id,
+                completed_at="2026-05-19T12:00:00+00:00",
+                exit_code=0,
+                payload={"out": 0},
+            ),
         },
     )
     assert result.status_code == 201
@@ -757,7 +821,14 @@ def test_late_result_does_not_refire_completion(
             "completed_at": "2026-06-06T11:00:00+00:00",
             "exit_code": 0,
             "payload": {"v": 1},
-            "worker_signature": "Zm9v",
+            "worker_signature": sign_result_body(
+                privkey,
+                worker.pubkey_hex,
+                unit_id="u1",
+                completed_at="2026-06-06T11:00:00+00:00",
+                exit_code=0,
+                payload={"v": 1},
+            ),
         },
     )
     assert first.status_code == 201, first.text
@@ -788,7 +859,14 @@ def test_late_result_does_not_refire_completion(
             "completed_at": "2026-06-06T12:00:00+00:00",
             "exit_code": 0,
             "payload": {"v": 1},
-            "worker_signature": "Zm9v",
+            "worker_signature": sign_result_body(
+                other_pk,
+                other_pub,
+                unit_id="u1",
+                completed_at="2026-06-06T12:00:00+00:00",
+                exit_code=0,
+                payload={"v": 1},
+            ),
         },
     )
     assert late.status_code == 201, late.text

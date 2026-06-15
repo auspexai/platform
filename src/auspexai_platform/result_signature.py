@@ -1,0 +1,91 @@
+"""§9 #13a: reconstruct + verify the worker's canonical result signature.
+
+Byte-for-byte mirror of the worker's
+`auspexai_worker.signing.result.canonical_result_bytes` (the platform cannot
+import the worker package, so the canonical encoding is duplicated — the
+cross-checked known-vector tests on both sides guard against drift).
+
+v0 = the legacy five-field body. v1 (§9 #13a) additionally signs
+`schema_version` + `served_weights` ({model_id: gguf_sha256}), so the
+served-weights digest is worker-ATTESTED, not coordinator-asserted. The
+coordinator reconstructs per the worker-declared `schema_version`, so a v1
+signature (binding the digest) verifies AND a v0 (un-rolled fleet) signature
+stays byte-identical.
+
+This is the first place the body-level `worker_signature` is actually VERIFIED
+(historically it was stored-but-not-verified until receipt issuance). Verifying
+at submit keeps an unauthentic result out of the consensus set entirely.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+from datetime import datetime
+from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+
+def canonical_result_bytes(
+    *,
+    unit_id: str,
+    worker_pubkey: str,
+    completed_at: datetime | str,
+    exit_code: int,
+    payload: dict[str, Any],
+    schema_version: int | None = 0,
+    served_weights: dict[str, str] | None = None,
+) -> bytes:
+    """The canonical bytes the worker signed. `schema_version` 0/None reproduces
+    the legacy five-field encoding byte-for-byte; >= 1 adds the signed
+    `schema_version` + `served_weights` (digests normalized to lower hex)."""
+    ts = completed_at.isoformat() if isinstance(completed_at, datetime) else completed_at
+    body: dict[str, Any] = {
+        "unit_id": unit_id,
+        "worker_pubkey": worker_pubkey.lower(),
+        "completed_at": ts,
+        "exit_code": int(exit_code),
+        "payload": payload,
+    }
+    if schema_version and schema_version >= 1:
+        body["schema_version"] = int(schema_version)
+        body["served_weights"] = {str(k): str(v).lower() for k, v in (served_weights or {}).items()}
+    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def verify_result_signature(
+    *,
+    worker_pubkey: str,
+    signature_b64: str,
+    unit_id: str,
+    completed_at: datetime | str,
+    exit_code: int,
+    payload: dict[str, Any],
+    schema_version: int | None = 0,
+    served_weights: dict[str, str] | None = None,
+) -> bool:
+    """True iff `signature_b64` is a valid Ed25519 signature by `worker_pubkey`
+    over the canonical body for the declared `schema_version`. Malformed pubkey
+    / signature ⇒ False (never raises)."""
+    try:
+        pubkey = Ed25519PublicKey.from_public_bytes(bytes.fromhex(worker_pubkey.lower()))
+        signature = base64.b64decode(signature_b64, validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    sig_input = canonical_result_bytes(
+        unit_id=unit_id,
+        worker_pubkey=worker_pubkey,
+        completed_at=completed_at,
+        exit_code=exit_code,
+        payload=payload,
+        schema_version=schema_version,
+        served_weights=served_weights,
+    )
+    try:
+        pubkey.verify(signature, sig_input)
+        return True
+    except InvalidSignature:
+        return False

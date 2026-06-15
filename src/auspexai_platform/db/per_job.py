@@ -93,6 +93,12 @@ CREATE TABLE IF NOT EXISTS results (
     -- at result submission (worker version / ollama_version / served model ids
     -- from the worker's last heartbeat). NULL = pre-EB-1 row or nothing known.
     environment_json     TEXT,
+    -- §9 #13a: the worker-SIGNED schema version (NULL/0 = legacy 5-field body;
+    -- 1 = body also signs served_weights) and the worker-ATTESTED served-weights
+    -- digest map. Distinct from environment_json (coordinator-asserted): this is
+    -- covered by the worker signature, so #13b enforces against it.
+    schema_version       INTEGER,
+    served_weights_json  TEXT,
     FOREIGN KEY (unit_id) REFERENCES work_units(unit_id)
 );
 
@@ -145,6 +151,7 @@ class PerJobDatabaseFactory:
             _ensure_assignments_refused_columns(db)
             _ensure_results_retention_columns(db)
             _ensure_results_environment_column(db)
+            _ensure_results_served_weights_columns(db)
             _ensure_work_units_pin_column(db)
             self._cache[experiment_id] = db
             return db
@@ -169,6 +176,7 @@ class PerJobDatabaseFactory:
             _ensure_assignments_refused_columns(db)
             _ensure_results_retention_columns(db)
             _ensure_results_environment_column(db)
+            _ensure_results_served_weights_columns(db)
             _ensure_work_units_pin_column(db)
             self._cache[experiment_id] = db
             return db
@@ -223,6 +231,18 @@ def _ensure_results_environment_column(db: Database) -> None:
     captured at result submission. Pre-existing rows read NULL (= unknown,
     pre-EB-1), which the attestation builder passes through as absent."""
     _add_columns_idempotent(db, "results", (("environment_json", "TEXT"),))
+
+
+def _ensure_results_served_weights_columns(db: Database) -> None:
+    """Idempotently add the §9 #13a columns to the per-job `results` table:
+    `schema_version` (the worker-signed canonical version; NULL/0 = legacy) and
+    `served_weights_json` (the worker-ATTESTED served-weights digest map).
+    Pre-existing rows read NULL — treated as v0 (no attested digest)."""
+    _add_columns_idempotent(
+        db,
+        "results",
+        (("schema_version", "INTEGER"), ("served_weights_json", "TEXT")),
+    )
 
 
 def _ensure_work_units_pin_column(db: Database) -> None:

@@ -8,6 +8,7 @@ from auspexai_platform.auth.signature import sign_request
 from auspexai_platform.db.models import ExperimentStatus
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.weights import served_weights_verdict
+from tests._result_helpers import sign_result_body
 
 
 def _manifest(*models):
@@ -84,15 +85,32 @@ def _spost(client, *, privkey, pubkey_hex, path, payload):
     return client.post(path, headers=h, content=body)
 
 
-def _result(unit_id, pubkey_hex):
-    return {
+def _result(privkey, unit_id, pubkey_hex, *, schema_version=None, served_weights=None):
+    """A signed result body. v0 by default (heartbeat-enforced #13b); pass
+    schema_version=1 + served_weights for the worker-attested (v1) path."""
+    completed_at = "2026-06-14T12:00:00+00:00"
+    payload = {"out": 1}
+    body = {
         "unit_id": unit_id,
         "worker_pubkey": pubkey_hex,
-        "completed_at": "2026-06-14T12:00:00+00:00",
+        "completed_at": completed_at,
         "exit_code": 0,
-        "payload": {"out": 1},
-        "worker_signature": "ZmFrZQ==",
+        "payload": payload,
+        "worker_signature": sign_result_body(
+            privkey,
+            pubkey_hex,
+            unit_id=unit_id,
+            completed_at=completed_at,
+            exit_code=0,
+            payload=payload,
+            schema_version=schema_version,
+            served_weights=served_weights,
+        ),
     }
+    if schema_version and schema_version >= 1:
+        body["schema_version"] = schema_version
+        body["served_weights"] = served_weights or {}
+    return body
 
 
 def _pinning_experiment(manifest_repository, experiment_repository, tenant_id, expected):
@@ -153,7 +171,7 @@ def test_submit_result_409_on_served_weights_mismatch(
         privkey=privkey,
         pubkey_hex=worker.pubkey_hex,
         path=f"/api/v0/workers/{wid}/assignments/{unit_id}/result",
-        payload=_result(unit_id, worker.pubkey_hex),
+        payload=_result(privkey, unit_id, worker.pubkey_hex),
     )
     assert r.status_code == 409, r.text
     assert r.json()["detail"]["error"]["code"] == "served_weights_mismatch"
@@ -192,6 +210,99 @@ def test_submit_result_ok_when_served_digest_matches(
         privkey=privkey,
         pubkey_hex=worker.pubkey_hex,
         path=f"/api/v0/workers/{wid}/assignments/{unit_id}/result",
-        payload=_result(unit_id, worker.pubkey_hex),
+        payload=_result(privkey, unit_id, worker.pubkey_hex),
     )
     assert r.status_code == 201, r.text  # matching digest → accepted into consensus
+
+
+def test_submit_v1_signed_mismatch_rejected_even_when_heartbeat_matches(
+    client,
+    enrolled_worker,
+    worker_repository,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+    registered_tenant,
+):
+    """§9 #13a anti-fab: the WORKER-SIGNED served_weights is authoritative. A
+    worker can't dodge #13b by lying in its (unsigned) heartbeat — here the
+    heartbeat reports the matching digest but the signed v1 body reports a
+    different one, and the coordinator rejects on the signed value."""
+    privkey, worker = enrolled_worker
+    _, binding = registered_tenant
+    exp = _pinning_experiment(
+        manifest_repository, experiment_repository, binding.tenant_id, "a" * 64
+    )
+    WorkUnitRepository(per_job_factory.get_or_create(exp.experiment_id)).submit_batch(
+        [{"unit_id": "pu1", "payload": {"input": 1}}]
+    )
+    # Heartbeat MATCHES (the spoofable channel) ...
+    worker_repository.record_heartbeat(
+        worker.worker_id, capabilities={"os": "linux", "served_model_digests": {"gemma": "a" * 64}}
+    )
+    wid = worker.worker_id
+    unit_id = _sget(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{wid}/assignments",
+    ).json()["work_unit"]["unit_id"]
+    r = _spost(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{wid}/assignments/{unit_id}/result",
+        # ... but the SIGNED served_weights does NOT.
+        payload=_result(
+            privkey,
+            unit_id,
+            worker.pubkey_hex,
+            schema_version=1,
+            served_weights={"gemma": "b" * 64},
+        ),
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"]["code"] == "served_weights_mismatch"
+
+
+def test_submit_v1_signed_match_accepted(
+    client,
+    enrolled_worker,
+    worker_repository,
+    manifest_repository,
+    experiment_repository,
+    per_job_factory,
+    registered_tenant,
+):
+    """The signed v1 served_weights matching the manifest is accepted — even
+    with no heartbeat digest at all (the attested value stands on its own)."""
+    privkey, worker = enrolled_worker
+    _, binding = registered_tenant
+    exp = _pinning_experiment(
+        manifest_repository, experiment_repository, binding.tenant_id, "a" * 64
+    )
+    WorkUnitRepository(per_job_factory.get_or_create(exp.experiment_id)).submit_batch(
+        [{"unit_id": "pu1", "payload": {"input": 1}}]
+    )
+    worker_repository.record_heartbeat(worker.worker_id, capabilities={"os": "linux"})
+    wid = worker.worker_id
+    unit_id = _sget(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{wid}/assignments",
+    ).json()["work_unit"]["unit_id"]
+    r = _spost(
+        client,
+        privkey=privkey,
+        pubkey_hex=worker.pubkey_hex,
+        path=f"/api/v0/workers/{wid}/assignments/{unit_id}/result",
+        payload=_result(
+            privkey,
+            unit_id,
+            worker.pubkey_hex,
+            schema_version=1,
+            served_weights={"gemma": "a" * 64},
+        ),
+    )
+    assert r.status_code == 201, r.text

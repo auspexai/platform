@@ -32,6 +32,7 @@ from auspexai_platform.auth.dependency import enforce_worker_active
 from auspexai_platform.auth.signature import sign_request
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
+from tests._result_helpers import sign_result_body
 
 AUTHORITY = "testserver"
 _TS = datetime(2026, 6, 13, tzinfo=UTC)
@@ -72,14 +73,24 @@ def _seed_units(per_job_factory: PerJobDatabaseFactory, experiment_id: str, unit
     )
 
 
-def _result_payload(unit_id: str, pubkey_hex: str) -> dict[str, Any]:
+def _result_payload(privkey, unit_id: str, pubkey_hex: str) -> dict[str, Any]:
+    completed_at = "2026-05-19T12:00:00+00:00"
+    payload = {"out": 1}
     return {
         "unit_id": unit_id,
         "worker_pubkey": pubkey_hex,
-        "completed_at": "2026-05-19T12:00:00+00:00",
+        "completed_at": completed_at,
         "exit_code": 0,
-        "payload": {"out": 1},
-        "worker_signature": "ZmFrZS1zaWc=",  # base64 placeholder
+        "payload": payload,
+        # §9 #13a: real signature — the coordinator verifies it at submit.
+        "worker_signature": sign_result_body(
+            privkey,
+            pubkey_hex,
+            unit_id=unit_id,
+            completed_at=completed_at,
+            exit_code=0,
+            payload=payload,
+        ),
     }
 
 
@@ -123,7 +134,7 @@ def test_quarantined_worker_result_is_rejected_then_recovers(
         privkey=privkey,
         pubkey_hex=worker.pubkey_hex,
         path=path,
-        payload=_result_payload(unit_id, worker.pubkey_hex),
+        payload=_result_payload(privkey, unit_id, worker.pubkey_hex),
     )
     assert r.status_code == 423, r.text
     err = r.json()["detail"]["error"]
@@ -140,7 +151,7 @@ def test_quarantined_worker_result_is_rejected_then_recovers(
         privkey=privkey,
         pubkey_hex=worker.pubkey_hex,
         path=path,
-        payload=_result_payload(unit_id, worker.pubkey_hex),
+        payload=_result_payload(privkey, unit_id, worker.pubkey_hex),
     )
     assert r2.status_code == 201, r2.text
 

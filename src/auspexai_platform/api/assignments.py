@@ -32,11 +32,14 @@ increments work_unit.completions_so_far, and (if completions >=
 replication_target) transitions the unit to 'completed'. Audit-log
 entries are written for both assign and result.
 
-**The body-level worker_signature is stored but NOT verified in M6d.**
-The HTTP-level RFC 9421 signature on the request is the M6d acceptance
-proof. M7's receipt issuance will re-verify the body signature when
-binding it into a signed receipt; that's the right place to ratify the
-body chain since receipts are what external verifiers consume.
+**The body-level worker_signature is VERIFIED at submit (§9 #13a).** The
+canonical body is reconstructed (v0 or v1 per `schema_version`) and the
+Ed25519 signature checked before the result is accepted into the consensus
+set — an unauthentic / tampered result is refused (422
+`worker_signature_invalid`). This keeps fabricated results out entirely and,
+for a v1 result, cryptographically binds the served-weights digest that #13b
+enforces. The HTTP-level RFC 9421 signature remains the transport acceptance
+proof; receipt issuance re-anchors the same body hash for external verifiers.
 """
 
 from __future__ import annotations
@@ -84,6 +87,7 @@ from auspexai_platform.receipts.attestation import (
     collect_result_set_entries,
     receipt_map_from_per_job,
 )
+from auspexai_platform.result_signature import verify_result_signature
 from auspexai_platform.scheduler import Scheduler, reoffer_eligible
 from auspexai_platform.scheduler.conductor import plan_prestage_for_worker
 from auspexai_platform.weights import served_weights_verdict
@@ -129,6 +133,11 @@ class ResultSubmissionRequest(BaseModel):
     # assignment_id; older workers omit it (the scan then skips terminal
     # experiments, which already fixes the observed incident).
     assignment_id: str | None = Field(default=None, max_length=128)
+    # §9 #13a: a v1 result additionally signs the served-weights digest. Absent
+    # ⇒ legacy v0 (un-rolled worker) and the coordinator reconstructs the
+    # five-field canonical body. served_weights is {model_id: gguf_sha256}.
+    schema_version: int | None = Field(default=None)
+    served_weights: dict[str, str] | None = Field(default=None)
 
 
 class RefuseRequest(BaseModel):
@@ -480,6 +489,53 @@ def build_router(
         assignments_repo = AssignmentRepository(per_job_db)
         work_units_repo = WorkUnitRepository(per_job_db)
 
+        # §9 #13a: VERIFY the worker's body signature before accepting the result
+        # into the consensus set. Historically the body signature was stored but
+        # not verified until receipt issuance; verifying here keeps an
+        # unauthentic / tampered result out entirely, and (for a v1 result)
+        # cryptographically binds the served-weights digest #13b enforces below.
+        # Reconstructs the legacy (v0) or v1 canonical body per schema_version.
+        if not verify_result_signature(
+            worker_pubkey=body.worker_pubkey,
+            signature_b64=body.worker_signature,
+            unit_id=unit_id,
+            completed_at=body.completed_at,
+            exit_code=body.exit_code,
+            payload=body.payload,
+            schema_version=body.schema_version,
+            served_weights=body.served_weights,
+        ):
+            assignments_repo.mark_refused(
+                assignment_id=assignment.assignment_id,
+                kind="worker_signature_invalid",
+                reason="worker_signature does not verify over the canonical result body",
+            )
+            audit_repository.append(
+                actor_class=CredentialClass.WORKER,
+                actor_identifier=worker_id,
+                action="result.worker_signature_invalid",
+                resource_type="work_unit",
+                resource_id=unit_id,
+                payload={"experiment_id": experiment_id},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "error": {
+                        "code": "worker_signature_invalid",
+                        "message": (
+                            "result rejected: worker_signature does not verify over the "
+                            "canonical result body (§9 #13a)"
+                        ),
+                    }
+                },
+            )
+
+        # §9 #13a: a v1 result's served-weights digest is now signature-covered
+        # (verified just above) — prefer it over the best-effort heartbeat
+        # snapshot for both the environment leg and #13b enforcement.
+        is_v1_result = (body.schema_version or 0) >= 1
+
         # EB-1 (§9 #47): snapshot the coordinator-asserted serving environment
         # at submission — the reproducibility triple's environment leg. Sourced
         # from the worker's last heartbeat-declared capabilities (what the
@@ -490,12 +546,15 @@ def build_router(
         served_digests: dict[str, str] | None = None
         if worker_row is not None:
             caps = worker_row.capabilities or {}
-            served_digests = caps.get("served_model_digests")  # v0_2 #13a (rolled worker)
+            served_digests = caps.get("served_model_digests")  # heartbeat (v0 fallback)
+            # Attested (v1) digest preferred — it is per-result and signature-
+            # bound; the heartbeat value is fleet-wide last-beat best-effort.
+            snapshot_digests = body.served_weights if is_v1_result else served_digests
             snapshot = {
                 "worker_version": caps.get("version"),
                 "ollama_version": caps.get("ollama_version"),
                 "served_models": caps.get("served_models"),
-                "served_model_digests": served_digests,  # M3 reproducibility leg
+                "served_model_digests": snapshot_digests,  # M3 reproducibility leg
             }
             environment = {k: v for k, v in snapshot.items() if v is not None} or None
 
@@ -507,8 +566,12 @@ def build_router(
         if manifest_repository is not None:
             exp = experiment_repository.get_by_id(experiment_id)
             manifest = manifest_repository.get(exp.manifest_hash) if exp is not None else None
+            # §9 #13b: enforce against the WORKER-SIGNED served_weights for a v1
+            # result (anti-fabrication — covered by the verified signature);
+            # fall back to the best-effort heartbeat snapshot for legacy v0.
+            enforce_digests = body.served_weights if is_v1_result else served_digests
             mismatch = (
-                served_weights_verdict(manifest.manifest_json, served_digests)
+                served_weights_verdict(manifest.manifest_json, enforce_digests)
                 if manifest is not None
                 else None
             )
@@ -550,6 +613,11 @@ def build_router(
             worker_signature=body.worker_signature,
             completed_at=body.completed_at,
             environment=environment,
+            # §9 #13a: persist the worker-signed version + attested digest so the
+            # receipt/attestation reconstructs the right canonical body and the
+            # attested digest survives for evidence.
+            schema_version=body.schema_version,
+            served_weights=body.served_weights,
         )
         assignments_repo.attach_result(assignment.assignment_id, result.result_id)
         updated_unit, just_completed = work_units_repo.increment_completions(unit_id)

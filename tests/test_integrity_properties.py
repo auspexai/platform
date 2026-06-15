@@ -58,6 +58,7 @@ from auspexai_platform.db import Database, MigrationRunner
 from auspexai_platform.db.repositories import TenantRepository
 from auspexai_platform.main import create_app
 from auspexai_platform.rate_limit import reset_for_tests as _reset_rate_limit
+from tests._result_helpers import sign_result_body
 
 pytestmark = __import__("pytest").mark.timeout(600)
 
@@ -412,7 +413,14 @@ class ResultAcceptanceMachine(RuleBasedStateMachine):
             "exit_code": 0,
             # byte-identical replicas per unit → hash-agreement consensus fires
             "payload": {"answer": a["unit_id"]},
-            "worker_signature": "ZmFrZS1zaWc=",
+            "worker_signature": sign_result_body(
+                a["worker"]["priv"],
+                a["worker"]["pub"],
+                unit_id=a["unit_id"],
+                completed_at="2026-06-11T12:00:00+00:00",
+                exit_code=0,
+                payload={"answer": a["unit_id"]},
+            ),
         }
         if send_assignment_id:
             body["assignment_id"] = a["assignment_id"]
@@ -707,7 +715,14 @@ def test_legacy_submit_with_ambiguous_unit_lands_in_exactly_one_active_experimen
                 "completed_at": "2026-06-11T12:00:00+00:00",
                 "exit_code": 0,
                 "payload": {"answer": 1},
-                "worker_signature": "ZmFrZS1zaWc=",
+                "worker_signature": sign_result_body(
+                    worker["priv"],
+                    worker["pub"],
+                    unit_id="u-shared",
+                    completed_at="2026-06-11T12:00:00+00:00",
+                    exit_code=0,
+                    payload={"answer": 1},
+                ),
             },
         )
         assert r.status_code == 201, r.text

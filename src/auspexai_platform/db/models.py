@@ -326,6 +326,13 @@ class Result(BaseModel):
     # at submission (worker version / ollama_version / served model ids). The
     # reproducibility triple's environment leg; None = pre-EB-1 row.
     environment: dict[str, Any] | None = None
+    # §9 #13a: the worker-SIGNED canonical schema version (0/None = legacy
+    # 5-field; 1 = the body also signs served_weights) and the worker-ATTESTED
+    # served-weights digest ({model_id: gguf_sha256}). Distinct from the
+    # coordinator-asserted `environment` snapshot above: this is covered by the
+    # worker's Ed25519 signature, so #13b enforces against it (anti-fabrication).
+    schema_version: int | None = None
+    served_weights: dict[str, str] | None = None
 
 
 class WorkUnit(BaseModel):

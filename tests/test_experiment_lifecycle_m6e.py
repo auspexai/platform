@@ -12,6 +12,7 @@ from auspexai_platform.auth.signature import sign_request
 from auspexai_platform.db.models import ExperimentStatus
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
+from tests._result_helpers import sign_result_body
 
 AUTHORITY = "testserver"
 
@@ -318,7 +319,14 @@ def test_auto_complete_fires_when_finalized_and_all_done(
                 "completed_at": "2026-05-19T12:00:00+00:00",
                 "exit_code": 0,
                 "payload": {"out": 1},
-                "worker_signature": "Zm9v",
+                "worker_signature": sign_result_body(
+                    priv,
+                    pub,
+                    unit_id="u1",
+                    completed_at="2026-05-19T12:00:00+00:00",
+                    exit_code=0,
+                    payload={"out": 1},
+                ),
             },
         )
 
@@ -372,7 +380,14 @@ def test_auto_complete_fires_when_finalize_arrives_after_all_units_done(
                 "completed_at": "2026-05-19T12:00:00+00:00",
                 "exit_code": 0,
                 "payload": {"out": 1},
-                "worker_signature": "Zm9v",
+                "worker_signature": sign_result_body(
+                    priv,
+                    pub,
+                    unit_id="u1",
+                    completed_at="2026-05-19T12:00:00+00:00",
+                    exit_code=0,
+                    payload={"out": 1},
+                ),
             },
         )
 
@@ -438,7 +453,14 @@ def test_auto_complete_does_not_fire_if_not_finalized(
                 "completed_at": "2026-05-19T12:00:00+00:00",
                 "exit_code": 0,
                 "payload": {"out": 1},
-                "worker_signature": "Zm9v",
+                "worker_signature": sign_result_body(
+                    priv,
+                    pub,
+                    unit_id="u1",
+                    completed_at="2026-05-19T12:00:00+00:00",
+                    exit_code=0,
+                    payload={"out": 1},
+                ),
             },
         )
 
@@ -516,7 +538,14 @@ def test_auto_complete_does_not_fire_when_paused(
                 "completed_at": "2026-05-19T12:00:00+00:00",
                 "exit_code": 0,
                 "payload": {"out": 1},
-                "worker_signature": "Zm9v",
+                "worker_signature": sign_result_body(
+                    priv,
+                    pub,
+                    unit_id="u1",
+                    completed_at="2026-05-19T12:00:00+00:00",
+                    exit_code=0,
+                    payload={"out": 1},
+                ),
             },
         )
 

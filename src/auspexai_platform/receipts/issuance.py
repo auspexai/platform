@@ -30,7 +30,6 @@ work.
 
 from __future__ import annotations
 
-import json
 import logging
 import secrets
 from dataclasses import dataclass
@@ -50,6 +49,7 @@ from auspexai_platform.receipts.models import (
 from auspexai_platform.receipts.rekor import NoOpRekorClient, RekorClient
 from auspexai_platform.receipts.repository import ReceiptRecord, ReceiptRepository
 from auspexai_platform.receipts.signing import SigningKey, cose_sign1_encode
+from auspexai_platform.result_signature import canonical_result_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -85,23 +85,21 @@ def _semantic_hash(result: Result) -> str:
 
 def _result_hash(result: Result) -> str:
     """SHA-256 of the full canonical worker-signed form. Used for the
-    `result_hash_anchors` field of the receipt — each anchor identifies
-    a specific worker's specific result."""
-    completed_at = result.completed_at
-    if hasattr(completed_at, "isoformat"):
-        completed_at = completed_at.isoformat()
-    canonical = json.dumps(
-        {
-            "unit_id": result.unit_id,
-            "worker_pubkey": result.worker_pubkey_hex.lower(),
-            "completed_at": completed_at,
-            "exit_code": result.exit_code,
-            "payload": result.payload,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return sha256(canonical.encode("utf-8")).hexdigest()
+    `result_hash_anchors` field of the receipt — each anchor identifies a
+    specific worker's specific result. §9 #13a: reconstructs the v0 or v1
+    canonical body per the result's `schema_version`, so the anchor matches the
+    exact bytes the worker signed (a v1 result binds its served-weights digest)."""
+    return sha256(
+        canonical_result_bytes(
+            unit_id=result.unit_id,
+            worker_pubkey=result.worker_pubkey_hex,
+            completed_at=result.completed_at,
+            exit_code=result.exit_code,
+            payload=result.payload,
+            schema_version=result.schema_version,
+            served_weights=result.served_weights,
+        )
+    ).hexdigest()
 
 
 def hash_agreement_reducer(results: list[Result]) -> AgreementOutcome:
