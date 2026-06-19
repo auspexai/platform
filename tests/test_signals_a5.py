@@ -12,10 +12,15 @@ import json
 
 from auspexai_platform.db.database import Database
 from auspexai_platform.db.models import IdentityProvider
-from auspexai_platform.db.repositories import AccountRepository, WorkerRepository
+from auspexai_platform.db.repositories import (
+    AccountRepository,
+    ReceiptIndexRepository,
+    WorkerRepository,
+)
 from auspexai_platform.signals import (
     autonomy_signal,
     compute_self_observation,
+    divergence_health_signal,
     fleet_diversity_signal,
     trust_flow_signal,
     vouch_topology_signal,
@@ -102,11 +107,47 @@ def test_vouch_topology_flags_mutual_and_self(db: Database):
     assert sig["distinct_vouchers"] == 3
 
 
+def test_divergence_health_rate(db: Database):
+    """Firewall #5 network rate: 3 agreement units (receipt_index) + 1 STRICT
+    divergence unit (divergence_index, #32) → divergence_rate 0.25."""
+    workers = WorkerRepository(db)
+    receipts = ReceiptIndexRepository(db)
+    workers.enroll(worker_id="w1", pubkey_hex="11" * 32)
+    for i in range(3):
+        receipts.record(
+            receipt_id=f"r{i}",
+            experiment_id="exp-x",
+            worker_id="w1",
+            worker_pubkey="11" * 32,
+            unit_id=f"u{i}",
+        )
+    receipts.record_divergence(
+        experiment_id="exp-x",
+        worker_id="w1",
+        worker_pubkey="11" * 32,
+        unit_id="u-div",
+        ran_under_strict=True,
+    )
+    sig = divergence_health_signal(db)
+    assert sig["agreement_units"] == 3
+    assert sig["divergence_units"] == 1
+    assert sig["strict_divergence_units"] == 1
+    assert sig["total_terminal_units"] == 4
+    assert sig["divergence_rate"] == 0.25
+
+
 def test_compute_self_observation_assembles_all_and_is_empty_safe(db: Database):
     obs = compute_self_observation(db)
-    assert set(obs) == {"autonomy", "fleet_diversity", "trust_flow", "vouch_topology"}
+    assert set(obs) == {
+        "autonomy",
+        "fleet_diversity",
+        "trust_flow",
+        "vouch_topology",
+        "divergence_health",
+    }
     # Honest empties at single-maintainer scale — no crash, no fabricated signal.
     assert obs["autonomy"]["autonomy_ratio"] == 0.0
     assert obs["fleet_diversity"]["active_workers"] == 0
     assert obs["trust_flow"]["active_accounts"] == 0
     assert obs["vouch_topology"]["active_vouches"] == 0
+    assert obs["divergence_health"]["divergence_rate"] == 0.0

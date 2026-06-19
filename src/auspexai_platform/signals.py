@@ -122,16 +122,47 @@ def vouch_topology_signal(db: Database) -> dict[str, Any]:
     }
 
 
+def divergence_health_signal(db: Database) -> dict[str, Any]:
+    """Firewall #5: the network's divergence-vs-agreement rate. A LOW rate can mean
+    genuine agreement OR the apparatus SUPPRESSING disagreement (the convergence
+    gradient the equal-trust flip removes) — so it is THE metric to watch around the
+    flip: removing the trust penalty should let real divergence surface rather than
+    be discouraged. Counts DISTINCT units that reached consensus (`receipt_index`)
+    vs diverged (`divergence_index`, the #32 trust-index), network-wide — control-DB,
+    so no per-job scans; reward-independent + externally verifiable. (Per-experiment
+    breakdown lives in the firewall-#2 footprint's `integrity_basis` counts; this is
+    the network rollup.)"""
+    agree = db.execute(
+        "SELECT COUNT(DISTINCT COALESCE(unit_id, receipt_id)) AS n FROM receipt_index"
+    )
+    diverge = db.execute("SELECT COUNT(DISTINCT unit_id) AS n FROM divergence_index")
+    strict_div = db.execute(
+        "SELECT COUNT(DISTINCT unit_id) AS n FROM divergence_index WHERE ran_under_strict = 1"
+    )
+    agreement_units = int(agree[0]["n"]) if agree else 0
+    divergence_units = int(diverge[0]["n"]) if diverge else 0
+    strict_divergence_units = int(strict_div[0]["n"]) if strict_div else 0
+    total = agreement_units + divergence_units
+    return {
+        "agreement_units": agreement_units,
+        "divergence_units": divergence_units,
+        "strict_divergence_units": strict_divergence_units,
+        "total_terminal_units": total,
+        "divergence_rate": (divergence_units / total) if total else 0.0,
+    }
+
+
 def compute_self_observation(db: Database) -> dict[str, Any]:
     """The firewall-#5 self-observation snapshot — the control-DB network signals,
     computed deterministically from recorded data, no writes, no enforcement.
-    (Per-experiment consensus-independence + divergence-health aggregation are
-    deferred; they live in `footprint.compute_independence` / `attestation.
-    collect_diverged_units` per-experiment until cross-experiment rollup is built.)
-    """
+    (Per-experiment consensus-independence aggregation stays deferred; it lives in
+    `footprint.compute_independence` per-experiment until cross-experiment rollup is
+    built. Divergence health is now a network control-DB signal via the #32
+    `divergence_index`.)"""
     return {
         "autonomy": autonomy_signal(db),
         "fleet_diversity": fleet_diversity_signal(db),
         "trust_flow": trust_flow_signal(db),
         "vouch_topology": vouch_topology_signal(db),
+        "divergence_health": divergence_health_signal(db),
     }
