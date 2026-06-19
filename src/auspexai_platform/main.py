@@ -653,7 +653,6 @@ _ROOT_HTML = f"""<!doctype html>
   <p>Maintainer endpoints: <code><a href="/api/v0/audit">GET /api/v0/audit</a></code> · API docs: <a href="/docs">Swagger</a> · <a href="/redoc">ReDoc</a></p>
   <p>Signing roster: <a href="https://github.com/auspexai/.github/blob/main/security/AUTHORIZED_SIGNERS.md">AUTHORIZED_SIGNERS.md</a></p>
   <p class="meta">Worker installer: <a href="https://getworker.auspexai.network">getworker.auspexai.network</a> · <a href="https://github.com/auspexai/worker/releases">releases</a> · Operator console: <a href="https://ops.auspexai.network">ops.auspexai.network</a></p>
-  <p class="meta">Last updated: 2026-05-25</p>
 </body>
 </html>
 """
@@ -682,7 +681,6 @@ def _install_root_and_docs(app: FastAPI, credential_dep) -> None:
                 "name": "AuspexAI Coordinator",
                 "version": __version__,
                 "phase": "Phase 2 closed-beta",
-                "last_updated": "2026-05-25",
                 "public_endpoints": {
                     "health": "GET /api/v0/health/public",
                     "receipts_verify": "POST /api/v0/receipts/verify",
