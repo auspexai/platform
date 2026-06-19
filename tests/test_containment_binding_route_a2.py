@@ -107,6 +107,12 @@ def test_v2_permissive_on_strict_required_is_containment_violation(
     assert resp.json()["detail"]["error"]["code"] == "containment_violation"
     rows = db.execute("SELECT 1 FROM audit_log WHERE action = 'result.containment_violation'")
     assert len(rows) >= 1
+    # The provable misconduct AUTO-QUARANTINES the worker (the assignment endpoint
+    # then refuses it work) — the flip's containment guard is load-bearing.
+    from auspexai_platform.db.repositories import WorkerRepository
+
+    w = WorkerRepository(db).get_by_id(worker.worker_id)
+    assert w is not None and w.quarantined_at is not None
 
 
 def test_v2_strict_on_strict_required_is_compliant(

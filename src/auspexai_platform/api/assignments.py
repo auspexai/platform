@@ -576,6 +576,30 @@ def build_router(
                         f"requires {_required!r}"
                     ),
                 )
+                # AUTO-QUARANTINE: the worker SIGNED an admission of running weaker
+                # than required — provable misconduct, so the response is automated
+                # (charter: a provable sandbox violation loses standing; distinct
+                # from divergence, which must NEVER auto-penalize). The assignment
+                # endpoint then refuses it work; reversible via unquarantine and it
+                # surfaces for the maintainer's demote/suspend call. Best-effort:
+                # an escalation hiccup must never mask the refusal/409.
+                auto_quarantined = False
+                try:
+                    worker_repository.quarantine(
+                        worker_id,
+                        reason=(
+                            f"containment_violation: signed ran_under={body.ran_under!r} "
+                            f"< required {_required!r} (unit {unit_id})"
+                        ),
+                    )
+                    auto_quarantined = True
+                except Exception:
+                    import logging
+
+                    logging.getLogger(__name__).exception(
+                        "auto-quarantine failed for worker %s after containment_violation",
+                        worker_id,
+                    )
                 audit_repository.append(
                     actor_class=CredentialClass.WORKER,
                     actor_identifier=worker_id,
@@ -586,6 +610,7 @@ def build_router(
                         "experiment_id": experiment_id,
                         "ran_under": body.ran_under,
                         "required_containment": _required,
+                        "auto_quarantined": auto_quarantined,
                     },
                 )
                 raise HTTPException(
