@@ -99,6 +99,11 @@ CREATE TABLE IF NOT EXISTS results (
     -- covered by the worker signature, so #13b enforces against it.
     schema_version       INTEGER,
     served_weights_json  TEXT,
+    -- A2 #32 (equal-trust flip activation): the worker-SIGNED sandbox policy this
+    -- result ran under (v2 body). Covered by the worker signature, so the
+    -- containment guard is accountable, not heartbeat-self-reported. NULL = pre-v2
+    -- result → falls back to the worker's reported capability.
+    ran_under            TEXT,
     FOREIGN KEY (unit_id) REFERENCES work_units(unit_id)
 );
 
@@ -152,6 +157,7 @@ class PerJobDatabaseFactory:
             _ensure_results_retention_columns(db)
             _ensure_results_environment_column(db)
             _ensure_results_served_weights_columns(db)
+            _ensure_results_ran_under_column(db)
             _ensure_work_units_pin_column(db)
             self._cache[experiment_id] = db
             return db
@@ -177,6 +183,7 @@ class PerJobDatabaseFactory:
             _ensure_results_retention_columns(db)
             _ensure_results_environment_column(db)
             _ensure_results_served_weights_columns(db)
+            _ensure_results_ran_under_column(db)
             _ensure_work_units_pin_column(db)
             self._cache[experiment_id] = db
             return db
@@ -243,6 +250,15 @@ def _ensure_results_served_weights_columns(db: Database) -> None:
         "results",
         (("schema_version", "INTEGER"), ("served_weights_json", "TEXT")),
     )
+
+
+def _ensure_results_ran_under_column(db: Database) -> None:
+    """Idempotently add `ran_under` (A2 #32) to the per-job `results` table — the
+    worker-SIGNED sandbox policy the result ran under (v2 body). Part of
+    PER_JOB_SCHEMA_SQL for new DBs; this converges existing per-job DBs. NULL =
+    pre-v2 result → the trust resolver falls back to the worker's reported
+    capability."""
+    _add_columns_idempotent(db, "results", (("ran_under", "TEXT"),))
 
 
 def _ensure_work_units_pin_column(db: Database) -> None:

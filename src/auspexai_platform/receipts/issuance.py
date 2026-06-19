@@ -145,7 +145,7 @@ def issue_receipts_for_completed_unit(
     signing_key: SigningKey,
     receipt_index_repo: ReceiptIndexRepository | None = None,
     rekor_client: RekorClient | NoOpRekorClient | None = None,
-    containment_resolver=None,  # Callable[[str], bool] | None: worker_id -> ran-under-STRICT
+    containment_resolver=None,  # Callable[[Result], bool] | None: result -> ran-under-STRICT
 ) -> ReceiptIssuanceOutcome:
     """Build, sign, and persist one receipt per agreeing worker.
 
@@ -203,9 +203,7 @@ def issue_receipts_for_completed_unit(
                         worker_pubkey=r.worker_pubkey_hex,
                         unit_id=work_unit.unit_id,
                         ran_under_strict=(
-                            bool(containment_resolver(r.worker_id))
-                            if containment_resolver
-                            else False
+                            bool(containment_resolver(r)) if containment_resolver else False
                         ),
                     )
                 except Exception:
@@ -309,9 +307,7 @@ def issue_receipts_for_completed_unit(
                     result_id=result.result_id,
                     unit_id=work_unit.unit_id,  # A4: per-account-per-unit trust
                     ran_under_strict=(  # A2: STRICT-containment gate for the flip
-                        bool(containment_resolver(result.worker_id))
-                        if containment_resolver
-                        else False
+                        bool(containment_resolver(result)) if containment_resolver else False
                     ),
                 )
             except Exception:

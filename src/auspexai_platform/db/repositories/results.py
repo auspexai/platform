@@ -42,6 +42,7 @@ class ResultRepository:
         environment: dict[str, Any] | None = None,
         schema_version: int | None = None,
         served_weights: dict[str, str] | None = None,
+        ran_under: str | None = None,
     ) -> Result:
         received_at = datetime.now(UTC).isoformat()
         # M-Results: persist the semantic hash at insert so an aged-off row still
@@ -55,8 +56,8 @@ class ResultRepository:
                     result_id, unit_id, worker_id, worker_pubkey_hex,
                     exit_code, payload_json, worker_signature,
                     completed_at, received_at, semantic_hash, environment_json,
-                    schema_version, served_weights_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    schema_version, served_weights_json, ran_under
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     result_id,
@@ -76,6 +77,9 @@ class ResultRepository:
                     # served-weights digest (covered by worker_signature).
                     schema_version,
                     json.dumps(served_weights) if served_weights is not None else None,
+                    # A2 #32: the worker-signed sandbox policy (covered by
+                    # worker_signature). NULL for pre-v2 results.
+                    ran_under,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -274,4 +278,6 @@ class ResultRepository:
             served_weights=(
                 json.loads(row["served_weights_json"]) if row["served_weights_json"] else None
             ),
+            # A2 #32: worker-signed sandbox policy (covered by worker_signature).
+            ran_under=row["ran_under"],
         )

@@ -333,6 +333,12 @@ class Result(BaseModel):
     # worker's Ed25519 signature, so #13b enforces against it (anti-fabrication).
     schema_version: int | None = None
     served_weights: dict[str, str] | None = None
+    # A2 #32 (equal-trust flip activation): the worker-SIGNED sandbox policy this
+    # result ran under (v2 body). Like served_weights, it's covered by the worker
+    # signature — so the flip's STRICT-containment guard is accountable, not
+    # heartbeat-self-reported. None = pre-v2 result (resolver falls back to the
+    # worker's reported capability).
+    ran_under: str | None = None
 
 
 class WorkUnit(BaseModel):

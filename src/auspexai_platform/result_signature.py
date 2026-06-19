@@ -7,10 +7,14 @@ cross-checked known-vector tests on both sides guard against drift).
 
 v0 = the legacy five-field body. v1 (§9 #13a) additionally signs
 `schema_version` + `served_weights` ({model_id: gguf_sha256}), so the
-served-weights digest is worker-ATTESTED, not coordinator-asserted. The
-coordinator reconstructs per the worker-declared `schema_version`, so a v1
-signature (binding the digest) verifies AND a v0 (un-rolled fleet) signature
-stays byte-identical.
+served-weights digest is worker-ATTESTED, not coordinator-asserted. v2 (A2 flip
+activation, #32) additionally signs `ran_under` (the sandbox policy the worker
+actually ran under), so the equal-trust containment guard is worker-ATTESTED +
+accountable instead of heartbeat-self-reported. The coordinator reconstructs per
+the worker-declared `schema_version`, so a v2 signature (binding ran_under)
+verifies, a v1 stays byte-identical, and a v0 (un-rolled fleet) stays
+byte-identical — no flag day. Schema versions are cumulative: v2 carries the v1
+fields too.
 
 This is the first place the body-level `worker_signature` is actually VERIFIED
 (historically it was stored-but-not-verified until receipt issuance). Verifying
@@ -38,10 +42,17 @@ def canonical_result_bytes(
     payload: dict[str, Any],
     schema_version: int | None = 0,
     served_weights: dict[str, str] | None = None,
+    ran_under: str | None = None,
 ) -> bytes:
     """The canonical bytes the worker signed. `schema_version` 0/None reproduces
     the legacy five-field encoding byte-for-byte; >= 1 adds the signed
-    `schema_version` + `served_weights` (digests normalized to lower hex)."""
+    `schema_version` + `served_weights` (digests normalized to lower hex); >= 2
+    adds `ran_under` (the sandbox policy, lower-cased). Versions are cumulative.
+
+    WIRE CONTRACT: this is a byte-for-byte mirror of the worker's
+    `auspexai_worker.signing.result.canonical_result_bytes`. Any change here MUST
+    land identically on the worker side; the known-vector tests on both sides
+    guard against drift."""
     ts = completed_at.isoformat() if isinstance(completed_at, datetime) else completed_at
     body: dict[str, Any] = {
         "unit_id": unit_id,
@@ -53,6 +64,8 @@ def canonical_result_bytes(
     if schema_version and schema_version >= 1:
         body["schema_version"] = int(schema_version)
         body["served_weights"] = {str(k): str(v).lower() for k, v in (served_weights or {}).items()}
+    if schema_version and schema_version >= 2:
+        body["ran_under"] = str(ran_under or "").lower()
     return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -66,6 +79,7 @@ def verify_result_signature(
     payload: dict[str, Any],
     schema_version: int | None = 0,
     served_weights: dict[str, str] | None = None,
+    ran_under: str | None = None,
 ) -> bool:
     """True iff `signature_b64` is a valid Ed25519 signature by `worker_pubkey`
     over the canonical body for the declared `schema_version`. Malformed pubkey
@@ -83,6 +97,7 @@ def verify_result_signature(
         payload=payload,
         schema_version=schema_version,
         served_weights=served_weights,
+        ran_under=ran_under,
     )
     try:
         pubkey.verify(signature, sig_input)

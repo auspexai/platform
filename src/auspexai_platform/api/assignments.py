@@ -143,6 +143,10 @@ class ResultSubmissionRequest(BaseModel):
     # five-field canonical body. served_weights is {model_id: gguf_sha256}.
     schema_version: int | None = Field(default=None)
     served_weights: dict[str, str] | None = Field(default=None)
+    # §9 / A2 #32: a v2 result additionally signs `ran_under` — the sandbox policy
+    # the worker actually ran under. Absent ⇒ pre-v2 (un-rolled worker); the
+    # containment guard then falls back to the worker's reported capability.
+    ran_under: str | None = Field(default=None, max_length=64)
 
 
 class RefuseRequest(BaseModel):
@@ -224,13 +228,15 @@ def _require_self_worker(credential: Credential, url_worker_id: str) -> None:
 # ---- router ---------------------------------------------------------------
 
 
-def _worker_ran_strict(worker_repository, worker_id: str) -> bool:
-    """Firewall #1 (A2): did this worker run under STRICT containment? Reads the
-    worker's reported `sandbox_policy`. NOTE (a2_equal_trust_flip_design.md): this
-    is SELF-REPORTED today — binding ran-under-STRICT to the signed result is the
-    open activation-blocker before the flip is ever turned on."""
-    w = worker_repository.get_by_id(worker_id)
-    policy = w.capabilities.get("sandbox_policy") if w is not None else None
+def _result_ran_strict(worker_repository, result) -> bool:
+    """Firewall #1 (A2): did this RESULT run under STRICT containment? Prefers the
+    worker-SIGNED `ran_under` (v2 result, #32 — accountable, covered by the
+    signature verified at submit); falls back to the worker's reported
+    `sandbox_policy` capability for a pre-v2 result during the fleet roll."""
+    policy = getattr(result, "ran_under", None)
+    if policy is None:
+        w = worker_repository.get_by_id(result.worker_id)
+        policy = w.capabilities.get("sandbox_policy") if w is not None else None
     return containment_rank(policy) >= containment_rank(CONTAINMENT_STRICT)
 
 
@@ -522,6 +528,7 @@ def build_router(
             payload=body.payload,
             schema_version=body.schema_version,
             served_weights=body.served_weights,
+            ran_under=body.ran_under,
         ):
             assignments_repo.mark_refused(
                 assignment_id=assignment.assignment_id,
@@ -548,6 +555,55 @@ def build_router(
                     }
                 },
             )
+
+        # A2 #32 (equal-trust flip activation): a v2 result SIGNS the containment it
+        # ran under. If the worker ran WEAKER than the experiment requires, it has
+        # signed an admission of non-compliance → reject + record provable
+        # misconduct (charter: "sandbox violation" — the maintainer demote/suspend
+        # lever). v0/v1 results carry no signed claim → no-op for the un-rolled
+        # fleet. NB this catches honest non-compliance; a malicious worker would
+        # sign the required level (a lie), but then the signed claim is on record
+        # as the demotion evidence if a violation is later independently detected.
+        if body.ran_under is not None:
+            _exp = experiment_repository.get_by_id(experiment_id)
+            _required = _exp.required_containment if _exp is not None else None
+            if containment_rank(body.ran_under) < containment_rank(_required):
+                assignments_repo.mark_refused(
+                    assignment_id=assignment.assignment_id,
+                    kind="containment_violation",
+                    reason=(
+                        f"worker signed ran_under={body.ran_under!r} but the experiment "
+                        f"requires {_required!r}"
+                    ),
+                )
+                audit_repository.append(
+                    actor_class=CredentialClass.WORKER,
+                    actor_identifier=worker_id,
+                    action="result.containment_violation",
+                    resource_type="work_unit",
+                    resource_id=unit_id,
+                    payload={
+                        "experiment_id": experiment_id,
+                        "ran_under": body.ran_under,
+                        "required_containment": _required,
+                    },
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": {
+                            "code": "containment_violation",
+                            "message": (
+                                "result rejected: signed ran_under is weaker than the "
+                                "experiment's required containment (A2 #32 — provable misconduct)"
+                            ),
+                            "details": {
+                                "ran_under": body.ran_under,
+                                "required_containment": _required,
+                            },
+                        }
+                    },
+                )
 
         # §9 #13a: a v1 result's served-weights digest is now signature-covered
         # (verified just above) — prefer it over the best-effort heartbeat
@@ -636,6 +692,9 @@ def build_router(
             # attested digest survives for evidence.
             schema_version=body.schema_version,
             served_weights=body.served_weights,
+            # A2 #32: persist the worker-signed sandbox policy so issuance reads
+            # the SIGNED containment (not the heartbeat capability) for trust.
+            ran_under=body.ran_under,
         )
         assignments_repo.attach_result(assignment.assignment_id, result.result_id)
         updated_unit, just_completed = work_units_repo.increment_completions(unit_id)
@@ -697,7 +756,9 @@ def build_router(
                         receipt_repo=receipt_repo,
                         signing_key=receipt_signing_key,
                         receipt_index_repo=receipt_index_repository,
-                        containment_resolver=lambda wid: _worker_ran_strict(worker_repository, wid),
+                        containment_resolver=lambda result: _result_ran_strict(
+                            worker_repository, result
+                        ),
                     )
                     audit_repository.append(
                         actor_class=CredentialClass.SYSTEM,
