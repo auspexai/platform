@@ -1186,12 +1186,15 @@ def _maybe_auto_promote(
     if vouch_repository is not None:
         active_vouches = vouch_repository.list_for_target(worker.account_id)
 
-    receipt_count, distinct_tenants = receipt_index_repository.account_receipt_summary(
+    # A4 firewall #3 floor: trust = DISTINCT UNITS the account corroborated, not
+    # raw receipts — so an operator's N workers under one account can't farm the
+    # T2 threshold by redundantly covering the same units.
+    corroborations, distinct_tenants = receipt_index_repository.account_corroboration_summary(
         worker.account_id
     )
 
     elig = compute_t2_eligibility(
-        receipt_count=receipt_count,
+        receipt_count=corroborations,
         distinct_tenants=distinct_tenants,
         thresholds=eligibility_thresholds,
         account=account,
@@ -1227,7 +1230,7 @@ def _maybe_auto_promote(
             "old_tier": int(TrustTier.T1_AUTHENTICATED),
             "new_tier": int(TrustTier.T2_TRUSTED),
             "trigger": "receipt_breadth_age_and_identity_gate_satisfied",
-            "receipt_count": receipt_count,
+            "corroborations": corroborations,  # A4: distinct units, not raw receipts
             "distinct_tenants": distinct_tenants,
             "account_age_days": elig.actuals["account_age_days"],
             "identity_gate_method": elig.identity_gate.method,

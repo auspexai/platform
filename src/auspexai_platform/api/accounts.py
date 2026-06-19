@@ -612,14 +612,19 @@ def build_router(
         # record before its vouch counts (a vouch is enough to satisfy the
         # target's identity gate, so this is the Sybil chokepoint).
         if receipt_index_repository is not None:
-            total, tenants = receipt_index_repository.account_receipt_summary(credential.account_id)
-            if total < vouch_min_receipts or tenants < vouch_min_distinct_tenants:
+            # A4 firewall #3 floor: count DISTINCT corroborated units per account,
+            # not raw receipts — a voucher can't farm the bar with N workers under
+            # one account redundantly covering the same units.
+            corroborations, tenants = receipt_index_repository.account_corroboration_summary(
+                credential.account_id
+            )
+            if corroborations < vouch_min_receipts or tenants < vouch_min_distinct_tenants:
                 raise HTTPException(
                     status_code=403,
                     detail=(
-                        f"voucher must hold ≥{vouch_min_receipts} receipts across "
+                        f"voucher must hold ≥{vouch_min_receipts} corroborated units across "
                         f"≥{vouch_min_distinct_tenants} tenants (anti-Sybil, §6.2.2); "
-                        f"has {total} across {tenants}"
+                        f"has {corroborations} across {tenants}"
                     ),
                 )
         if credential.account_id == account_id:

@@ -282,6 +282,7 @@ def issue_receipts_for_completed_unit(
                     worker_id=result.worker_id,
                     worker_pubkey=result.worker_pubkey_hex,
                     result_id=result.result_id,
+                    unit_id=work_unit.unit_id,  # A4: per-account-per-unit trust
                 )
             except Exception:
                 logger.exception(

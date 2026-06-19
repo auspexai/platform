@@ -31,6 +31,7 @@ class ReceiptIndexEntry:
     worker_pubkey: str  # 64 lowercase hex
     issued_at: datetime
     result_id: str | None = None  # M7-tail: backreference to the worker's result row
+    unit_id: str | None = None  # A4 (0035): the work unit, for per-account-per-unit trust
 
 
 class ReceiptIndexRepository:
@@ -47,6 +48,7 @@ class ReceiptIndexRepository:
         worker_id: str,
         worker_pubkey: str,
         result_id: str | None = None,
+        unit_id: str | None = None,
     ) -> ReceiptIndexEntry:
         """Index a newly-issued receipt. Raises DuplicateReceiptIndexError if
         receipt_id is already indexed (should not happen during normal
@@ -54,7 +56,9 @@ class ReceiptIndexRepository:
 
         `result_id` is M7-tail's backreference: it lets the worker fetch the
         canonical receipt for one of its results via a single index hit.
-        Nullable for backward compatibility with pre-M7-tail rows.
+        `unit_id` (A4, 0035) is the work unit, so per-account trust can count
+        distinct units rather than raw receipts. Both nullable for backward
+        compatibility with rows created before their respective migrations.
         """
         worker_pubkey = worker_pubkey.lower()
         issued_at = datetime.now(UTC).isoformat()
@@ -62,10 +66,19 @@ class ReceiptIndexRepository:
             self.db.execute(
                 """
                 INSERT INTO receipt_index
-                  (receipt_id, experiment_id, worker_id, worker_pubkey, issued_at, result_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                  (receipt_id, experiment_id, worker_id, worker_pubkey, issued_at,
+                   result_id, unit_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (receipt_id, experiment_id, worker_id, worker_pubkey, issued_at, result_id),
+                (
+                    receipt_id,
+                    experiment_id,
+                    worker_id,
+                    worker_pubkey,
+                    issued_at,
+                    result_id,
+                    unit_id,
+                ),
             )
         except sqlite3.IntegrityError as e:
             # Distinguish duplicate-PK from FK-violation by inspecting the
@@ -137,6 +150,30 @@ class ReceiptIndexRepository:
             return (0, 0)
         return (int(rows[0]["total"]), int(rows[0]["tenants"]))
 
+    def account_corroboration_summary(self, account_id: str) -> tuple[int, int]:
+        """(distinct_units, distinct_tenants) — the firewall #3 (A4) ACCOUNT-WEIGHTED
+        trust metric. Counts DISTINCT work units the account corroborated, NOT raw
+        receipts: an operator's N workers under one account corroborating the same
+        unit earn ONE unit of trust, not N — closing within-account receipt-farming
+        toward T2 / the vouch gate. `COALESCE(unit_id, receipt_id)` keeps pre-0035
+        rows (unit_id NULL) at their prior one-each behavior, so the dedup engages
+        only on rows carrying unit_id. `account_receipt_summary` (raw totals) stays
+        for display; this is the count the trust GATES consult."""
+        rows = self.db.execute(
+            """
+            SELECT COUNT(DISTINCT COALESCE(ri.unit_id, ri.receipt_id)) AS units,
+                   COUNT(DISTINCT e.tenant_id) AS tenants
+            FROM receipt_index ri
+            INNER JOIN workers w     ON w.worker_id = ri.worker_id
+            INNER JOIN experiments e ON e.experiment_id = ri.experiment_id
+            WHERE w.account_id = ?
+            """,
+            (account_id,),
+        )
+        if not rows:
+            return (0, 0)
+        return (int(rows[0]["units"]), int(rows[0]["tenants"]))
+
     def get_for_worker_result(self, *, worker_id: str, result_id: str) -> ReceiptIndexEntry | None:
         """Find the receipt index entry for a specific (worker, result) pair
         (M7-tail). Returns None if no receipt was issued for this result
@@ -185,11 +222,16 @@ class ReceiptIndexRepository:
 
     @staticmethod
     def _row_to_entry(row: sqlite3.Row) -> ReceiptIndexEntry:
-        # result_id is M7-tail; nullable on rows from before that migration.
+        # result_id is M7-tail; unit_id is A4/0035 — both nullable on rows from
+        # before their respective migrations.
         try:
             result_id = row["result_id"]
         except (KeyError, IndexError):
             result_id = None
+        try:
+            unit_id = row["unit_id"]
+        except (KeyError, IndexError):
+            unit_id = None
         return ReceiptIndexEntry(
             receipt_id=row["receipt_id"],
             experiment_id=row["experiment_id"],
@@ -197,4 +239,5 @@ class ReceiptIndexRepository:
             worker_pubkey=row["worker_pubkey"],
             issued_at=datetime.fromisoformat(row["issued_at"]),
             result_id=result_id,
+            unit_id=unit_id,
         )

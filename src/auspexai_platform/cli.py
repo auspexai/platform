@@ -241,9 +241,9 @@ def receipts_rebuild_index(
             }
             authoritative = receipt_map_from_per_job(per_job_db)
             worker_by_result = {
-                row["result_id"]: (row["worker_id"], row["worker_pubkey_hex"])
+                row["result_id"]: (row["worker_id"], row["worker_pubkey_hex"], row["unit_id"])
                 for row in per_job_db.execute(
-                    "SELECT result_id, worker_id, worker_pubkey_hex FROM results"
+                    "SELECT result_id, worker_id, worker_pubkey_hex, unit_id FROM results"
                 )
             }
             missing = sorted(set(authoritative) - indexed)
@@ -252,7 +252,7 @@ def receipts_rebuild_index(
             for result_id in missing:
                 if not apply_changes:
                     continue
-                worker_id, worker_pubkey = worker_by_result[result_id]
+                worker_id, worker_pubkey, unit_id = worker_by_result[result_id]
                 try:
                     index_repo.record(
                         receipt_id=authoritative[result_id],
@@ -260,6 +260,7 @@ def receipts_rebuild_index(
                         worker_id=worker_id,
                         worker_pubkey=worker_pubkey,
                         result_id=result_id,
+                        unit_id=unit_id,  # A4: backfill per-account-per-unit trust
                     )
                     inserted += 1
                 except Exception as e:  # per-row fault tolerance, mirror backfill-rekor
