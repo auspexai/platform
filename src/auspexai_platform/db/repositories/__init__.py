@@ -27,6 +27,7 @@ from auspexai_platform.db.repositories.retired_keys import RetiredKeyRepository
 from auspexai_platform.db.repositories.software_requests import SoftwareRequestRepository
 from auspexai_platform.db.repositories.tenant_applications import TenantApplicationRepository
 from auspexai_platform.db.repositories.tenants import TenantRepository
+from auspexai_platform.db.repositories.trust_model_policy import TrustModelPolicyRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.db.repositories.workers import WorkerRepository
 
@@ -49,6 +50,7 @@ __all__ = [
     "SoftwareRequestRepository",
     "TenantApplicationRepository",
     "TenantRepository",
+    "TrustModelPolicyRepository",
     "WorkUnitRepository",
     "WorkerRepository",
 ]

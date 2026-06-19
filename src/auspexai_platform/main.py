@@ -47,6 +47,7 @@ from auspexai_platform.api import scheduler as scheduler_routes
 from auspexai_platform.api import software_requests as software_request_routes
 from auspexai_platform.api import tenant_applications as tenant_application_routes
 from auspexai_platform.api import tenants as tenant_routes
+from auspexai_platform.api import trust_model_policy as trust_model_policy_routes
 from auspexai_platform.api import work_units as work_unit_routes
 from auspexai_platform.api import workers as worker_routes
 from auspexai_platform.auth.bearer import TokenStore
@@ -75,6 +76,7 @@ from auspexai_platform.db.repositories import (
     SoftwareRequestRepository,
     TenantApplicationRepository,
     TenantRepository,
+    TrustModelPolicyRepository,
     WorkerRepository,
 )
 from auspexai_platform.eligibility import EligibilityThresholds
@@ -122,6 +124,7 @@ def create_app(
     account_repository = AccountRepository(db)
     assessment_policy_repository = AssessmentPolicyRepository(db)
     promotion_policy_repository = PromotionPolicyRepository(db)
+    trust_model_policy_repository = TrustModelPolicyRepository(db)
     tenant_repository = TenantRepository(db)
     manifest_repository = ManifestRepository(db)
     experiment_repository = ExperimentRepository(db)
@@ -375,6 +378,15 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["promotion-policy"],
+    )
+    app.include_router(
+        trust_model_policy_routes.build_router(
+            credential_dep,
+            trust_model_policy_repository,
+            audit_repository,
+        ),
+        prefix="/api/v0",
+        tags=["trust-model-policy"],
     )
 
     def _promotion_auto_t1_t2() -> bool:
