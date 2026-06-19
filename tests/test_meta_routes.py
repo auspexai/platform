@@ -1,13 +1,13 @@
 """Tests for the public root-discovery + API-docs routes.
 
-Added 2026-05-23 when the coord went publicly reachable at
-`coord.auspexai.network`. Bare `/` returns a friendly discovery doc (HTML to
-browsers, JSON to programs). `/docs`, `/redoc`, and `/openapi.json` are
-publicly accessible (made public in `3cf45fa`): the OpenAPI document
-describes the API *shape*, not tenant *data* — tenant-private experiment
-data is row-scoped + field-filtered server-side regardless of who reads the
-schema (researcher_dashboard_design.md §3). They remain accessible to the
-maintainer too.
+Bare `/` returns a friendly discovery doc (HTML to browsers, JSON to programs)
+and is public. `/docs`, `/redoc`, and `/openapi.json` are **maintainer-only**
+(2026-06-19, defense-in-depth): the OpenAPI document maps the full 83-path API
+surface incl. maintainer actions (promote/demote/quarantine/…), so it is not
+published to the public even though tenant data is row-scoped + field-filtered
+server-side regardless. This reverses the `3cf45fa` public-schema decision in
+favor of not advertising the attack surface; the maintainer reaches the docs
+through the operator console's authed same-origin proxy.
 """
 
 from __future__ import annotations
@@ -47,26 +47,20 @@ def test_root_returns_html_for_browser_accept_with_quality(client: TestClient) -
     assert response.headers["content-type"].startswith("text/html")
 
 
-def test_openapi_public(client: TestClient) -> None:
-    """The OpenAPI schema is public (3cf45fa): it describes API shape, not
-    tenant data, which is scoped server-side regardless."""
+def test_openapi_requires_maintainer(client: TestClient) -> None:
+    """The OpenAPI schema is maintainer-only (2026-06-19): an unauthenticated
+    request is rejected (403, the coordinator's auth-failure status) — the
+    schema isn't published publicly."""
     response = client.get("/openapi.json")
-    assert response.status_code == 200
-    schema = response.json()
-    assert "paths" in schema
-    assert "/api/v0/health/public" in schema["paths"]
+    assert response.status_code == 403
 
 
-def test_docs_public(client: TestClient) -> None:
-    response = client.get("/docs")
-    assert response.status_code == 200
-    assert "swagger" in response.text.lower()
+def test_docs_requires_maintainer(client: TestClient) -> None:
+    assert client.get("/docs").status_code == 403
 
 
-def test_redoc_public(client: TestClient) -> None:
-    response = client.get("/redoc")
-    assert response.status_code == 200
-    assert "redoc" in response.text.lower()
+def test_redoc_requires_maintainer(client: TestClient) -> None:
+    assert client.get("/redoc").status_code == 403
 
 
 def test_openapi_returns_schema_for_maintainer(client: TestClient, maintainer_token: str) -> None:

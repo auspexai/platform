@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from slowapi import _rate_limit_exceeded_handler
@@ -51,7 +51,8 @@ from auspexai_platform.api import trust_model_policy as trust_model_policy_route
 from auspexai_platform.api import work_units as work_unit_routes
 from auspexai_platform.api import workers as worker_routes
 from auspexai_platform.auth.bearer import TokenStore
-from auspexai_platform.auth.dependency import make_credential_dependency
+from auspexai_platform.auth.credential import Credential
+from auspexai_platform.auth.dependency import make_credential_dependency, require_maintainer
 from auspexai_platform.auth.resolver import CredentialResolver
 from auspexai_platform.auth.tenant_registry import TenantRegistry
 from auspexai_platform.auth.worker_registry import WorkerRegistry
@@ -662,13 +663,14 @@ def _install_root_and_docs(app: FastAPI, credential_dep) -> None:
     """Mount the public root-discovery doc + maintainer-only docs UIs.
 
     Public surface: `GET /` returns HTML to browsers and JSON to programs.
-    Operator surface: `/docs`, `/redoc`, `/openapi.json` require maintainer
-    auth (the FastAPI auto-mounted versions are disabled at construct time).
-    Browser visits to `/docs` after authing render the Swagger UI shell,
-    but the page's JS fetch of `/openapi.json` carries no Authorization
-    header — maintainers can curl the schema with their bearer token for
-    actual inspection. Full browser-side Swagger auth (security-scheme
-    plumbing) is deferred.
+    Operator surface: `/docs`, `/redoc`, `/openapi.json` are **maintainer-only**
+    — each enforces `require_maintainer` (the FastAPI auto-mounted versions are
+    disabled at construct time), so the 83-path schema is never public. The
+    maintainer reaches them through the operator console, which serves a
+    same-origin Swagger/ReDoc shell and proxies `/openapi.json` with the
+    trusted-proxy service token — so the console session cookie does the
+    browser-side auth. A direct unauthenticated browser hit here 401s; a
+    maintainer bearer token also works for a curl.
     """
 
     @app.get("/", include_in_schema=False)
@@ -698,18 +700,27 @@ def _install_root_and_docs(app: FastAPI, credential_dep) -> None:
         )
 
     @app.get("/openapi.json", include_in_schema=False)
-    async def openapi_public() -> JSONResponse:
+    async def openapi_maintainer(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> JSONResponse:
+        require_maintainer(credential)
         return JSONResponse(app.openapi())
 
     @app.get("/docs", include_in_schema=False)
-    async def docs_public() -> HTMLResponse:
+    async def docs_maintainer(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> HTMLResponse:
+        require_maintainer(credential)
         return get_swagger_ui_html(
             openapi_url="/openapi.json",
             title=f"{app.title} — Swagger UI",
         )
 
     @app.get("/redoc", include_in_schema=False)
-    async def redoc_public() -> HTMLResponse:
+    async def redoc_maintainer(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> HTMLResponse:
+        require_maintainer(credential)
         return get_redoc_html(
             openapi_url="/openapi.json",
             title=f"{app.title} — ReDoc",
