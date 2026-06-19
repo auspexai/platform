@@ -618,11 +618,13 @@ def build_router(
                     "worker_pubkey_hex": r.worker_pubkey_hex,
                     "exit_code": r.exit_code,
                     "environment": r.environment,
-                    # §9 #13a: the worker-signed schema version + attested
-                    # served-weights digest — so the bundle reproduces the v1
-                    # canonical body and the SDK verifies the bound digest.
+                    # §9 #13a / A2 #32: the worker-signed schema version + attested
+                    # served-weights digest + ran_under (sandbox policy) — so the
+                    # bundle reproduces the v1/v2 canonical body and the SDK
+                    # verifies the bound digest + containment claim.
                     "schema_version": r.schema_version,
                     "served_weights": r.served_weights,
+                    "ran_under": r.ran_under,
                     "receipt_id": rid,
                     "completed_at": r.completed_at.isoformat(),
                 }
