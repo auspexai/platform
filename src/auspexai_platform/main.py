@@ -652,7 +652,7 @@ _ROOT_HTML = f"""<!doctype html>
   <code class="endpoint"><a href="/api/v0/receipts/">GET /api/v0/receipts/{{receipt_id}}</a></code>
   <p>Signing roster: <a href="https://github.com/auspexai/.github/blob/main/security/AUTHORIZED_SIGNERS.md">AUTHORIZED_SIGNERS.md</a></p>
   <p class="meta">Maintainers: API docs (Swagger / ReDoc), the audit log, and the trust controls live behind the <a href="https://ops.auspexai.network">operator console</a>.</p>
-  <p class="meta">Worker installer: <a href="https://getworker.auspexai.network">getworker.auspexai.network</a> · <a href="https://github.com/auspexai/worker/releases">releases</a> · Operator console: <a href="https://ops.auspexai.network">ops.auspexai.network</a></p>
+  <p class="meta">Worker installer: <a href="https://getworker.auspexai.network">getworker.auspexai.network</a> · <a href="https://github.com/auspexai/worker/releases">releases</a></p>
 </body>
 </html>
 """
