@@ -158,6 +158,7 @@ def build_router(
     eligibility_thresholds=None,
     vouch_min_receipts: int = VOUCH_MIN_RECEIPTS,
     vouch_min_distinct_tenants: int = VOUCH_MIN_DISTINCT_TENANTS,
+    trust_model_policy_repository=None,  # firewall #1 (A2) flip toggle; OFF when unwired
 ) -> APIRouter:
     """Build /accounts router bound to repository instances + verifier."""
 
@@ -615,8 +616,13 @@ def build_router(
             # A4 firewall #3 floor: count DISTINCT corroborated units per account,
             # not raw receipts — a voucher can't farm the bar with N workers under
             # one account redundantly covering the same units.
+            _equal_trust = (
+                trust_model_policy_repository.get().equal_trust_enabled
+                if trust_model_policy_repository is not None
+                else False
+            )
             corroborations, tenants = receipt_index_repository.account_corroboration_summary(
-                credential.account_id
+                credential.account_id, equal_trust_enabled=_equal_trust
             )
             if corroborations < vouch_min_receipts or tenants < vouch_min_distinct_tenants:
                 raise HTTPException(

@@ -88,7 +88,12 @@ from auspexai_platform.receipts.attestation import (
     receipt_map_from_per_job,
 )
 from auspexai_platform.result_signature import verify_result_signature
-from auspexai_platform.scheduler import Scheduler, reoffer_eligible
+from auspexai_platform.scheduler import (
+    CONTAINMENT_STRICT,
+    Scheduler,
+    containment_rank,
+    reoffer_eligible,
+)
 from auspexai_platform.scheduler.conductor import plan_prestage_for_worker
 from auspexai_platform.weights import served_weights_verdict
 from auspexai_platform.worker_status import heartbeat_cutoff
@@ -219,6 +224,16 @@ def _require_self_worker(credential: Credential, url_worker_id: str) -> None:
 # ---- router ---------------------------------------------------------------
 
 
+def _worker_ran_strict(worker_repository, worker_id: str) -> bool:
+    """Firewall #1 (A2): did this worker run under STRICT containment? Reads the
+    worker's reported `sandbox_policy`. NOTE (a2_equal_trust_flip_design.md): this
+    is SELF-REPORTED today — binding ran-under-STRICT to the signed result is the
+    open activation-blocker before the flip is ever turned on."""
+    w = worker_repository.get_by_id(worker_id)
+    policy = w.capabilities.get("sandbox_policy") if w is not None else None
+    return containment_rank(policy) >= containment_rank(CONTAINMENT_STRICT)
+
+
 def build_router(
     credential_dep,
     worker_repository: WorkerRepository,
@@ -240,6 +255,9 @@ def build_router(
     promotion_auto_t1_t2=None,
     # firewall #2: (experiment, entries, diverged, db) -> dict | None
     governance_footprint_builder=None,
+    # firewall #1 (A2): the equal-trust flip toggle. Unwired (tests) → OFF = the
+    # current convergence-gradient trust model (behavior-preserving).
+    trust_model_policy_repository=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -679,6 +697,7 @@ def build_router(
                         receipt_repo=receipt_repo,
                         signing_key=receipt_signing_key,
                         receipt_index_repo=receipt_index_repository,
+                        containment_resolver=lambda wid: _worker_ran_strict(worker_repository, wid),
                     )
                     audit_repository.append(
                         actor_class=CredentialClass.SYSTEM,
@@ -737,6 +756,11 @@ def build_router(
                             vouch_repository=vouch_repository,
                             audit_repository=audit_repository,
                             promotion_auto_t1_t2=promotion_auto_t1_t2,
+                            equal_trust_enabled=(
+                                trust_model_policy_repository.get().equal_trust_enabled
+                                if trust_model_policy_repository is not None
+                                else False
+                            ),
                         )
             except Exception:
                 import logging
@@ -1152,6 +1176,7 @@ def _maybe_auto_promote(
     vouch_repository,
     audit_repository: AuditRepository,
     promotion_auto_t1_t2=None,
+    equal_trust_enabled: bool = False,
 ) -> None:
     """Auto-promote T1→T2 when both gates are satisfied after receipt issuance.
 
@@ -1189,8 +1214,10 @@ def _maybe_auto_promote(
     # A4 firewall #3 floor: trust = DISTINCT UNITS the account corroborated, not
     # raw receipts — so an operator's N workers under one account can't farm the
     # T2 threshold by redundantly covering the same units.
+    # firewall #1 (A2): post-flip, trust = STRICT-contained units, agreement AND
+    # divergence equal (D7). OFF (default / unwired) = the current agreement-only count.
     corroborations, distinct_tenants = receipt_index_repository.account_corroboration_summary(
-        worker.account_id
+        worker.account_id, equal_trust_enabled=equal_trust_enabled
     )
 
     elig = compute_t2_eligibility(

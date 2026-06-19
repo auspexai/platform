@@ -32,6 +32,7 @@ class ReceiptIndexEntry:
     issued_at: datetime
     result_id: str | None = None  # M7-tail: backreference to the worker's result row
     unit_id: str | None = None  # A4 (0035): the work unit, for per-account-per-unit trust
+    ran_under_strict: bool = False  # A2 (0037): STRICT containment — equal-trust accrual gate
 
 
 class ReceiptIndexRepository:
@@ -49,6 +50,7 @@ class ReceiptIndexRepository:
         worker_pubkey: str,
         result_id: str | None = None,
         unit_id: str | None = None,
+        ran_under_strict: bool = False,
     ) -> ReceiptIndexEntry:
         """Index a newly-issued receipt. Raises DuplicateReceiptIndexError if
         receipt_id is already indexed (should not happen during normal
@@ -57,8 +59,10 @@ class ReceiptIndexRepository:
         `result_id` is M7-tail's backreference: it lets the worker fetch the
         canonical receipt for one of its results via a single index hit.
         `unit_id` (A4, 0035) is the work unit, so per-account trust can count
-        distinct units rather than raw receipts. Both nullable for backward
-        compatibility with rows created before their respective migrations.
+        distinct units rather than raw receipts. `ran_under_strict` (A2, 0037)
+        records the containment the agreeing worker ran under, so the equal-trust
+        accrual can keep only STRICT-contained units. Nullable/defaulted for
+        backward compatibility with rows created before their respective migrations.
         """
         worker_pubkey = worker_pubkey.lower()
         issued_at = datetime.now(UTC).isoformat()
@@ -67,8 +71,8 @@ class ReceiptIndexRepository:
                 """
                 INSERT INTO receipt_index
                   (receipt_id, experiment_id, worker_id, worker_pubkey, issued_at,
-                   result_id, unit_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                   result_id, unit_id, ran_under_strict)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     receipt_id,
@@ -78,6 +82,7 @@ class ReceiptIndexRepository:
                     issued_at,
                     result_id,
                     unit_id,
+                    1 if ran_under_strict else 0,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -91,6 +96,38 @@ class ReceiptIndexRepository:
         got = self.get_by_id(receipt_id)
         assert got is not None
         return got
+
+    def record_divergence(
+        self,
+        *,
+        experiment_id: str,
+        worker_id: str,
+        worker_pubkey: str,
+        unit_id: str,
+        ran_under_strict: bool,
+    ) -> None:
+        """Index one diverging worker's honest work on a diverged unit (A2, 0037).
+
+        The disagreement class is NOT minted as a Receipt object (firewall #1
+        design §11) — it gets this parallel trust-index instead. Recorded for
+        every diverged unit (evidentiary now, D7's "issue now"); the equal-trust
+        accrual only COUNTS it once `trust_model_policy.equal_trust_enabled` is ON,
+        and only the `ran_under_strict` rows. Idempotent (INSERT OR IGNORE on the
+        (worker_id, unit_id) unique key) so a re-finalization sweep is a no-op."""
+        self.db.execute(
+            """
+            INSERT OR IGNORE INTO divergence_index
+              (experiment_id, worker_id, worker_pubkey, unit_id, ran_under_strict)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                experiment_id,
+                worker_id,
+                worker_pubkey.lower(),
+                unit_id,
+                1 if ran_under_strict else 0,
+            ),
+        )
 
     # ---- reads ----
 
@@ -150,7 +187,9 @@ class ReceiptIndexRepository:
             return (0, 0)
         return (int(rows[0]["total"]), int(rows[0]["tenants"]))
 
-    def account_corroboration_summary(self, account_id: str) -> tuple[int, int]:
+    def account_corroboration_summary(
+        self, account_id: str, *, equal_trust_enabled: bool = False
+    ) -> tuple[int, int]:
         """(distinct_units, distinct_tenants) — the firewall #3 (A4) ACCOUNT-WEIGHTED
         trust metric. Counts DISTINCT work units the account corroborated, NOT raw
         receipts: an operator's N workers under one account corroborating the same
@@ -158,17 +197,53 @@ class ReceiptIndexRepository:
         toward T2 / the vouch gate. `COALESCE(unit_id, receipt_id)` keeps pre-0035
         rows (unit_id NULL) at their prior one-each behavior, so the dedup engages
         only on rows carrying unit_id. `account_receipt_summary` (raw totals) stays
-        for display; this is the count the trust GATES consult."""
+        for display; this is the count the trust GATES consult.
+
+        `equal_trust_enabled` (A2 / the firewall #1 flip): when FALSE (the default,
+        and the live state until the activation gate) the count is unchanged — it
+        reads agreement receipts regardless of containment. When TRUE (post-flip),
+        trust accrues from the process bundle, which REQUIRES STRICT containment
+        and is EQUAL for agreement AND divergence (firewall_1 D7): the count becomes
+        distinct STRICT-contained units across `receipt_index` (agreement) UNION
+        `divergence_index` (disagreement) — never reading `integrity_basis`/agreement.
+        Permissive units carry no bundle, so they don't count."""
+        if not equal_trust_enabled:
+            rows = self.db.execute(
+                """
+                SELECT COUNT(DISTINCT COALESCE(ri.unit_id, ri.receipt_id)) AS units,
+                       COUNT(DISTINCT e.tenant_id) AS tenants
+                FROM receipt_index ri
+                INNER JOIN workers w     ON w.worker_id = ri.worker_id
+                INNER JOIN experiments e ON e.experiment_id = ri.experiment_id
+                WHERE w.account_id = ?
+                """,
+                (account_id,),
+            )
+            if not rows:
+                return (0, 0)
+            return (int(rows[0]["units"]), int(rows[0]["tenants"]))
+
+        # Equal-trust (flip ON): STRICT-contained units only, agreement UNION
+        # divergence, counted equally per unit (D7). The UNION dedups so an account both
+        # agreed and diverged on the same unit still counts it once (A4 per-unit).
         rows = self.db.execute(
             """
-            SELECT COUNT(DISTINCT COALESCE(ri.unit_id, ri.receipt_id)) AS units,
-                   COUNT(DISTINCT e.tenant_id) AS tenants
-            FROM receipt_index ri
-            INNER JOIN workers w     ON w.worker_id = ri.worker_id
-            INNER JOIN experiments e ON e.experiment_id = ri.experiment_id
-            WHERE w.account_id = ?
+            SELECT COUNT(DISTINCT unit) AS units, COUNT(DISTINCT tenant) AS tenants
+            FROM (
+                SELECT COALESCE(ri.unit_id, ri.receipt_id) AS unit, e.tenant_id AS tenant
+                FROM receipt_index ri
+                INNER JOIN workers w     ON w.worker_id = ri.worker_id
+                INNER JOIN experiments e ON e.experiment_id = ri.experiment_id
+                WHERE w.account_id = ? AND ri.ran_under_strict = 1
+                UNION
+                SELECT di.unit_id AS unit, e.tenant_id AS tenant
+                FROM divergence_index di
+                INNER JOIN workers w     ON w.worker_id = di.worker_id
+                INNER JOIN experiments e ON e.experiment_id = di.experiment_id
+                WHERE w.account_id = ? AND di.ran_under_strict = 1
+            )
             """,
-            (account_id,),
+            (account_id, account_id),
         )
         if not rows:
             return (0, 0)
@@ -232,6 +307,10 @@ class ReceiptIndexRepository:
             unit_id = row["unit_id"]
         except (KeyError, IndexError):
             unit_id = None
+        try:
+            ran_under_strict = bool(row["ran_under_strict"])
+        except (KeyError, IndexError):
+            ran_under_strict = False
         return ReceiptIndexEntry(
             receipt_id=row["receipt_id"],
             experiment_id=row["experiment_id"],
@@ -240,4 +319,5 @@ class ReceiptIndexRepository:
             issued_at=datetime.fromisoformat(row["issued_at"]),
             result_id=result_id,
             unit_id=unit_id,
+            ran_under_strict=ran_under_strict,
         )

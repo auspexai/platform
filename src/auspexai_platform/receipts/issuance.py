@@ -145,6 +145,7 @@ def issue_receipts_for_completed_unit(
     signing_key: SigningKey,
     receipt_index_repo: ReceiptIndexRepository | None = None,
     rekor_client: RekorClient | NoOpRekorClient | None = None,
+    containment_resolver=None,  # Callable[[str], bool] | None: worker_id -> ran-under-STRICT
 ) -> ReceiptIssuanceOutcome:
     """Build, sign, and persist one receipt per agreeing worker.
 
@@ -189,6 +190,30 @@ def issue_receipts_for_completed_unit(
             work_unit.replication_target,
             len(results),
         )
+        # Firewall #1 (A2): index each diverging worker's honest work in the
+        # divergence trust-index — evidentiary now, counted only once the
+        # equal-trust flip is ON (D7 §11: divergence is NOT a Receipt object).
+        # Best-effort: a failure here never blocks unit completion.
+        if receipt_index_repo is not None:
+            for r in results:
+                try:
+                    receipt_index_repo.record_divergence(
+                        experiment_id=experiment.experiment_id,
+                        worker_id=r.worker_id,
+                        worker_pubkey=r.worker_pubkey_hex,
+                        unit_id=work_unit.unit_id,
+                        ran_under_strict=(
+                            bool(containment_resolver(r.worker_id))
+                            if containment_resolver
+                            else False
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "divergence_index record failed for unit %s worker %s",
+                        work_unit.unit_id,
+                        r.worker_id,
+                    )
         return ReceiptIssuanceOutcome(issued_receipt_ids=[], agreement=outcome)
 
     # All results have the same semantic hash. Build hash anchors covering
@@ -283,6 +308,11 @@ def issue_receipts_for_completed_unit(
                     worker_pubkey=result.worker_pubkey_hex,
                     result_id=result.result_id,
                     unit_id=work_unit.unit_id,  # A4: per-account-per-unit trust
+                    ran_under_strict=(  # A2: STRICT-containment gate for the flip
+                        bool(containment_resolver(result.worker_id))
+                        if containment_resolver
+                        else False
+                    ),
                 )
             except Exception:
                 logger.exception(
