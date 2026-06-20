@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Install / update the AuspexAI coordinator's maintenance timer units (the C14 regime-2
-# settle-sweep + the result-retention age-off) into systemd.
+# settle-sweep, the result-retention age-off, and the Rekor anchoring backfill) into systemd.
 #
 # We eat our own dog food: these units are version-controlled in packaging/systemd/ and
 # installed by this script — NOT hand-dropped one-off files. Re-run it on every coordinator

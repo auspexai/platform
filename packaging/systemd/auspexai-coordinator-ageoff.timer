@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily AuspexAI M-Results retention age-off sweep
+Documentation=https://github.com/auspexai/platform
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,29 @@
+[Unit]
+Description=AuspexAI coordinator — Rekor attestation anchoring backfill sweep
+Documentation=https://github.com/auspexai/platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jason
+Group=jason
+Environment=AUSPEXAI_STATE_DIR=/var/lib/auspexai-coordinator
+# Submits un-anchored persisted result-set attestations to Rekor and records the
+# log index + entry UUID. Idempotent + per-row fault-tolerant + NoOp-safe.
+# --apply actually anchors (the CLI is dry-run by default).
+ExecStart=/opt/auspexai-coordinator/bin/auspexai-coordinator attestation backfill-rekor --apply
+
+# Hardening — mirrors auspexai-coordinator.service / -ageoff.service. Reads the
+# binary from a read-only /opt; writes only the rekor-anchor columns under the
+# state dir. Needs outbound network for Rekor (no IPAddressDeny).
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/auspexai-coordinator
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

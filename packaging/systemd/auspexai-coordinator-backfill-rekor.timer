@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly AuspexAI Rekor attestation anchoring backfill
+Documentation=https://github.com/auspexai/platform
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
