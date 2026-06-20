@@ -24,14 +24,22 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from auspexai_platform.config import Config
 from auspexai_platform.db.database import Database
-from auspexai_platform.db.models import CredentialClass, Experiment, Result
+from auspexai_platform.db.models import (
+    CredentialClass,
+    Experiment,
+    ExperimentStatus,
+    Result,
+    WorkUnitStatus,
+)
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AuditRepository,
     ExperimentRepository,
     ResultRepository,
 )
+from auspexai_platform.worker_status import STALE_HEARTBEAT_MINUTES
 
 DEFAULT_RAW_TTL_DAYS = 30
 DEFAULT_GRACE_DAYS = 14
@@ -172,6 +180,151 @@ def age_off_sweep(
                     bytes_freed=bytes_freed,
                 )
             )
+    finally:
+        factory.close_all()
+    return report
+
+
+# ---- C14 regime-2: capacity-aware settle-sweep ----
+
+# Quiescence window before a capacity-stuck unit settles at its floor, in heartbeat
+# intervals so it rides the existing liveness framework (no new wall-clock constant). 2x the
+# stale-heartbeat window lets a transiently-offline worker recover before its unit settles
+# below target.
+SETTLE_QUIESCENCE_INTERVALS = 2
+
+
+@dataclass
+class SettledUnit:
+    experiment_id: str
+    unit_id: str
+    achieved: int
+    target: int
+    floor: int
+
+
+@dataclass
+class SettleReport:
+    applied: bool
+    now: str
+    settled: list[SettledUnit] = field(default_factory=list)
+
+    def summary(self) -> str:
+        verb = "settled" if self.applied else "would settle"
+        head = f"regime-2 settle-sweep @ {self.now} ({'APPLIED' if self.applied else 'DRY-RUN'})"
+        if not self.settled:
+            return f"{head}\n  no capacity-stuck units ready to settle"
+        lines = [head]
+        lines += [
+            f"  {verb} {s.experiment_id}/{s.unit_id} at {s.achieved}/{s.target} (floor {s.floor})"
+            for s in self.settled
+        ]
+        return "\n".join(lines)
+
+
+def settle_sweep(
+    config: Config,
+    *,
+    apply: bool,
+    now: datetime,
+    quiescence_intervals: int = SETTLE_QUIESCENCE_INTERVALS,
+) -> SettleReport:
+    """C14 regime-2 (capacity-aware completion). Complete an IN_PROGRESS unit at its ACHIEVED
+    replication when it has met its floor, the eligible fleet is exhausted, AND it has been
+    quiescent (no new result) for >= `quiescence_intervals` heartbeat windows — so a unit aiming
+    for more replicas than the fleet can supply settles at the best achievable instead of
+    stalling forever. Dry-run unless `apply=True`.
+
+    A settled unit runs the SAME post-completion path as a normal completion
+    (`finalize_completed_unit`) so receipts / consensus-promotion / attestation are
+    byte-identical; the agreeing contributors get their promotion check (their receipts are
+    minted here for the first time)."""
+    from auspexai_platform.api.assignments import finalize_completed_unit
+    from auspexai_platform.db.repositories.assignments import AssignmentRepository
+    from auspexai_platform.db.repositories.work_units import WorkUnitRepository
+    from auspexai_platform.scheduler.capacity import unit_fleet_exhausted
+    from auspexai_platform.services import build_coordinator_services
+
+    svc = build_coordinator_services(config)
+    quiescence = timedelta(minutes=quiescence_intervals * STALE_HEARTBEAT_MINUTES)
+    report = SettleReport(applied=apply, now=now.isoformat())
+    factory = svc.per_job_factory
+    try:
+        for exp in svc.experiment_repository.list_all(status=ExperimentStatus.APPROVED):
+            per_job = factory.get(exp.experiment_id)
+            if per_job is None:
+                continue
+            wu_repo = WorkUnitRepository(per_job)
+            assignments_repo = AssignmentRepository(per_job)  # assignments are a per-job table
+            for unit in wu_repo.list_all(status=WorkUnitStatus.IN_PROGRESS):
+                if unit.completions_so_far < exp.replication_floor:
+                    continue  # below the floor → regime 3 (pause/resume), not a settle
+                if unit.completions_so_far < 2:
+                    # A 1-replica settle is process_only; until the attestation basis classifies
+                    # on the receipt's agreeing-worker count (not replication_target), settling it
+                    # would mislabel the cross-check. Default floor is 2, so this only defers a
+                    # niche floor=1 config (tracked: design §9 basis-source fix).
+                    continue
+                results = ResultRepository(per_job).list_for_unit(unit.unit_id)
+                if not results:
+                    continue  # defensive — completions>=floor implies results exist
+                if now - max(r.received_at for r in results) < quiescence:
+                    continue  # not quiescent yet — a late result / enroller may still arrive
+                if not unit_fleet_exhausted(
+                    unit,
+                    exp,
+                    worker_repository=svc.worker_repository,
+                    assignments_repo=assignments_repo,
+                    now=now,
+                ):
+                    continue  # a schedulable eligible worker can still contribute
+                report.settled.append(
+                    SettledUnit(
+                        experiment_id=exp.experiment_id,
+                        unit_id=unit.unit_id,
+                        achieved=unit.completions_so_far,
+                        target=unit.replication_target,
+                        floor=exp.replication_floor,
+                    )
+                )
+                if not apply:
+                    continue
+                updated, just_completed = wu_repo.complete_at_floor(unit.unit_id)
+                if not just_completed:
+                    continue  # a racing path already completed it
+                svc.audit_repository.append(
+                    actor_class=CredentialClass.SYSTEM,
+                    actor_identifier="settle-sweep",
+                    action="unit.completed_at_floor",
+                    resource_type="work_unit",
+                    resource_id=unit.unit_id,
+                    payload={
+                        "experiment_id": exp.experiment_id,
+                        "achieved": updated.completions_so_far,
+                        "target": updated.replication_target,
+                        "floor": exp.replication_floor,
+                    },
+                )
+                finalize_completed_unit(
+                    unit_id=unit.unit_id,
+                    experiment_id=exp.experiment_id,
+                    updated_unit=updated,
+                    per_job_db=per_job,
+                    promote_worker_ids=sorted({r.worker_id for r in results}),
+                    experiment_repository=svc.experiment_repository,
+                    receipt_signing_key=svc.receipt_signing_key,
+                    receipt_index_repository=svc.receipt_index_repository,
+                    worker_repository=svc.worker_repository,
+                    account_repository=svc.account_repository,
+                    audit_repository=svc.audit_repository,
+                    eligibility_thresholds=svc.eligibility_thresholds,
+                    vouch_repository=svc.vouch_repository,
+                    promotion_auto_t1_t2=svc.promotion_auto_t1_t2,
+                    trust_model_policy_repository=svc.trust_model_policy_repository,
+                    attestation_repository=svc.attestation_repository,
+                    event_bus=None,
+                    governance_footprint_builder=svc.governance_footprint_for,
+                )
     finally:
         factory.close_all()
     return report

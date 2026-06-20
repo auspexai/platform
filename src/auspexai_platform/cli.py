@@ -125,6 +125,34 @@ def age_off(state_dir: Path | None, apply_changes: bool) -> None:
         click.echo("\nRe-run with --apply to blank these payloads.")
 
 
+@main.command("settle")
+@_state_dir_option
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Actually settle eligible units at their achieved replication. Default is a dry-run.",
+)
+def settle(state_dir: Path | None, apply_changes: bool) -> None:
+    """Settle capacity-stuck units at their achieved replication (C14 regime-2).
+
+    Completes IN_PROGRESS units that have met their replication FLOOR but cannot reach their
+    TARGET because the eligible fleet is exhausted and quiescent — instead of stalling
+    forever. DRY-RUN by default; pass `--apply` to settle. A settled unit runs the same
+    post-completion path (receipts / consensus / attestation) as a normal completion.
+    Intended to run from a systemd timer alongside `age-off`.
+    """
+    from datetime import UTC, datetime
+
+    from auspexai_platform.maintenance import settle_sweep
+
+    config = _resolve_config(state_dir)
+    report = settle_sweep(config, apply=apply_changes, now=datetime.now(UTC))
+    click.echo(report.summary())
+    if not apply_changes and report.settled:
+        click.echo("\nRe-run with --apply to settle these units.")
+
+
 # ----------------------------------------------------------------------------
 # attestation group (A2 — Rekor anchoring backfill)
 # ----------------------------------------------------------------------------
