@@ -166,3 +166,33 @@ def unit_fleet_exhausted(
         if a.result_id is not None or a.refused_at is not None
     }
     return all(w.worker_id in done for w in eligible)
+
+
+def unit_max_achievable_replication(
+    unit,
+    experiment,
+    *,
+    worker_repository: WorkerRepository,
+    assignments_repo,
+    now: datetime,
+) -> int:
+    """C14 regime-3: the most replicas this unit could still reach from the CURRENT schedulable
+    fleet — its delivered results plus every schedulable eligible worker that hasn't yet
+    delivered or terminally refused. Below the floor it can never be corroborated with today's
+    fleet (→ pause); when it recovers to >= floor the experiment can resume. Same eligibility
+    basis as `unit_fleet_exhausted` so the pause and resume sides never disagree."""
+    schedulable = _schedulable_workforce(worker_repository.list_all(), now=now)
+    eligible = _eligible(
+        schedulable,
+        experiment.required_capabilities or {},
+        unit.replication_target,
+        requires_real_execution=experiment.requires_real_execution,
+        required_containment=experiment.required_containment,
+    )
+    done = {
+        a.worker_id
+        for a in assignments_repo.list_for_unit(unit.unit_id)
+        if a.result_id is not None or a.refused_at is not None
+    }
+    uncontributed = sum(1 for w in eligible if w.worker_id not in done)
+    return unit.completions_so_far + uncontributed

@@ -39,6 +39,7 @@ from auspexai_platform.db.repositories import (
     ExperimentRepository,
     ResultRepository,
 )
+from auspexai_platform.db.repositories.experiments import InvalidStatusTransitionError
 from auspexai_platform.worker_status import STALE_HEARTBEAT_MINUTES
 
 DEFAULT_RAW_TTL_DAYS = 30
@@ -208,17 +209,28 @@ class SettleReport:
     applied: bool
     now: str
     settled: list[SettledUnit] = field(default_factory=list)
+    paused: list[SettledUnit] = field(default_factory=list)  # regime 3: starved below the floor
+    resumed: list[str] = field(default_factory=list)  # experiment_ids auto-resumed (capacity back)
 
     def summary(self) -> str:
-        verb = "settled" if self.applied else "would settle"
-        head = f"regime-2 settle-sweep @ {self.now} ({'APPLIED' if self.applied else 'DRY-RUN'})"
-        if not self.settled:
-            return f"{head}\n  no capacity-stuck units ready to settle"
+        head = (
+            f"regime-2/3 capacity sweep @ {self.now} ({'APPLIED' if self.applied else 'DRY-RUN'})"
+        )
+        if not (self.settled or self.paused or self.resumed):
+            return f"{head}\n  nothing to settle, pause, or resume"
+        sv = "settled" if self.applied else "would settle"
+        pv = "paused" if self.applied else "would pause"
+        rv = "resumed" if self.applied else "would resume"
         lines = [head]
         lines += [
-            f"  {verb} {s.experiment_id}/{s.unit_id} at {s.achieved}/{s.target} (floor {s.floor})"
+            f"  {sv} {s.experiment_id}/{s.unit_id} at {s.achieved}/{s.target} (floor {s.floor})"
             for s in self.settled
         ]
+        lines += [
+            f"  {pv} {p.experiment_id}: {p.unit_id} starved at {p.achieved}/floor {p.floor}"
+            for p in self.paused
+        ]
+        lines += [f"  {rv} {e} (corroborating capacity recovered)" for e in self.resumed]
         return "\n".join(lines)
 
 
@@ -229,7 +241,7 @@ def settle_sweep(
     now: datetime,
     quiescence_intervals: int = SETTLE_QUIESCENCE_INTERVALS,
 ) -> SettleReport:
-    """C14 regime-2 (capacity-aware completion). Complete an IN_PROGRESS unit at its ACHIEVED
+    """C14 regimes 2 + 3 (capacity-aware completion + pause/resume below the floor). Settle an IN_PROGRESS unit at its ACHIEVED
     replication when it has met its floor, the eligible fleet is exhausted, AND it has been
     quiescent (no new result) for >= `quiescence_intervals` heartbeat windows — so a unit aiming
     for more replicas than the fleet can supply settles at the best achievable instead of
@@ -242,7 +254,10 @@ def settle_sweep(
     from auspexai_platform.api.assignments import finalize_completed_unit
     from auspexai_platform.db.repositories.assignments import AssignmentRepository
     from auspexai_platform.db.repositories.work_units import WorkUnitRepository
-    from auspexai_platform.scheduler.capacity import unit_fleet_exhausted
+    from auspexai_platform.scheduler.capacity import (
+        unit_fleet_exhausted,
+        unit_max_achievable_replication,
+    )
     from auspexai_platform.services import build_coordinator_services
 
     svc = build_coordinator_services(config)
@@ -250,20 +265,30 @@ def settle_sweep(
     report = SettleReport(applied=apply, now=now.isoformat())
     factory = svc.per_job_factory
     try:
+        # APPROVED experiments: settle a unit at the floor (regime 2), or pause the experiment
+        # when a unit's fleet is exhausted BELOW the floor (regime 3).
         for exp in svc.experiment_repository.list_all(status=ExperimentStatus.APPROVED):
             per_job = factory.get(exp.experiment_id)
             if per_job is None:
                 continue
             wu_repo = WorkUnitRepository(per_job)
             assignments_repo = AssignmentRepository(per_job)  # assignments are a per-job table
+            starved: SettledUnit | None = None  # first below-floor, fleet-exhausted unit
             for unit in wu_repo.list_all(status=WorkUnitStatus.IN_PROGRESS):
-                if unit.completions_so_far < exp.replication_floor:
-                    continue  # below the floor → regime 3 (pause/resume), not a settle
                 results = ResultRepository(per_job).list_for_unit(unit.unit_id)
-                if not results:
-                    continue  # defensive — completions>=floor implies results exist
-                if now - max(r.received_at for r in results) < quiescence:
-                    continue  # not quiescent yet — a late result / enroller may still arrive
+                assigns = assignments_repo.list_for_unit(unit.unit_id)
+                if not assigns:
+                    continue  # defensive: an IN_PROGRESS unit has been assigned at least once
+                # Quiescence is keyed on the last RESULT (a worker delivering); an in-flight
+                # fetch is handled by unit_fleet_exhausted, not here. The assignment time is the
+                # fallback only for a 0-result unit (an abandoned fetch with nothing delivered).
+                last_activity = (
+                    max(r.received_at for r in results)
+                    if results
+                    else max(a.assigned_at for a in assigns)
+                )
+                if now - last_activity < quiescence:
+                    continue  # not quiescent: a late result / enroller may still arrive
                 if not unit_fleet_exhausted(
                     unit,
                     exp,
@@ -272,6 +297,18 @@ def settle_sweep(
                     now=now,
                 ):
                     continue  # a schedulable eligible worker can still contribute
+                if unit.completions_so_far < exp.replication_floor:
+                    # regime 3: exhausted BELOW the floor, so this unit can never be corroborated
+                    # with today's fleet. Remember it; pause the experiment after this pass.
+                    starved = starved or SettledUnit(
+                        experiment_id=exp.experiment_id,
+                        unit_id=unit.unit_id,
+                        achieved=unit.completions_so_far,
+                        target=unit.replication_target,
+                        floor=exp.replication_floor,
+                    )
+                    continue
+                # regime 2: exhausted AT/ABOVE the floor, settle at the achieved replication.
                 report.settled.append(
                     SettledUnit(
                         experiment_id=exp.experiment_id,
@@ -319,6 +356,90 @@ def settle_sweep(
                     event_bus=None,
                     governance_footprint_builder=svc.governance_footprint_for,
                 )
+            if starved is not None:
+                report.paused.append(starved)
+                if apply:
+                    _regime3_pause(svc, exp, starved)
+
+        # PAUSED-by-the-sweep experiments: resume once corroborating capacity recovers (regime 3).
+        for exp in svc.experiment_repository.list_all(status=ExperimentStatus.PAUSED):
+            if exp.last_action_by_class is not CredentialClass.SYSTEM:
+                continue  # only auto-resume what the sweep paused, never an operator pause
+            per_job = factory.get(exp.experiment_id)
+            if per_job is None:
+                continue
+            wu_repo = WorkUnitRepository(per_job)
+            assignments_repo = AssignmentRepository(per_job)
+            recovered = True
+            for unit in wu_repo.list_all(status=WorkUnitStatus.IN_PROGRESS):
+                if unit.completions_so_far >= exp.replication_floor:
+                    continue  # already corroborated to the floor
+                if (
+                    unit_max_achievable_replication(
+                        unit,
+                        exp,
+                        worker_repository=svc.worker_repository,
+                        assignments_repo=assignments_repo,
+                        now=now,
+                    )
+                    < exp.replication_floor
+                ):
+                    recovered = False  # at least one unit still can't reach the floor
+                    break
+            if recovered:
+                report.resumed.append(exp.experiment_id)
+                if apply:
+                    _regime3_resume(svc, exp)
     finally:
         factory.close_all()
     return report
+
+
+def _regime3_pause(svc, exp, starved: SettledUnit) -> None:
+    """C14 regime 3: SYSTEM-pause an experiment whose unit cannot reach the floor with the
+    current fleet. Mirrors `_maybe_auto_complete` (SYSTEM-actor status transition + audit);
+    `last_action_by_class=SYSTEM` marks it for the sweep's auto-resume. Idempotent: a racing
+    operator transition (e.g. abort) just no-ops."""
+    try:
+        svc.experiment_repository.update_status(
+            exp.experiment_id,
+            ExperimentStatus.PAUSED,
+            actor_class=CredentialClass.SYSTEM,
+        )
+    except InvalidStatusTransitionError:
+        return
+    svc.audit_repository.append(
+        actor_class=CredentialClass.SYSTEM,
+        actor_identifier="settle-sweep",
+        action="experiment.regime3_pause",
+        resource_type="experiment",
+        resource_id=exp.experiment_id,
+        payload={
+            "trigger": "insufficient_corroborating_capacity",
+            "unit_id": starved.unit_id,
+            "need": starved.floor,
+            "have": starved.achieved,
+        },
+    )
+
+
+def _regime3_resume(svc, exp) -> None:
+    """C14 regime 3: SYSTEM-resume an experiment the sweep paused, once corroborating capacity
+    recovered (every below-floor unit can again reach the floor). Only ever called for
+    experiments the sweep itself paused; never un-pauses an operator pause."""
+    try:
+        svc.experiment_repository.update_status(
+            exp.experiment_id,
+            ExperimentStatus.APPROVED,
+            actor_class=CredentialClass.SYSTEM,
+        )
+    except InvalidStatusTransitionError:
+        return
+    svc.audit_repository.append(
+        actor_class=CredentialClass.SYSTEM,
+        actor_identifier="settle-sweep",
+        action="experiment.regime3_resume",
+        resource_type="experiment",
+        resource_id=exp.experiment_id,
+        payload={"trigger": "corroborating_capacity_recovered"},
+    )
