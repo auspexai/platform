@@ -62,10 +62,10 @@ from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.maintenance import projected_raw_age_off
 from auspexai_platform.receipts.signing import SigningKey
 from auspexai_platform.scheduler import (
-    integrity_policy_for_request,
     is_sub_floor_policy,
     policy_floor_for_tier,
     required_containment_for_tier,
+    resolve_replication,
 )
 
 # ---- response models -------------------------------------------------------
@@ -529,12 +529,19 @@ def build_router(
         # experiment at trusted/repl-1.
         if tenant_tier is not None:
             tier = tenant_tier(manifest_tenant)
-            experiment_repository.set_integrity_policy(
+            # C14: decouple replication from the {1,3,5} ladder so repl-2 is expressible.
+            # The manifest's replication_factor is the TARGET; replication_floor defaults
+            # to 2 (a real cross-check), both floored by the tenant's trust tier.
+            _target, _floor, _policy = resolve_replication(
+                requested_target=int(body.manifest.get("replication_factor", 1) or 1),
+                requested_floor=body.manifest.get("replication_floor"),
+                tenant_tier=tier,
+            )
+            experiment_repository.set_replication(
                 experiment.experiment_id,
-                integrity_policy_for_request(
-                    replication_factor=int(body.manifest.get("replication_factor", 1) or 1),
-                    tenant_tier=tier,
-                ),
+                replication_target=_target,
+                replication_floor=_floor,
+                integrity_policy=_policy,
             )
             # §41 containment floor: seed the minimum sandbox isolation from the
             # tenant tier (the host-isolation analogue of the A' replication floor).

@@ -26,7 +26,12 @@ from datetime import UTC, datetime
 
 from auspexai_platform.auth.credential import CredentialClass
 from auspexai_platform.db.database import Database
-from auspexai_platform.db.models import Experiment, ExperimentStatus, IntegrityPolicy
+from auspexai_platform.db.models import (
+    INTEGRITY_POLICY_REPLICATION,
+    Experiment,
+    ExperimentStatus,
+    IntegrityPolicy,
+)
 
 
 class DuplicateExperimentLabelError(Exception):
@@ -303,21 +308,47 @@ class ExperimentRepository:
             raise ExperimentNotFoundError(experiment_id)
         return got
 
-    def set_integrity_policy(
+    def set_replication(
         self,
         experiment_id: str,
-        policy: IntegrityPolicy,
+        *,
+        replication_target: int,
+        replication_floor: int,
+        integrity_policy: IntegrityPolicy,
     ) -> Experiment:
-        """Set the integrity policy for an experiment. Typically called at
-        approval time by the Maintainer."""
+        """C14: set an experiment's replication (the source of truth) together with its
+        DERIVED integrity_policy label. Used at submit (decoupled (target, floor)) and by
+        the maintainer override (exact count). `replication_target` is what the scheduler
+        and completion consult; the policy enum is a coarse legacy label."""
         self.db.execute(
-            "UPDATE experiments SET integrity_policy = ? WHERE experiment_id = ?",
-            (policy.value, experiment_id),
+            "UPDATE experiments SET replication_target = ?, replication_floor = ?, "
+            "integrity_policy = ? WHERE experiment_id = ?",
+            (
+                int(replication_target),
+                int(replication_floor),
+                integrity_policy.value,
+                experiment_id,
+            ),
         )
         got = self.get_by_id(experiment_id)
         if got is None:
             raise ExperimentNotFoundError(experiment_id)
         return got
+
+    def set_integrity_policy(
+        self,
+        experiment_id: str,
+        policy: IntegrityPolicy,
+    ) -> Experiment:
+        """Maintainer override (explicit): set an EXACT integrity policy. C14: keeps the
+        replication source-of-truth in sync — target = floor = the policy's count."""
+        count = INTEGRITY_POLICY_REPLICATION.get(policy, 3)
+        return self.set_replication(
+            experiment_id,
+            replication_target=count,
+            replication_floor=count,
+            integrity_policy=policy,
+        )
 
     def set_required_containment(self, experiment_id: str, level: str) -> Experiment:
         """§41 containment floor: set the minimum sandbox isolation this
@@ -430,6 +461,12 @@ class ExperimentRepository:
             integrity_policy=IntegrityPolicy(row["integrity_policy"])
             if row["integrity_policy"]
             else IntegrityPolicy.STANDARD,
+            replication_target=(
+                row["replication_target"] if "replication_target" in row.keys() else 3
+            ),
+            replication_floor=(
+                row["replication_floor"] if "replication_floor" in row.keys() else 2
+            ),
             required_containment=(
                 row["required_containment"]
                 if "required_containment" in row.keys()

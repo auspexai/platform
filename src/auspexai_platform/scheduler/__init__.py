@@ -83,6 +83,36 @@ def integrity_policy_for_request(
     return IntegrityPolicy.HIGH
 
 
+def _derive_integrity_policy(replication_target: int) -> IntegrityPolicy:
+    """C14: the integrity_policy enum is now a DERIVED coarse label over the real
+    `replication_target` (the source of truth). 2 and 3 both read as 'standard' — the
+    precise count is the target, the precise corroboration is the basis code."""
+    if replication_target <= 1:
+        return IntegrityPolicy.TRUSTED
+    if replication_target <= 3:
+        return IntegrityPolicy.STANDARD
+    return IntegrityPolicy.HIGH
+
+
+def resolve_replication(
+    *,
+    requested_target: int,
+    requested_floor: int | None,
+    tenant_tier: TrustTier | int,
+) -> tuple[int, int, IntegrityPolicy]:
+    """C14: resolve an experiment's (replication_target, replication_floor) from the
+    researcher's request — decoupled from the {1,3,5} ladder so repl-2 is expressible.
+    The tier floor is the COORDINATOR's trust requirement (lower tenant trust → more
+    corroboration); it floors both. `requested_floor` defaults to 2 (a real cross-check);
+    the floor is DORMANT until capacity-aware completion (regime 2) consumes it, and never
+    exceeds the target. Returns (target, floor, derived policy label)."""
+    tier_floor = _TIER_REPLICATION_FLOOR.get(TrustTier(int(tenant_tier)), 3)
+    target = max(int(requested_target), tier_floor)
+    floor = max(int(requested_floor) if requested_floor is not None else 2, tier_floor)
+    floor = min(floor, target)
+    return target, floor, _derive_integrity_policy(target)
+
+
 def policy_floor_for_tier(tenant_tier: TrustTier | int) -> IntegrityPolicy:
     """A' approve-time clamp: the most-permissive (lowest-replication) integrity
     policy a tenant of this tier is ALLOWED to run at — the manual-override

@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from auspexai_platform.db.models import INTEGRITY_POLICY_REPLICATION, ExperimentStatus, Worker
+from auspexai_platform.db.models import ExperimentStatus, Worker
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import ExperimentRepository, WorkUnitRepository
 from auspexai_platform.db.repositories.workers import WorkerRepository
@@ -117,7 +117,7 @@ def experiments_collapsed_by_removing(
         needs_work = counts.get("pending", 0) + counts.get("in_progress", 0)
         if needs_work <= 0:
             continue
-        repl = INTEGRITY_POLICY_REPLICATION.get(exp.integrity_policy, 3)
+        repl = exp.replication_target  # C14: source of truth (decoupled from the policy map)
         required = exp.required_capabilities or {}
         rre = exp.requires_real_execution
         rc = exp.required_containment

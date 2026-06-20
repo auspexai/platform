@@ -26,7 +26,6 @@ from pydantic import BaseModel
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.db.models import (
-    INTEGRITY_POLICY_REPLICATION,
     ExperimentStatus,
     WorkUnitStatus,
 )
@@ -183,7 +182,7 @@ def build_router(
             in_progress = counts.get("in_progress", 0)
             completed = counts.get("completed", 0)
             needs_work = pending + in_progress  # in-progress units may still need replicas
-            repl = INTEGRITY_POLICY_REPLICATION.get(exp.integrity_policy, 3)
+            repl = exp.replication_target  # C14: source of truth (decoupled from the policy map)
             required = exp.required_capabilities or {}
             capable = [
                 w
@@ -268,7 +267,7 @@ def build_router(
         required = (exp.required_capabilities or {}).get("models", [])
         manifest = manifest_repository.get(exp.manifest_hash)
         coords = _coords_for_models(manifest.manifest_json) if manifest is not None else {}
-        repl = INTEGRITY_POLICY_REPLICATION.get(exp.integrity_policy, 3)
+        repl = exp.replication_target  # C14: source of truth (decoupled from the policy map)
         need = repl + 1  # + churn margin (matches the conductor)
         cutoff = heartbeat_cutoff(datetime.now(UTC))
         on_network = [

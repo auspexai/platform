@@ -168,7 +168,14 @@ class Experiment(BaseModel):
     submissions_finalized: bool = False
     last_action_at: datetime | None = None
     last_action_by_class: CredentialClass | None = None
+    # C14 replication-model redesign (0040): the replication COUNT, decoupled from
+    # the 3-value integrity_policy enum so repl-2 is expressible. `replication_target`
+    # is now the SOURCE OF TRUTH for how many distinct-worker completions a unit needs;
+    # `integrity_policy` is a DERIVED coarse label. `replication_floor` = the minimum
+    # corroboration accepted (consumed by capacity-aware completion in a later phase).
     integrity_policy: IntegrityPolicy = IntegrityPolicy.STANDARD
+    replication_target: int = 3
+    replication_floor: int = 2
     # §41 containment floor: minimum sandbox isolation a worker must run this
     # experiment's code under (seeded at submit from the tenant tier). 'permissive'
     # | 'strict'. The scheduler matches worker.capabilities['sandbox_policy'].

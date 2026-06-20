@@ -142,16 +142,21 @@ class World:
 
     # ---- domain helpers ----
 
-    def create_approved_experiment(self, label: str) -> tuple[str, str]:
+    def create_approved_experiment(
+        self, label: str, *, replication_factor: int | None = None
+    ) -> tuple[str, str]:
+        manifest = {
+            "tenant_id": "prop-tenant",
+            "experiment_id": label,
+            "executor": "python -m prop.executor",
+        }
+        if replication_factor is not None:  # C14: opt into explicit repl (else the tier default)
+            manifest["replication_factor"] = replication_factor
         r = self.researcher(
             "POST",
             "/api/v0/experiments",
             json_body={
-                "manifest": {
-                    "tenant_id": "prop-tenant",
-                    "experiment_id": label,
-                    "executor": "python -m prop.executor",
-                },
+                "manifest": manifest,
                 "signature": {"alg": "ed25519", "sig": "opaque-to-v0"},
             },
         )
@@ -665,8 +670,8 @@ def test_legacy_submit_with_ambiguous_unit_lands_in_exactly_one_active_experimen
     aborted-experiment variant; v0.1.24 added the terminal skip.)"""
     w = World()
     try:
-        exp_a, hash_a = w.create_approved_experiment("amb-a")
-        exp_b, hash_b = w.create_approved_experiment("amb-b")
+        exp_a, hash_a = w.create_approved_experiment("amb-a", replication_factor=3)
+        exp_b, hash_b = w.create_approved_experiment("amb-b", replication_factor=3)
         worker = w.enroll_worker()
         for exp_id, label, h in ((exp_a, "amb-a", hash_a), (exp_b, "amb-b", hash_b)):
             r = w.researcher(

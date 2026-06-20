@@ -126,6 +126,7 @@ def test_full_flow_researcher_to_auto_complete(
                 "tenant_id": "synth-doubler",
                 "experiment_id": "doubler-001",
                 "executor": "python -m examples.doubler",
+                "replication_factor": 3,  # C14: T1 tenant — request repl-3 explicitly (3-way)
             },
             "signature": {"alg": "ed25519", "sig": "fake-sig-opaque-to-v0"},
         },
@@ -335,7 +336,7 @@ def test_pause_mid_flow_stops_new_assignments_but_accepts_in_flight(
         privkey=researcher_priv,
         pubkey_hex=researcher_pub,
         json_body={
-            "manifest": {"tenant_id": "synth", "experiment_id": "exp-1"},
+            "manifest": {"tenant_id": "synth", "experiment_id": "exp-1", "replication_factor": 3},
             "signature": {},
         },
     ).json()
@@ -481,7 +482,7 @@ def test_abort_mid_flow_records_attribution(
         privkey=researcher_priv,
         pubkey_hex=researcher_pub,
         json_body={
-            "manifest": {"tenant_id": "synth", "experiment_id": "doomed"},
+            "manifest": {"tenant_id": "synth", "experiment_id": "doomed", "replication_factor": 3},
             "signature": {},
         },
     ).json()
@@ -539,7 +540,11 @@ def test_every_state_changing_action_in_full_flow_writes_audit(
         privkey=researcher_priv,
         pubkey_hex=researcher_pub,
         json_body={
-            "manifest": {"tenant_id": "tcoverage", "experiment_id": "cov-1"},
+            "manifest": {
+                "tenant_id": "tcoverage",
+                "experiment_id": "cov-1",
+                "replication_factor": 3,
+            },
             "signature": {},
         },
     ).json()
@@ -686,7 +691,7 @@ def test_researcher_can_observe_unit_progress_via_list(
         privkey=researcher_priv,
         pubkey_hex=researcher_pub,
         json_body={
-            "manifest": {"tenant_id": "synth", "experiment_id": "exp-1"},
+            "manifest": {"tenant_id": "synth", "experiment_id": "exp-1", "replication_factor": 3},
             "signature": {},
         },
     ).json()

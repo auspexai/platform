@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from auspexai_platform.db.models import INTEGRITY_POLICY_REPLICATION, ExperimentStatus, Worker
+from auspexai_platform.db.models import ExperimentStatus, Worker
 from auspexai_platform.db.repositories import (
     ExperimentRepository,
     ManifestRepository,
@@ -82,7 +82,7 @@ def plan_prestage_for_worker(
             required = (exp.required_capabilities or {}).get("models", [])
             if not required:
                 continue
-            repl = INTEGRITY_POLICY_REPLICATION.get(exp.integrity_policy, 3)
+            repl = exp.replication_target  # C14: source of truth (decoupled from the map)
             if tier_floor > repl:
                 continue  # worker can't take this experiment's units anyway
             need = repl + churn_margin

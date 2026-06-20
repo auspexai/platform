@@ -295,7 +295,6 @@ def build_router(
             seen_ids.add(unit.unit_id)
 
         # ---- resource bounds enforcement (set by Maintainer at approval) ----
-        from auspexai_platform.db.models import INTEGRITY_POLICY_REPLICATION
 
         if experiment.max_payload_bytes is not None:
             import json as _json
@@ -338,7 +337,9 @@ def build_router(
                     },
                 )
 
-        replication_target = INTEGRITY_POLICY_REPLICATION.get(experiment.integrity_policy, 3)
+        # C14: replication_target is the SOURCE OF TRUTH on the experiment (decoupled
+        # from the {1,3,5} integrity_policy ladder) — read it directly, not the map.
+        replication_target = experiment.replication_target
 
         per_job_db = per_job_factory.get_or_create(experiment_id)
         repo = WorkUnitRepository(per_job_db)
