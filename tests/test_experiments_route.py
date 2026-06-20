@@ -523,6 +523,68 @@ def test_approve_at_floor_policy_is_not_gated(
     assert "forced_below_floor" not in (rows[0].payload or {})
 
 
+# ---- C14 (target, floor) override — repl-2 expressible at approval ----------
+
+
+def test_approve_with_replication_target_2_is_expressible(
+    client: TestClient, submitted_experiment, maintainer_token: str
+) -> None:
+    # C14: the maintainer sets replication_target directly — repl-2 (which the {1,3,5}
+    # integrity_policy ladder could NOT express) is selectable. Tenant is T1 (floor 2).
+    _, _, experiment_id = submitted_experiment
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/approve",
+        params={"replication_target": 2},
+        headers=_AUTH(maintainer_token),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "approved"
+    assert body["replication_target"] == 2  # the ladder's gap — now expressible
+    assert body["integrity_policy"] == "standard"  # derived coarse label
+
+
+def test_approve_replication_target_floored_to_tier(
+    client: TestClient, submitted_experiment, maintainer_token: str
+) -> None:
+    # resolve_replication tier-floors: a T1 tenant (floor 2) can't be dropped to repl-1 via this
+    # path — lowering below the earned floor stays on the legacy integrity_policy + force path.
+    _, _, experiment_id = submitted_experiment
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/approve",
+        params={"replication_target": 1},
+        headers=_AUTH(maintainer_token),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["replication_target"] == 2  # floored up to the T1 tier floor
+
+
+def test_set_replication_override_after_approval(
+    client: TestClient, submitted_experiment, maintainer_token: str, audit_repository
+) -> None:
+    _, _, experiment_id = submitted_experiment
+    client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/approve",
+        headers=_AUTH(maintainer_token),
+    )
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/set-replication",
+        json={"replication_target": 5, "replication_floor": 3, "reason": "raise corroboration"},
+        headers=_AUTH(maintainer_token),
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["replication_target"] == 5
+    assert body["replication_floor"] == 3
+    assert body["integrity_policy"] == "high"
+    rows = [
+        a
+        for a in audit_repository.latest(limit=30)
+        if a.action == "experiment.set_replication" and a.resource_id == experiment_id
+    ]
+    assert rows and rows[0].payload["replication_target"] == 5
+
+
 def test_approve_subfloor_allowed_without_force_for_t2_tenant(
     client: TestClient,
     submitted_experiment,

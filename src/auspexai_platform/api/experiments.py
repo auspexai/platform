@@ -100,6 +100,8 @@ class ExperimentResponse(BaseModel):
     revision: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     error_summary: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     integrity_policy: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
+    replication_target: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
+    replication_floor: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     max_unit_duration_seconds: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     max_units: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     max_concurrent_assignments: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
@@ -154,6 +156,18 @@ class SetIntegrityPolicyRequest(BaseModel):
     )
 
 
+class SetReplicationRequest(BaseModel):
+    """C14 override: set an experiment's (replication_target, replication_floor) directly — the
+    post-ladder mechanic that supersedes the {1,3,5} integrity_policy ladder. `reason` is
+    mandatory + audited. resolve_replication tier-floors both, so a maintainer RAISES
+    corroboration freely; lowering BELOW the tier floor stays on the legacy
+    set-integrity-policy + force path."""
+
+    replication_target: int | None = Field(default=None, ge=1, le=15)
+    replication_floor: int | None = Field(default=None, ge=1, le=15)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 # ---- helpers ---------------------------------------------------------------
 
 
@@ -195,6 +209,8 @@ def _to_response(experiment) -> ExperimentResponse:
         integrity_policy=experiment.integrity_policy.value
         if hasattr(experiment, "integrity_policy") and experiment.integrity_policy
         else "standard",
+        replication_target=getattr(experiment, "replication_target", None),
+        replication_floor=getattr(experiment, "replication_floor", None),
         max_unit_duration_seconds=experiment.max_unit_duration_seconds,
         max_units=experiment.max_units,
         max_concurrent_assignments=experiment.max_concurrent_assignments,
@@ -660,6 +676,8 @@ def build_router(
     async def approve_experiment(
         experiment_id: str,
         integrity_policy: str | None = None,
+        replication_target: int | None = None,
+        replication_floor: int | None = None,
         max_unit_duration_seconds: int | None = None,
         max_units: int | None = None,
         max_concurrent_assignments: int | None = None,
@@ -670,7 +688,31 @@ def build_router(
     ) -> ExperimentResponse:
         require_maintainer(credential)
         override_audit: dict[str, Any] = {}
-        if integrity_policy is not None:
+        if replication_target is not None or replication_floor is not None:
+            # C14 (target, floor) override — the post-ladder mechanic. resolve_replication
+            # tier-floors both: the maintainer RAISES corroboration freely; lowering below the
+            # tier floor stays on the legacy integrity_policy + force path (the elif).
+            experiment = experiment_repository.get_by_id(experiment_id)
+            if experiment is None:
+                raise _experiment_not_found(experiment_id)
+            tier = tenant_tier(experiment.tenant_id) if tenant_tier is not None else None
+            cur_target = getattr(experiment, "replication_target", None) or 3
+            _rt, _rf, _rp = resolve_replication(
+                requested_target=int(replication_target)
+                if replication_target is not None
+                else int(cur_target),
+                requested_floor=replication_floor,
+                tenant_tier=tier if tier is not None else int(TrustTier.T2_TRUSTED),
+            )
+            experiment_repository.set_replication(
+                experiment_id, replication_target=_rt, replication_floor=_rf, integrity_policy=_rp
+            )
+            override_audit = {
+                "replication_target": _rt,
+                "replication_floor": _rf,
+                "integrity_policy": _rp.value,
+            }
+        elif integrity_policy is not None:
             try:
                 policy = IntegrityPolicy(integrity_policy)
             except ValueError:
@@ -1108,6 +1150,59 @@ def build_router(
             resource_type="experiment",
             resource_id=experiment_id,
             payload={"integrity_policy": policy.value, "reason": body.reason, **override_audit},
+        )
+        return filter_for_credential(
+            _to_response(updated), credential, resource_tenant_id=updated.tenant_id
+        )
+
+    @router.post(
+        "/experiments/{experiment_id}/actions/set-replication",
+        response_model=ExperimentResponse,
+        response_model_exclude_none=True,
+    )
+    async def set_replication(
+        experiment_id: str,
+        body: SetReplicationRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ExperimentResponse:
+        """Maintainer-only M4 override (C14): set the experiment's (replication_target,
+        replication_floor) directly — the post-ladder mechanic superseding set-integrity-policy.
+        resolve_replication tier-floors both: a maintainer RAISES corroboration freely; lowering
+        BELOW the tier's earned floor stays on the legacy set-integrity-policy + force path.
+        Changes FUTURE units (units bake the target at submit). Mandatory reason; audited."""
+        require_maintainer(credential)
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None:
+            raise _experiment_not_found(experiment_id)
+        tier = tenant_tier(experiment.tenant_id) if tenant_tier is not None else None
+        cur_target = getattr(experiment, "replication_target", None) or 3
+        target, floor, policy = resolve_replication(
+            requested_target=body.replication_target
+            if body.replication_target is not None
+            else int(cur_target),
+            requested_floor=body.replication_floor,
+            tenant_tier=tier if tier is not None else int(TrustTier.T2_TRUSTED),
+        )
+        experiment_repository.set_replication(
+            experiment_id,
+            replication_target=target,
+            replication_floor=floor,
+            integrity_policy=policy,
+        )
+        updated = experiment_repository.get_by_id(experiment_id)
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            actor_tenant_id=credential.tenant_id,
+            action="experiment.set_replication",
+            resource_type="experiment",
+            resource_id=experiment_id,
+            payload={
+                "replication_target": target,
+                "replication_floor": floor,
+                "integrity_policy": policy.value,
+                "reason": body.reason,
+            },
         )
         return filter_for_credential(
             _to_response(updated), credential, resource_tenant_id=updated.tenant_id
