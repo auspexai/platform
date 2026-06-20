@@ -1,0 +1,32 @@
+[Unit]
+Description=AuspexAI coordinator — C14 regime-2 settle-sweep (capacity-aware completion of capacity-stuck units)
+Documentation=https://github.com/auspexai/platform
+# Runs against the same state dir as the coordinator; ordered after it so the
+# daemon is up (the sweep uses its own DB connection, but co-scheduling is cleaner).
+After=network-online.target auspexai-coordinator.service
+Wants=auspexai-coordinator.service
+
+[Service]
+Type=oneshot
+User=jason
+Group=jason
+# Match the coordinator daemon's environment EXACTLY: same state dir (so it reads
+# the same control + per-job DBs) and the same operational receipts mode (so receipts
+# minted by a settle are labelled identically to those minted on the request path).
+Environment=AUSPEXAI_STATE_DIR=/var/lib/auspexai-coordinator
+Environment=AUSPEXAI_RECEIPTS_MODE=operational
+EnvironmentFile=-/etc/auspexai/coordinator.env
+ExecStart=/opt/auspexai-coordinator/bin/auspexai-coordinator settle --apply
+
+# Hardening — same shape as auspexai-coordinator.service. The sweep WRITES (completes
+# units, issues receipts, emits attestations, appends audit) into the coordinator state dir.
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/auspexai-coordinator
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

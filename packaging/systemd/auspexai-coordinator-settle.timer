@@ -1,0 +1,15 @@
+[Unit]
+Description=AuspexAI coordinator regime-2 settle-sweep (every 10 min; a no-op when nothing is stuck)
+Documentation=https://github.com/auspexai/platform
+
+[Timer]
+# A stuck unit becomes settle-able only after it's been quiescent for ~2 heartbeat
+# windows (~6 min), so a 10-minute cadence settles it within roughly one window of
+# becoming eligible. The sweep is cheap when nothing qualifies.
+OnBootSec=5min
+OnUnitActiveSec=10min
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

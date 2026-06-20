@@ -1,0 +1,27 @@
+[Unit]
+Description=AuspexAI coordinator — result-payload age-off (M-Results retention sweep)
+Documentation=https://github.com/auspexai/platform
+After=network-online.target auspexai-coordinator.service
+Wants=auspexai-coordinator.service
+
+[Service]
+Type=oneshot
+User=jason
+Group=jason
+Environment=AUSPEXAI_STATE_DIR=/var/lib/auspexai-coordinator
+EnvironmentFile=-/etc/auspexai/coordinator.env
+# Blank expired T-X / overridden T-C payloads; rows, signatures, hashes + receipts are
+# preserved. Experiments under a retention hold are skipped.
+ExecStart=/opt/auspexai-coordinator/bin/auspexai-coordinator age-off --apply
+
+# Hardening — writes only into the coordinator state dir (blanks payload bytes in place).
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/auspexai-coordinator
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

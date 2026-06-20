@@ -1,7 +1,7 @@
 # Local CI gate — mirrors .github/workflows/ci.yml step-for-step so a green
 # `make ci` is a green CI run (CI additionally runs the same steps on a
 # 3.11/3.12 matrix). Run before every push.
-.PHONY: ci venv lint test
+.PHONY: ci venv lint test install-timers
 
 ci: venv lint test
 
@@ -23,3 +23,8 @@ test:
 property-nightly:
 	AUSPEXAI_PROPERTY_PROFILE=nightly AUSPEXAI_PROPERTY_SOAK=1 \
 	.venv/bin/pytest tests/test_integrity_properties.py -q -o timeout=0
+
+# Install/update the coordinator's systemd maintenance timers (C14 settle + age-off) from
+# packaging/systemd/. Idempotent; run AFTER the package is deployed to /opt. Needs sudo.
+install-timers:
+	./packaging/install-timers.sh
