@@ -777,121 +777,26 @@ def build_router(
         # completed status — so a late/extra result from a rejoined worker doesn't
         # re-issue receipts / re-promote consensus / re-emit the attestation.
         if just_completed:
-            # M7c: hash_agreement reducer + receipt issuance. Best-effort
-            # from the route's perspective — if it fails, the unit stays
-            # `completed` (it really is done from a scheduling standpoint)
-            # and the operator can re-issue receipts manually. Receipt
-            # issuance is wrapped in a broad try/except so a bug here
-            # never blocks the M6d response.
-            try:
-                experiment = experiment_repository.get_by_id(experiment_id)
-                results = ResultRepository(per_job_db).list_for_unit(unit_id)
-                receipt_repo = ReceiptRepository(per_job_db)
-                if experiment is not None:
-                    issuance_outcome = issue_receipts_for_completed_unit(
-                        work_unit=updated_unit,
-                        experiment=experiment,
-                        results=results,
-                        receipt_repo=receipt_repo,
-                        signing_key=receipt_signing_key,
-                        receipt_index_repo=receipt_index_repository,
-                        containment_resolver=lambda result: _result_ran_strict(
-                            worker_repository, result
-                        ),
-                        attribution_resolver=lambda result: _result_account_opted_in(
-                            worker_repository, account_repository, result
-                        ),
-                    )
-                    audit_repository.append(
-                        actor_class=CredentialClass.SYSTEM,
-                        action=(
-                            "receipts.issue.agreed"
-                            if issuance_outcome.agreement.agreed
-                            else "receipts.issue.disagreed"
-                        ),
-                        resource_type="work_unit",
-                        resource_id=unit_id,
-                        payload={
-                            "experiment_id": experiment_id,
-                            "method": issuance_outcome.agreement.method,
-                            "agreeing_workers": issuance_outcome.agreement.agreeing_workers,
-                            "replication_target": updated_unit.replication_target,
-                            "issued_receipt_ids": issuance_outcome.issued_receipt_ids,
-                        },
-                    )
-                    if event_bus is not None and issuance_outcome.issued_receipt_ids:
-                        # M8: live receipt event — the experiment's verifiable
-                        # work record just grew; dashboards update the count.
-                        event_bus.publish(
-                            "receipt.issued",
-                            experiment_id=experiment_id,
-                            data={
-                                "unit_id": unit_id,
-                                "agreed": issuance_outcome.agreement.agreed,
-                                "agreeing_workers": issuance_outcome.agreement.agreeing_workers,
-                                "issued_receipt_ids": issuance_outcome.issued_receipt_ids,
-                            },
-                        )
-                    if issuance_outcome.agreement.agreed and results:
-                        # M-Results: promote one agreed result to the durable T-C
-                        # consensus copy (all agreeing results are byte-identical;
-                        # the rest are T-X replicas that age off first). Deterministic
-                        # pick so re-runs are idempotent.
-                        consensus_result_id = min(r.result_id for r in results)
-                        ResultRepository(per_job_db).promote_consensus(unit_id, consensus_result_id)
-                        audit_repository.append(
-                            actor_class=CredentialClass.SYSTEM,
-                            action="results.consensus_promoted",
-                            resource_type="work_unit",
-                            resource_id=unit_id,
-                            payload={
-                                "experiment_id": experiment_id,
-                                "result_id": consensus_result_id,
-                            },
-                        )
-                    if issuance_outcome.issued_receipt_ids:
-                        _maybe_auto_promote(
-                            worker_id=worker_id,
-                            worker_repository=worker_repository,
-                            account_repository=account_repository,
-                            receipt_index_repository=receipt_index_repository,
-                            eligibility_thresholds=eligibility_thresholds,
-                            vouch_repository=vouch_repository,
-                            audit_repository=audit_repository,
-                            promotion_auto_t1_t2=promotion_auto_t1_t2,
-                            equal_trust_enabled=(
-                                trust_model_policy_repository.get().equal_trust_enabled
-                                if trust_model_policy_repository is not None
-                                else False
-                            ),
-                        )
-            except Exception:
-                import logging
-
-                logging.getLogger(__name__).exception(
-                    "receipt issuance failed for unit %s; the unit stays "
-                    "completed but receipts may need re-issuance",
-                    unit_id,
-                )
-
-            _maybe_auto_complete(
+            # M7c + M6e + M7-tail: issuance → consensus-promote → worker promotion →
+            # auto-complete → attestation. Factored into finalize_completed_unit so the
+            # C14 settle-sweep runs the IDENTICAL path. The submitting worker is the sole
+            # promotion candidate here (unchanged behavior).
+            finalize_completed_unit(
+                unit_id=unit_id,
                 experiment_id=experiment_id,
+                updated_unit=updated_unit,
                 per_job_db=per_job_db,
+                promote_worker_ids=[worker_id],
                 experiment_repository=experiment_repository,
-                audit_repository=audit_repository,
-                event_bus=event_bus,
-            )
-            # M7-tail: emit the result-set completion attestation when the
-            # experiment just finished — a permanent, model-blind record of the
-            # final set's merkle root at completion (the on-demand GET stays the
-            # canonical fetch; this anchors it without waiting for a caller).
-            _maybe_emit_completion_attestation(
-                experiment_id=experiment_id,
-                per_job_db=per_job_db,
-                experiment_repository=experiment_repository,
+                receipt_signing_key=receipt_signing_key,
                 receipt_index_repository=receipt_index_repository,
-                signing_key=receipt_signing_key,
+                worker_repository=worker_repository,
+                account_repository=account_repository,
                 audit_repository=audit_repository,
+                eligibility_thresholds=eligibility_thresholds,
+                vouch_repository=vouch_repository,
+                promotion_auto_t1_t2=promotion_auto_t1_t2,
+                trust_model_policy_repository=trust_model_policy_repository,
                 attestation_repository=attestation_repository,
                 event_bus=event_bus,
                 governance_footprint_builder=governance_footprint_builder,
@@ -1204,6 +1109,151 @@ def _maybe_emit_completion_attestation(
             "completion attestation emit failed for %s; the on-demand GET can rebuild it",
             experiment_id,
         )
+
+
+def finalize_completed_unit(
+    *,
+    unit_id: str,
+    experiment_id: str,
+    updated_unit,
+    per_job_db,
+    promote_worker_ids: list[str],
+    experiment_repository,
+    receipt_signing_key,
+    receipt_index_repository,
+    worker_repository,
+    account_repository,
+    audit_repository,
+    eligibility_thresholds,
+    vouch_repository,
+    promotion_auto_t1_t2,
+    trust_model_policy_repository,
+    attestation_repository=None,
+    event_bus=None,
+    governance_footprint_builder=None,
+) -> None:
+    """Post-completion processing for a unit that JUST transitioned to `completed`:
+    issue receipts (best-effort), promote the consensus result, run the worker
+    promotion check for each `promote_worker_ids`, auto-complete the experiment, and
+    emit the result-set attestation.
+
+    Factored verbatim out of the result-submit route so the C14 regime-2 settle-sweep
+    runs the IDENTICAL sequence — one source of truth for the integrity path. The route
+    passes the submitting worker as the sole `promote_worker_ids` (a 1-element loop ==
+    today's behavior); the settle-sweep passes every agreeing contributor (whose receipts
+    are minted here for the first time)."""
+    try:
+        experiment = experiment_repository.get_by_id(experiment_id)
+        results = ResultRepository(per_job_db).list_for_unit(unit_id)
+        receipt_repo = ReceiptRepository(per_job_db)
+        if experiment is not None:
+            issuance_outcome = issue_receipts_for_completed_unit(
+                work_unit=updated_unit,
+                experiment=experiment,
+                results=results,
+                receipt_repo=receipt_repo,
+                signing_key=receipt_signing_key,
+                receipt_index_repo=receipt_index_repository,
+                containment_resolver=lambda result: _result_ran_strict(
+                    worker_repository, result
+                ),
+                attribution_resolver=lambda result: _result_account_opted_in(
+                    worker_repository, account_repository, result
+                ),
+            )
+            audit_repository.append(
+                actor_class=CredentialClass.SYSTEM,
+                action=(
+                    "receipts.issue.agreed"
+                    if issuance_outcome.agreement.agreed
+                    else "receipts.issue.disagreed"
+                ),
+                resource_type="work_unit",
+                resource_id=unit_id,
+                payload={
+                    "experiment_id": experiment_id,
+                    "method": issuance_outcome.agreement.method,
+                    "agreeing_workers": issuance_outcome.agreement.agreeing_workers,
+                    "replication_target": updated_unit.replication_target,
+                    "issued_receipt_ids": issuance_outcome.issued_receipt_ids,
+                },
+            )
+            if event_bus is not None and issuance_outcome.issued_receipt_ids:
+                # M8: live receipt event — the experiment's verifiable
+                # work record just grew; dashboards update the count.
+                event_bus.publish(
+                    "receipt.issued",
+                    experiment_id=experiment_id,
+                    data={
+                        "unit_id": unit_id,
+                        "agreed": issuance_outcome.agreement.agreed,
+                        "agreeing_workers": issuance_outcome.agreement.agreeing_workers,
+                        "issued_receipt_ids": issuance_outcome.issued_receipt_ids,
+                    },
+                )
+            if issuance_outcome.agreement.agreed and results:
+                # M-Results: promote one agreed result to the durable T-C
+                # consensus copy (all agreeing results are byte-identical;
+                # the rest are T-X replicas that age off first). Deterministic
+                # pick so re-runs are idempotent.
+                consensus_result_id = min(r.result_id for r in results)
+                ResultRepository(per_job_db).promote_consensus(unit_id, consensus_result_id)
+                audit_repository.append(
+                    actor_class=CredentialClass.SYSTEM,
+                    action="results.consensus_promoted",
+                    resource_type="work_unit",
+                    resource_id=unit_id,
+                    payload={
+                        "experiment_id": experiment_id,
+                        "result_id": consensus_result_id,
+                    },
+                )
+            if issuance_outcome.issued_receipt_ids:
+                for _promote_wid in promote_worker_ids:
+                    _maybe_auto_promote(
+                        worker_id=_promote_wid,
+                        worker_repository=worker_repository,
+                        account_repository=account_repository,
+                        receipt_index_repository=receipt_index_repository,
+                        eligibility_thresholds=eligibility_thresholds,
+                        vouch_repository=vouch_repository,
+                        audit_repository=audit_repository,
+                        promotion_auto_t1_t2=promotion_auto_t1_t2,
+                        equal_trust_enabled=(
+                            trust_model_policy_repository.get().equal_trust_enabled
+                            if trust_model_policy_repository is not None
+                            else False
+                        ),
+                    )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "receipt issuance failed for unit %s; the unit stays "
+            "completed but receipts may need re-issuance",
+            unit_id,
+        )
+
+    _maybe_auto_complete(
+        experiment_id=experiment_id,
+        per_job_db=per_job_db,
+        experiment_repository=experiment_repository,
+        audit_repository=audit_repository,
+        event_bus=event_bus,
+    )
+    # M7-tail: emit the result-set completion attestation when the experiment just
+    # finished — a permanent, model-blind record of the final set's merkle root.
+    _maybe_emit_completion_attestation(
+        experiment_id=experiment_id,
+        per_job_db=per_job_db,
+        experiment_repository=experiment_repository,
+        receipt_index_repository=receipt_index_repository,
+        signing_key=receipt_signing_key,
+        audit_repository=audit_repository,
+        attestation_repository=attestation_repository,
+        event_bus=event_bus,
+        governance_footprint_builder=governance_footprint_builder,
+    )
 
 
 def _maybe_auto_complete(
