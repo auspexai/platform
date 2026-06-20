@@ -251,6 +251,25 @@ class AccountRepository:
 
     # ---- account reads ----
 
+    def set_attribution(
+        self, account_id: str, *, public_attribution: bool, attribution_name: str | None
+    ) -> Account:
+        """Set the account's public-citation consent (System B opt-in) and the name
+        it wishes to be credited as. Idempotent. Raises AccountNotFoundError."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE accounts SET public_attribution = ?, attribution_name = ?
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (1 if public_attribution else 0, attribution_name, account_id),
+            )
+            if cur.rowcount == 0:
+                raise AccountNotFoundError(account_id)
+        got = self.get_by_id(account_id)
+        assert got is not None
+        return got
+
     def get_by_id(self, account_id: str) -> Account | None:
         rows = self.db.execute(
             "SELECT * FROM accounts WHERE account_id = ?",
@@ -376,6 +395,12 @@ class AccountRepository:
             suspension_reason=row["suspension_reason"],
             tier_set_by_class=(
                 row["tier_set_by_class"] if "tier_set_by_class" in row.keys() else None
+            ),
+            public_attribution=bool(
+                row["public_attribution"] if "public_attribution" in row.keys() else 0
+            ),
+            attribution_name=(
+                row["attribution_name"] if "attribution_name" in row.keys() else None
             ),
         )
 

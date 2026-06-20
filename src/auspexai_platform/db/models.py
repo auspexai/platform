@@ -225,6 +225,11 @@ class Account(BaseModel):
     idp_sub: str
     display_name: str | None = None
     email: str | None = None
+    # System B (D): opt-in consent to be NAMED in the public citation of work this
+    # account contributes to (default off — auth-consent ≠ attribution-consent).
+    # `attribution_name` is how they wish to be credited (falls back to display_name).
+    public_attribution: bool = False
+    attribution_name: str | None = None
     trust_tier: TrustTier = TrustTier.T1_AUTHENTICATED
     created_at: datetime
     retired_at: datetime | None = None

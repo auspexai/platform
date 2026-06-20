@@ -154,6 +154,61 @@ def _signer_note(kid: str | None, roster: frozenset[str]) -> str:
     return _NOTE_SIGNER_ON_ROSTER if kid in roster else _NOTE_SIGNER_OFF_ROSTER
 
 
+class ExperimentCitationResponse(BaseModel):
+    """Citation / acknowledgment block for a completed experiment's result (System
+    B, D). `named_contributors` are the volunteers who opted into PUBLIC attribution
+    (by their chosen name); everyone else is aggregated anonymously. The PI is the
+    producing tenant. The researcher uses this when ready to publish — separate from
+    collection. Pre-DOI it's a ready-to-paste acknowledgment; DOI (E) anchors it."""
+
+    experiment_id: str
+    tenant_id: str
+    named_contributors: list[str]
+    anonymous_contributor_count: int
+    total_contributor_accounts: int
+    acknowledgment: str
+
+
+def _experiment_contributors(
+    experiment_id: str, per_job_factory, worker_repository, account_repository
+) -> tuple[list[str], int, int]:
+    """Resolve a completed experiment's distinct contributing accounts →
+    (opted-in display names sorted, anonymous count, total accounts). Anonymity is
+    the default: an account is named only if it set `public_attribution`."""
+    per_job_db = per_job_factory.get(experiment_id)
+    if per_job_db is None:
+        return [], 0, 0
+    rows = per_job_db.execute(
+        "SELECT DISTINCT worker_id FROM results "
+        "WHERE unit_id IN (SELECT unit_id FROM results WHERE is_consensus = 1)"
+    )
+    account_ids: set[str] = set()
+    for r in rows:
+        w = worker_repository.get_by_id(r["worker_id"])
+        if w is not None and w.account_id:
+            account_ids.add(w.account_id)
+    named: list[str] = []
+    anonymous = 0
+    for aid in account_ids:
+        acct = account_repository.get_by_id(aid)
+        if acct is not None and acct.public_attribution:
+            named.append(acct.attribution_name or acct.display_name or aid)
+        else:
+            anonymous += 1
+    named.sort(key=str.lower)
+    return named, anonymous, len(account_ids)
+
+
+def _format_acknowledgment(named: list[str], anonymous: int) -> str:
+    parts: list[str] = []
+    if named:
+        parts.append(", ".join(named))
+    if anonymous:
+        parts.append(f"{anonymous} anonymous volunteer{'' if anonymous == 1 else 's'}")
+    who = " and ".join(parts) if parts else "no attributed contributors"
+    return f"Compute contributed via the AuspexAI network by {who}."
+
+
 class ReceiptSummary(BaseModel):
     """Summary row for receipt-list endpoints. Just enough to identify and
     locate the receipt; the full COSE bytes + body come from
@@ -391,6 +446,64 @@ def build_router(
         or per_job_factory is None
     ):
         return router
+
+    @router.get(
+        "/experiments/{experiment_id}/citation",
+        response_model=ExperimentCitationResponse,
+    )
+    async def experiment_citation(
+        experiment_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ExperimentCitationResponse:
+        """Citation / acknowledgment block for a completed experiment (System B, D):
+        the producing tenant (PI) + volunteers who opted into public attribution by
+        name, everyone else anonymous. Own-tenant researcher or maintainer — used
+        when ready to publish, separate from collection (DOI/E anchors it later)."""
+        if experiment_repository is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "not_available",
+                        "message": "citation requires the experiment repository",
+                    }
+                },
+            )
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "experiment_not_found",
+                        "message": f"no experiment {experiment_id!r}",
+                    }
+                },
+            )
+        if not (
+            credential.kind == CredentialClass.MAINTAINER
+            or (credential.tenant_id is not None and credential.tenant_id == experiment.tenant_id)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": {
+                        "code": "researcher_own_tenant_or_maintainer_required",
+                        "message": "need the experiment's tenant or a maintainer credential",
+                    }
+                },
+            )
+        named, anonymous, total = _experiment_contributors(
+            experiment_id, per_job_factory, worker_repository, account_repository
+        )
+        return ExperimentCitationResponse(
+            experiment_id=experiment_id,
+            tenant_id=experiment.tenant_id,
+            named_contributors=named,
+            anonymous_contributor_count=anonymous,
+            total_contributor_accounts=total,
+            acknowledgment=_format_acknowledgment(named, anonymous),
+        )
 
     @router.get(
         "/receipts/{receipt_id}",
