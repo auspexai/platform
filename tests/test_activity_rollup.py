@@ -160,3 +160,48 @@ class TestExperimentActivity:
             path="/api/v0/experiments/exp-does-not-exist/activity",
         )
         assert resp.status_code == 404, resp.text
+
+    def test_system_pause_yields_regime3_liveness_note(
+        self, client, approved_experiment, per_job_factory, experiment_repository
+    ) -> None:
+        """D8: a C14 regime-3 pause (last_action_by_class == system) self-explains
+        as a self-healing 'waiting for an eligible worker, auto-resumes' hold."""
+        from auspexai_platform.auth.credential import CredentialClass
+        from auspexai_platform.db.models import ExperimentStatus
+
+        privkey, binding, experiment, _hash = approved_experiment
+        _seed(per_job_factory, experiment.experiment_id)
+        # The coordinator pauses the run when the eligible fleet can't meet the
+        # corroboration floor → recorded as a system-actor transition.
+        experiment_repository.update_status(
+            experiment.experiment_id,
+            ExperimentStatus.PAUSED,
+            actor_class=CredentialClass.SYSTEM,
+        )
+
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        note = resp.json()["liveness_note"]
+        assert "auto-resumes" in note
+        assert "corroborating workers" in note
+
+    def test_normal_run_has_no_liveness_note(
+        self, client, approved_experiment, per_job_factory
+    ) -> None:
+        """A healthy (approved, no thin-corroboration) run has nothing to explain →
+        the field is omitted (response_model_exclude_none)."""
+        privkey, binding, experiment, _hash = approved_experiment
+        _seed(per_job_factory, experiment.experiment_id)
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        assert "liveness_note" not in resp.json()

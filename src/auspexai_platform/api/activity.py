@@ -34,7 +34,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from auspexai_platform.auth.credential import Credential
+from auspexai_platform.auth.credential import Credential, CredentialClass
+from auspexai_platform.db.models import ExperimentStatus
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     ExperimentRepository,
@@ -61,6 +62,59 @@ def _experiment_eligibility_reason(worker, required: dict, requires_real_executi
     if missing and caps.get("auto_acquire") is not True:
         return f"doesn't hold {', '.join(missing)}; auto-acquire off"
     return "not eligible for this experiment"
+
+
+def _liveness_note(
+    experiment,
+    *,
+    work_unit_counts: dict[str, int],
+    capable_worker_count: int | None,
+) -> str | None:
+    """D8: a plain-language explanation of the run's current state for the
+    watching researcher, so a paused/stalled experiment self-explains instead of
+    reading as a silent stall.
+
+    The headline case is the C14 regime-3 pause: the coordinator pauses a run
+    when the eligible fleet can no longer meet the unit's corroboration floor,
+    and auto-resumes it once enough eligible workers return. That's a
+    `last_action_by_class == system` pause — not a maintainer action — so the
+    researcher is told it's a self-healing hold, not a fault.
+
+    Returns None when there's nothing noteworthy to say (the common healthy
+    case), so the dashboard banner only ever appears when it has something to
+    explain.
+    """
+    status_val = getattr(experiment.status, "value", experiment.status)
+    by = getattr(experiment, "last_action_by_class", None)
+    by_val = getattr(by, "value", by)
+    floor = getattr(experiment, "replication_floor", None) or getattr(
+        experiment, "replication_target", None
+    )
+
+    if status_val == ExperimentStatus.PAUSED.value:
+        if by_val == CredentialClass.SYSTEM.value:
+            return (
+                f"Paused by the coordinator: each unit needs {floor} corroborating "
+                "workers, but the eligible fleet is short right now. It auto-resumes "
+                "as soon as enough eligible workers are available — e.g. log a "
+                "logged-out worker back in."
+            )
+        return "Paused by the maintainer."
+
+    if (
+        status_val == ExperimentStatus.APPROVED.value
+        and work_unit_counts.get("in_progress", 0) > 0
+        and floor
+        and capable_worker_count is not None
+        and capable_worker_count < floor
+    ):
+        return (
+            f"Running, but corroboration is thin: {capable_worker_count} capable "
+            f"worker(s) for a replication floor of {floor} — units may pause until "
+            "more eligible workers join."
+        )
+
+    return None
 
 
 class OwnWorkerActivity(BaseModel):
@@ -123,6 +177,11 @@ class ExperimentActivityResponse(BaseModel):
     # server-side with own-account workers only, so it can never carry a
     # third-party identity even before filtering (defense in depth).
     own_workers: Annotated[list[OwnWorkerActivity] | None, ExposureTag.ACCOUNT_SCOPED] = None
+    # D8 "liveness note": a plain-language self-explanation of the run's current
+    # state for the watching researcher — most importantly, why a C14 regime-3
+    # pause is a "waiting for an eligible worker, auto-resumes" hold rather than a
+    # silent stall. TENANT_SCOPED: it's the owner's own run; carries no identity.
+    liveness_note: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
 
 
 def build_router(
@@ -306,6 +365,11 @@ def build_router(
             required_capabilities=required_caps or None,
             capable_worker_count=capable_worker_count,
             own_workers=(own_workers or None) if show_own else None,
+            liveness_note=_liveness_note(
+                experiment,
+                work_unit_counts=counts,
+                capable_worker_count=capable_worker_count,
+            ),
         )
 
     return router
