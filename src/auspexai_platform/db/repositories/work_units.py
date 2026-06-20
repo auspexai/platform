@@ -123,6 +123,24 @@ class WorkUnitRepository:
         assert got is not None
         return got, just_completed
 
+    def complete_at_floor(self, unit_id: str) -> tuple[WorkUnit, bool]:
+        """C14 regime-2 (capacity-aware settle): transition a unit to 'completed' at its
+        ACHIEVED replication — no further bump (increment_completions already recorded each
+        replica). The CALLER (the settle-sweep) gates the precondition: completions_so_far >=
+        effective_floor AND the eligible fleet is exhausted AND quiescent. Race-safe +
+        idempotent via the status guard; returns (unit, just_completed) so post-completion
+        processing fires exactly once, exactly like increment_completions."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                "UPDATE work_units SET status = 'completed' "
+                "WHERE unit_id = ? AND status != 'completed'",
+                (unit_id,),
+            )
+            just_completed = cur.rowcount == 1
+        got = self.get_by_unit_id(unit_id)
+        assert got is not None
+        return got, just_completed
+
     # ---- reads ----
 
     def get_by_unit_id(self, unit_id: str) -> WorkUnit | None:

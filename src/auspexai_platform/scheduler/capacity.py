@@ -135,3 +135,34 @@ def experiments_collapsed_by_removing(
                 )
             )
     return collapsed
+
+
+def unit_fleet_exhausted(
+    unit,
+    experiment,
+    *,
+    worker_repository: WorkerRepository,
+    assignments_repo,
+    now: datetime,
+) -> bool:
+    """C14 regime-2: True when no further replica can arrive for this unit from the current
+    fleet — every SCHEDULABLE worker eligible for it has already delivered a result or
+    terminally refused, so none is still available to take it and none is mid-execution with a
+    pending result. Reuses the M9 capacity eligibility (`worker_satisfies` + the tier floor) so
+    the two never disagree. An OFFLINE worker's stale in-flight assignment does NOT block (it
+    isn't schedulable); a transiently-offline worker is covered by the sweep's quiescence window.
+    Vacuously True when no eligible worker exists at all (nothing can contribute)."""
+    schedulable = _schedulable_workforce(worker_repository.list_all(), now=now)
+    eligible = _eligible(
+        schedulable,
+        experiment.required_capabilities or {},
+        unit.replication_target,
+        requires_real_execution=experiment.requires_real_execution,
+        required_containment=experiment.required_containment,
+    )
+    done = {
+        a.worker_id
+        for a in assignments_repo.list_for_unit(unit.unit_id)
+        if a.result_id is not None or a.refused_at is not None
+    }
+    return all(w.worker_id in done for w in eligible)
