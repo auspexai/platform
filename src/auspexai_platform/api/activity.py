@@ -46,6 +46,7 @@ from auspexai_platform.db.repositories.receipt_index import ReceiptIndexReposito
 from auspexai_platform.db.repositories.results import ResultRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.exposure import ExposureTag, is_visible
+from auspexai_platform.receipts.attestation import collect_diverged_units
 from auspexai_platform.scheduler import worker_satisfies
 from auspexai_platform.worker_status import derive_worker_status, heartbeat_cutoff
 
@@ -182,6 +183,14 @@ class ExperimentActivityResponse(BaseModel):
     # pause is a "waiting for an eligible worker, auto-resumes" hold rather than a
     # silent stall. TENANT_SCOPED: it's the owner's own run; carries no identity.
     liveness_note: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
+    # Richer D8 (live corroboration health): the number of completed units whose
+    # independent replicas DIVERGED — workers disagreed, so no agreement, no
+    # receipt (firewall #1's signed-observation, G4). A live > 0 is the
+    # nondeterminism / model-version-skew signal a researcher would otherwise only
+    # see retrospectively in the evidence footprint; it is NOT model drift. An
+    # aggregate count with no per-worker identity → PUBLIC, like the other counts.
+    # None on the empty rollup (no per-job DB yet).
+    diverged_unit_count: Annotated[int | None, ExposureTag.PUBLIC] = None
 
 
 def build_router(
@@ -370,6 +379,9 @@ def build_router(
                 work_unit_counts=counts,
                 capable_worker_count=capable_worker_count,
             ),
+            # Richer D8: live corroboration health — completed units whose
+            # replicas diverged (no agreement, no receipt). 0 == cross-check clean.
+            diverged_unit_count=len(collect_diverged_units(per_job_db)),
         )
 
     return router

@@ -39,7 +39,8 @@ def _signed_get(client: TestClient, *, privkey, pubkey_hex: str, path: str):
 
 def _seed(per_job_factory: PerJobDatabaseFactory, experiment_id: str) -> None:
     """Seed a per-job DB with 3 work units (2 completed, 1 pending) and results
-    from 2 distinct workers."""
+    from 2 distinct workers. Both completed units reach AGREEMENT (a promoted
+    consensus row), so this is a clean run with zero divergence."""
     db = per_job_factory.get_or_create(experiment_id)
     work_units = WorkUnitRepository(db)
     results = ResultRepository(db)
@@ -63,6 +64,45 @@ def _seed(per_job_factory: PerJobDatabaseFactory, experiment_id: str) -> None:
             worker_pubkey_hex=f"{n:064x}",
             exit_code=0,
             payload={"ok": True},
+            worker_signature="sig",
+            completed_at=base + timedelta(minutes=n),
+        )
+    # The replicas AGREED → the reducer promotes one result per completed unit to
+    # consensus. Without this, `collect_diverged_units` would (correctly) read
+    # every completed-with-results-but-no-consensus unit as diverged — so a clean
+    # run MUST carry a promoted consensus row, which is exactly what agreement does.
+    results.promote_consensus("u0", "r0")
+    results.promote_consensus("u1", "r1")
+
+
+def _seed_diverged(per_job_factory: PerJobDatabaseFactory, experiment_id: str) -> None:
+    """Seed a per-job DB with one DIVERGED unit: a completed work unit whose
+    independent replicas produced different output and so reached NO agreement —
+    results exist, but no result was promoted to consensus (`promote_consensus`
+    never fired). This is precisely the state `collect_diverged_units` reads:
+    work_units.status='completed' AND has results AND no is_consensus=1 row.
+
+    `collect_diverged_units` only inspects per-job state (work_units + results); it
+    does not require an issued receipt, so seeding the two repos is sufficient."""
+    db = per_job_factory.get_or_create(experiment_id)
+    work_units = WorkUnitRepository(db)
+    results = ResultRepository(db)
+    work_units.submit_batch([{"unit_id": "d0", "payload": {}}], replication_target=2)
+    # Two replicas land → unit completes at target 2, but they DISAGREED, so the
+    # reducer never promotes a consensus row (left deliberately unpromoted here).
+    for _ in range(2):
+        work_units.increment_completions("d0")
+    base = datetime(2026, 5, 30, 12, 0, 0, tzinfo=UTC)
+    for n, (worker_id, payload) in enumerate(
+        [("w-alpha", {"answer": 1}), ("w-beta", {"answer": 2})]  # different output
+    ):
+        results.insert(
+            result_id=f"d-r{n}",
+            unit_id="d0",
+            worker_id=worker_id,
+            worker_pubkey_hex=f"{n:064x}",
+            exit_code=0,
+            payload=payload,
             worker_signature="sig",
             completed_at=base + timedelta(minutes=n),
         )
@@ -90,6 +130,8 @@ class TestExperimentActivity:
         assert body["completions_total"] == 6  # 3 + 3
         assert body["replication_target_total"] == 9  # 3 * 3
         assert body["last_activity_at"]  # present (received_at set on insert)
+        # Richer D8: both completed units AGREED (consensus promoted) → clean.
+        assert body["diverged_unit_count"] == 0
         # Anonymized: no worker identity may appear anywhere in the rollup.
         flat = repr(body)
         assert "w-alpha" not in flat
@@ -205,3 +247,53 @@ class TestExperimentActivity:
         )
         assert resp.status_code == 200, resp.text
         assert "liveness_note" not in resp.json()
+
+    def test_clean_run_reports_zero_divergence(
+        self, client, approved_experiment, per_job_factory
+    ) -> None:
+        """Richer D8: a run whose completed units all reached agreement reports
+        `diverged_unit_count == 0` — the field is present (reassurance is the
+        point) and the cross-check is clean."""
+        privkey, binding, experiment, _hash = approved_experiment
+        _seed(per_job_factory, experiment.experiment_id)
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "diverged_unit_count" in body
+        assert body["diverged_unit_count"] == 0
+
+    def test_diverged_unit_surfaces_in_rollup(
+        self, client, approved_experiment, per_job_factory
+    ) -> None:
+        """Richer D8: a completed unit whose replicas disagreed (no consensus
+        promoted) surfaces live as a divergence count, not only retrospectively in
+        the evidence footprint."""
+        privkey, binding, experiment, _hash = approved_experiment
+        _seed_diverged(per_job_factory, experiment.experiment_id)
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["diverged_unit_count"] >= 1
+
+    def test_empty_experiment_omits_divergence(self, client, approved_experiment) -> None:
+        """The empty rollup (no per-job DB yet) leaves `diverged_unit_count` None,
+        so it's omitted under response_model_exclude_none — nothing to corroborate."""
+        privkey, binding, experiment, _hash = approved_experiment
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        assert "diverged_unit_count" not in resp.json()
