@@ -146,6 +146,7 @@ def issue_receipts_for_completed_unit(
     receipt_index_repo: ReceiptIndexRepository | None = None,
     rekor_client: RekorClient | NoOpRekorClient | None = None,
     containment_resolver=None,  # Callable[[Result], bool] | None: result -> ran-under-STRICT
+    attribution_resolver=None,  # Callable[[Result], bool] | None: result -> account opted-in @ issue
 ) -> ReceiptIssuanceOutcome:
     """Build, sign, and persist one receipt per agreeing worker.
 
@@ -308,6 +309,9 @@ def issue_receipts_for_completed_unit(
                     unit_id=work_unit.unit_id,  # A4: per-account-per-unit trust
                     ran_under_strict=(  # A2: STRICT-containment gate for the flip
                         bool(containment_resolver(result)) if containment_resolver else False
+                    ),
+                    public_attribution_at_issue=(  # System B: opt-in snapshot at issue
+                        bool(attribution_resolver(result)) if attribution_resolver else False
                     ),
                 )
             except Exception:

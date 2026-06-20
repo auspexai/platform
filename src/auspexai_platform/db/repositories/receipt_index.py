@@ -33,6 +33,7 @@ class ReceiptIndexEntry:
     result_id: str | None = None  # M7-tail: backreference to the worker's result row
     unit_id: str | None = None  # A4 (0035): the work unit, for per-account-per-unit trust
     ran_under_strict: bool = False  # A2 (0037): STRICT containment — equal-trust accrual gate
+    public_attribution_at_issue: bool = False  # System B (0039): opt-in snapshot at issue
 
 
 class ReceiptIndexRepository:
@@ -51,6 +52,7 @@ class ReceiptIndexRepository:
         result_id: str | None = None,
         unit_id: str | None = None,
         ran_under_strict: bool = False,
+        public_attribution_at_issue: bool = False,
     ) -> ReceiptIndexEntry:
         """Index a newly-issued receipt. Raises DuplicateReceiptIndexError if
         receipt_id is already indexed (should not happen during normal
@@ -71,8 +73,8 @@ class ReceiptIndexRepository:
                 """
                 INSERT INTO receipt_index
                   (receipt_id, experiment_id, worker_id, worker_pubkey, issued_at,
-                   result_id, unit_id, ran_under_strict)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   result_id, unit_id, ran_under_strict, public_attribution_at_issue)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     receipt_id,
@@ -83,6 +85,7 @@ class ReceiptIndexRepository:
                     result_id,
                     unit_id,
                     1 if ran_under_strict else 0,
+                    1 if public_attribution_at_issue else 0,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -311,6 +314,10 @@ class ReceiptIndexRepository:
             ran_under_strict = bool(row["ran_under_strict"])
         except (KeyError, IndexError):
             ran_under_strict = False
+        try:
+            public_attribution_at_issue = bool(row["public_attribution_at_issue"])
+        except (KeyError, IndexError):
+            public_attribution_at_issue = False
         return ReceiptIndexEntry(
             receipt_id=row["receipt_id"],
             experiment_id=row["experiment_id"],
@@ -320,4 +327,5 @@ class ReceiptIndexRepository:
             result_id=result_id,
             unit_id=unit_id,
             ran_under_strict=ran_under_strict,
+            public_attribution_at_issue=public_attribution_at_issue,
         )

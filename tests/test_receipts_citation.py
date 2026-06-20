@@ -1,6 +1,8 @@
-"""Citation/contributor ledger (System B, D) — the aggregation behind
-GET /experiments/{id}/citation: opted-in accounts are NAMED, everyone else is
-aggregated anonymously, and unlinked (T0) workers don't count as accounts.
+"""Citation/contributor ledger (System B) — the aggregation behind
+GET /experiments/{id}/citation. NON-RETROACTIVE consent: an account is named only if
+it was opted in AT CONTRIBUTION (the receipt's `public_attribution_at_issue` snapshot)
+AND is still opted in now. The snapshot blocks retroactive opt-IN; the current flag
+preserves reversible opt-OUT. Unlinked (T0) workers aren't contributor accounts.
 """
 
 from __future__ import annotations
@@ -13,18 +15,23 @@ from auspexai_platform.api.receipts import (
 )
 
 
-class _Row(dict):
-    pass
+class _Entry:
+    def __init__(self, worker_id: str, at_issue: bool) -> None:
+        self.worker_id = worker_id
+        self.public_attribution_at_issue = at_issue
 
 
-class _DB:
-    def execute(self, _query: str):
-        return [_Row(worker_id="w1"), _Row(worker_id="w2"), _Row(worker_id="w3")]
+class _ReceiptIndex:
+    # One receipt per agreeing worker's contribution to this experiment.
+    _entries: ClassVar[list] = [
+        _Entry("w_named", True),  # opted in AT issue
+        _Entry("w_optout", True),  # opted in AT issue (but withdrew since)
+        _Entry("w_late", False),  # NOT opted in at issue (opted in afterwards)
+        _Entry("w_t0", False),  # unlinked worker, no account
+    ]
 
-
-class _Factory:
-    def get(self, _eid: str):
-        return _DB()
+    def list_for_experiment(self, _eid: str):
+        return self._entries
 
 
 class _Worker:
@@ -34,10 +41,11 @@ class _Worker:
 
 class _WorkerRepo:
     _map: ClassVar[dict] = {
-        "w1": _Worker("a1"),
-        "w2": _Worker("a2"),
-        "w3": _Worker(None),
-    }  # w3 = T0, no acct
+        "w_named": _Worker("a_named"),
+        "w_optout": _Worker("a_optout"),
+        "w_late": _Worker("a_late"),
+        "w_t0": _Worker(None),
+    }
 
     def get_by_id(self, wid: str):
         return self._map.get(wid)
@@ -52,33 +60,33 @@ class _Account:
 
 class _AcctRepo:
     _map: ClassVar[dict] = {
-        "a1": _Account(True, "Ada Lovelace", "ada"),  # opted in, custom name
-        "a2": _Account(False, None, "bob"),  # not opted in → anonymous
+        "a_named": _Account(True, "Ada Lovelace", "ada"),  # at_issue=T, now=T → NAMED
+        "a_optout": _Account(False, None, "bob"),  # at_issue=T, now=F → anon (opt-out)
+        "a_late": _Account(True, "Grace", "grace"),  # at_issue=F, now=T → anon (non-retroactive)
     }
 
     def get_by_id(self, aid: str):
         return self._map.get(aid)
 
 
-def test_contributors_named_vs_anonymous_with_unlinked_worker() -> None:
+def test_contributors_non_retroactive_and_reversible() -> None:
     named, anonymous, total = _experiment_contributors(
-        "exp-x", _Factory(), _WorkerRepo(), _AcctRepo()
+        "exp-x", _ReceiptIndex(), _WorkerRepo(), _AcctRepo()
     )
-    assert named == ["Ada Lovelace"]  # a1 opted in (custom name beats display_name)
-    assert anonymous == 1  # a2 did not opt in
-    assert total == 2  # a1 + a2; w3 has no account → not a contributor account
+    # Only a_named: opted in at contribution AND still opted in.
+    assert named == ["Ada Lovelace"]
+    # a_optout (withdrew consent) + a_late (opted in only AFTER contributing) both anonymous.
+    assert anonymous == 2
+    # 3 contributor accounts; w_t0 has no account → not counted.
+    assert total == 3
 
 
-def test_contributors_empty_when_no_per_job_db() -> None:
-    class _NoneFactory:
-        def get(self, _eid: str):
-            return None
+def test_contributors_empty_experiment() -> None:
+    class _Empty:
+        def list_for_experiment(self, _eid: str):
+            return []
 
-    assert _experiment_contributors("exp-x", _NoneFactory(), _WorkerRepo(), _AcctRepo()) == (
-        [],
-        0,
-        0,
-    )
+    assert _experiment_contributors("exp-x", _Empty(), _WorkerRepo(), _AcctRepo()) == ([], 0, 0)
 
 
 def test_acknowledgment_formatting() -> None:

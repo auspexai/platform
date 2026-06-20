@@ -228,6 +228,20 @@ def _require_self_worker(credential: Credential, url_worker_id: str) -> None:
 # ---- router ---------------------------------------------------------------
 
 
+def _result_account_opted_in(worker_repository, account_repository, result) -> bool:
+    """System B (non-retroactive citation): was the contributing worker's account opted
+    into public attribution AT THE MOMENT this result became a receipt? Snapshotted onto
+    the receipt (`public_attribution_at_issue`) so opting in later can't retroactively
+    credit past runs. `account_repository` may be None (older wiring) → not opted-in."""
+    if account_repository is None:
+        return False
+    w = worker_repository.get_by_id(result.worker_id)
+    if w is None or w.account_id is None:
+        return False
+    acct = account_repository.get_by_id(w.account_id)
+    return bool(acct is not None and acct.public_attribution)
+
+
 def _result_ran_strict(worker_repository, result) -> bool:
     """Firewall #1 (A2): did this RESULT run under STRICT containment? Prefers the
     worker-SIGNED `ran_under` (v2 result, #32 — accountable, covered by the
@@ -783,6 +797,9 @@ def build_router(
                         receipt_index_repo=receipt_index_repository,
                         containment_resolver=lambda result: _result_ran_strict(
                             worker_repository, result
+                        ),
+                        attribution_resolver=lambda result: _result_account_opted_in(
+                            worker_repository, account_repository, result
                         ),
                     )
                     audit_repository.append(

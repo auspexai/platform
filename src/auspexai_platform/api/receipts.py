@@ -171,33 +171,33 @@ class ExperimentCitationResponse(BaseModel):
 
 
 def _experiment_contributors(
-    experiment_id: str, per_job_factory, worker_repository, account_repository
+    experiment_id: str, receipt_index_repository, worker_repository, account_repository
 ) -> tuple[list[str], int, int]:
     """Resolve a completed experiment's distinct contributing accounts →
-    (opted-in display names sorted, anonymous count, total accounts). Anonymity is
-    the default: an account is named only if it set `public_attribution`."""
-    per_job_db = per_job_factory.get(experiment_id)
-    if per_job_db is None:
-        return [], 0, 0
-    rows = per_job_db.execute(
-        "SELECT DISTINCT worker_id FROM results "
-        "WHERE unit_id IN (SELECT unit_id FROM results WHERE is_consensus = 1)"
-    )
-    account_ids: set[str] = set()
-    for r in rows:
-        w = worker_repository.get_by_id(r["worker_id"])
+    (opted-in display names sorted, anonymous count, total accounts). NON-RETROACTIVE:
+    an account is NAMED only if it was opted in AT CONTRIBUTION (the receipt's
+    `public_attribution_at_issue` snapshot) AND is still opted in now. The snapshot
+    blocks retroactive opt-IN (opting in later can't credit past anonymous runs); the
+    current flag preserves reversible opt-OUT (withdrawing consent while live)."""
+    # Receipts are issued one per agreeing worker, so receipt_index for an experiment
+    # IS its consensus-set contributors (divergence goes to divergence_index).
+    opted_in_at_issue: dict[str, bool] = {}
+    for entry in receipt_index_repository.list_for_experiment(experiment_id):
+        w = worker_repository.get_by_id(entry.worker_id)
         if w is not None and w.account_id:
-            account_ids.add(w.account_id)
+            opted_in_at_issue[w.account_id] = opted_in_at_issue.get(w.account_id, False) or bool(
+                entry.public_attribution_at_issue
+            )
     named: list[str] = []
     anonymous = 0
-    for aid in account_ids:
-        acct = account_repository.get_by_id(aid)
-        if acct is not None and acct.public_attribution:
-            named.append(acct.attribution_name or acct.display_name or aid)
+    for account_id, at_issue in opted_in_at_issue.items():
+        acct = account_repository.get_by_id(account_id)
+        if at_issue and acct is not None and acct.public_attribution:
+            named.append(acct.attribution_name or acct.display_name or account_id)
         else:
             anonymous += 1
     named.sort(key=str.lower)
-    return named, anonymous, len(account_ids)
+    return named, anonymous, len(opted_in_at_issue)
 
 
 def _format_acknowledgment(named: list[str], anonymous: int) -> str:
@@ -509,7 +509,7 @@ def build_router(
                 },
             )
         named, anonymous, total = _experiment_contributors(
-            experiment_id, per_job_factory, worker_repository, account_repository
+            experiment_id, receipt_index_repository, worker_repository, account_repository
         )
         return ExperimentCitationResponse(
             experiment_id=experiment_id,
