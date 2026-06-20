@@ -3,7 +3,7 @@
 Covers the happy path against a coordinator-issued receipt, the failure
 modes (malformed base64, malformed COSE, tampered signature, wrong kid,
 schema-invalid inner payload), and the trust-posture fields (mode,
-authorized_signer always null pre-§5.16).
+authorized_signer = AUTHORIZED_SIGNERS.md roster membership).
 """
 
 from __future__ import annotations
@@ -84,9 +84,9 @@ class TestVerifyHappyPath:
         assert body["signer_kid"] == signing_key.pubkey_hex
         # Default config is dev mode.
         assert body["coordinator_mode"] == "dev"
-        # M7d defers AUTHORIZED_SIGNERS.md verification.
-        assert "authorized_signer" not in body  # None excluded by exclude_none
-        assert "Authoritative roster verification arrives" in body["authorized_signer_note"]
+        # Dev mode: the placeholder key is NOT on the AUTHORIZED_SIGNERS.md roster.
+        assert body["authorized_signer"] is False
+        assert "NOT on the published authoritative roster" in body["authorized_signer_note"]
         # Receipt body round-trips.
         assert body["receipt"]["tenant_id"] == "tenant-a"
         assert body["receipt"]["experiment_id"] == "doubler-v1"
@@ -221,22 +221,22 @@ class TestTrustPosture:
             response = cl.post("/api/v0/receipts/verify", json={"receipt_cose_b64": b64})
         body = response.json()
         assert body["coordinator_mode"] == "operational"
-        # M7d STILL doesn't perform the authoritative-roster check, even
-        # in operational mode — that's §5.16's job.
-        assert "authorized_signer" not in body  # None excluded
-        assert "§5.16" in body["authorized_signer_note"]
+        # Operational mode: the coordinator's signing key IS the active roster
+        # entry, so its receipts verify as an authoritative signer.
+        assert body["authorized_signer"] is True
+        assert "on the published authoritative roster" in body["authorized_signer_note"]
 
-    def test_authorized_signer_always_null_pre_section_5_16(self, client: TestClient) -> None:
-        """The M7d contract: signature_valid + schema_valid are real;
-        authorized_signer is null until §5.16 ships."""
+    def test_dev_key_is_not_on_the_authoritative_roster(self, client: TestClient) -> None:
+        """A valid signature from the dev placeholder key is honestly NOT
+        authoritative — authorized_signer is False because it's not on the roster."""
         signing_key: SigningKey = client.app.state.receipt_signing_key
         cose_blob = _signed_cose_blob(signing_key)
         b64 = base64.b64encode(cose_blob).decode("ascii")
         response = client.post("/api/v0/receipts/verify", json={"receipt_cose_b64": b64})
         body = response.json()
-        # Even on a mathematically perfect signature, authorized_signer
-        # stays null because the Fulcio attestation chain doesn't exist yet.
-        assert "authorized_signer" not in body  # excluded because None
+        # A mathematically perfect signature from a non-roster key: valid, not authoritative.
+        assert body["signature_valid"] is True
+        assert body["authorized_signer"] is False
         assert "AUTHORIZED_SIGNERS" in body["authorized_signer_note"]
 
 

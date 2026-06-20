@@ -125,14 +125,33 @@ class ReceiptVerifyResponse(BaseModel):
 # ---- router ---------------------------------------------------------------
 
 
-_AUTHORIZED_SIGNER_NOTE_M7D = (
-    "Authoritative roster verification arrives with §5.16 signing "
-    "infrastructure (one-time Maintainer Fulcio attestation + "
-    "auspexai/.github/security/AUTHORIZED_SIGNERS.md). Until then, this "
-    "field is null even when the signature mathematically verifies — "
-    "the signer's identity has not yet been chained to AuspexAI's "
-    "authoritative roster."
+# Authoritative-signer roster. The published roster is `auspexai/.github/security/
+# AUTHORIZED_SIGNERS.md` (§5.16-attested + Rekor-anchored). In `operational` mode
+# the coordinator's own signing key IS the active roster entry, so the endpoint
+# answers the roster question directly instead of deferring it (the M7D `null` was
+# a declarative↔enforcement gap once the roster existed).
+_NOTE_SIGNER_ON_ROSTER = (
+    "Signer is on the published authoritative roster "
+    "(auspexai/.github/security/AUTHORIZED_SIGNERS.md) — §5.16-attested + Rekor-anchored."
 )
+_NOTE_SIGNER_OFF_ROSTER = (
+    "The signing key is NOT on the published authoritative roster "
+    "(auspexai/.github/security/AUTHORIZED_SIGNERS.md): a valid signature from an "
+    "unrecognized key, or a dev-mode placeholder."
+)
+_NOTE_SIGNER_UNKNOWN = "Signer could not be determined (the receipt did not decode)."
+
+
+def _signer_authorized(kid: str | None, roster: frozenset[str]) -> bool | None:
+    """Tri-state: None when no signer could be read; else whether the signer's key
+    is on the authoritative roster."""
+    return None if kid is None else (kid in roster)
+
+
+def _signer_note(kid: str | None, roster: frozenset[str]) -> str:
+    if kid is None:
+        return _NOTE_SIGNER_UNKNOWN
+    return _NOTE_SIGNER_ON_ROSTER if kid in roster else _NOTE_SIGNER_OFF_ROSTER
 
 
 class ReceiptSummary(BaseModel):
@@ -223,6 +242,7 @@ class ReceiptFetchResponse(BaseModel):
 def build_router(
     *,
     coordinator_mode: str,
+    authorized_signer_pubkeys: frozenset[str] = frozenset(),
     credential_dep=None,
     receipt_index_repository: ReceiptIndexRepository | None = None,
     worker_repository: WorkerRepository | None = None,
@@ -288,8 +308,8 @@ def build_router(
                 schema_valid=False,
                 signer_kid=None,
                 coordinator_mode=coordinator_mode,
-                authorized_signer=None,
-                authorized_signer_note=_AUTHORIZED_SIGNER_NOTE_M7D,
+                authorized_signer=_signer_authorized(signer_kid, authorized_signer_pubkeys),
+                authorized_signer_note=_signer_note(signer_kid, authorized_signer_pubkeys),
                 receipt=None,
                 errors=errors,
             )
@@ -306,8 +326,8 @@ def build_router(
                 schema_valid=False,
                 signer_kid=signer_kid,
                 coordinator_mode=coordinator_mode,
-                authorized_signer=None,
-                authorized_signer_note=_AUTHORIZED_SIGNER_NOTE_M7D,
+                authorized_signer=_signer_authorized(signer_kid, authorized_signer_pubkeys),
+                authorized_signer_note=_signer_note(signer_kid, authorized_signer_pubkeys),
                 receipt=None,
                 errors=errors,
             )
@@ -349,8 +369,8 @@ def build_router(
             schema_valid=schema_valid,
             signer_kid=signer_kid,
             coordinator_mode=coordinator_mode,
-            authorized_signer=None,
-            authorized_signer_note=_AUTHORIZED_SIGNER_NOTE_M7D,
+            authorized_signer=_signer_authorized(signer_kid, authorized_signer_pubkeys),
+            authorized_signer_note=_signer_note(signer_kid, authorized_signer_pubkeys),
             receipt=receipt,
             errors=errors or None,
         )

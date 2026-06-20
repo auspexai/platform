@@ -484,6 +484,14 @@ def create_app(
     app.include_router(
         receipt_routes.build_router(
             coordinator_mode=config.receipts_mode,
+            # In operational mode the coordinator's signing key IS the active
+            # AUTHORIZED_SIGNERS.md roster entry, so the verify endpoint can answer
+            # the roster question. A dev placeholder key is not on the roster.
+            authorized_signer_pubkeys=(
+                frozenset({receipt_signing_key.pubkey_hex})
+                if config.receipts_mode == "operational"
+                else frozenset()
+            ),
             credential_dep=credential_dep,
             receipt_index_repository=receipt_index_repository,
             worker_repository=worker_repository,
