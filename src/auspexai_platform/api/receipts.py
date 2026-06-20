@@ -53,6 +53,7 @@ from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AccountRepository,
+    AuditRepository,
     ExperimentRepository,
     ReceiptIndexRepository,
     WorkerRepository,
@@ -336,6 +337,7 @@ def build_router(
     eligibility_thresholds: EligibilityThresholds | None = None,
     vouch_repository=None,
     experiment_repository: ExperimentRepository | None = None,
+    audit_repository: AuditRepository | None = None,
 ) -> APIRouter:
     """Build the receipts router.
 
@@ -840,6 +842,7 @@ def build_router(
         maintainer. The name (when opting in) falls back to display_name if blank."""
         _require_account_self_or_maintainer(credential, account_id, account_repository)
         name = (body.attribution_name or "").strip() or None
+        previous = account_repository.get_by_id(account_id)
         try:
             account = account_repository.set_attribution(
                 account_id,
@@ -856,6 +859,25 @@ def build_router(
                     }
                 },
             ) from None
+        # A change to PUBLIC attribution is consent-bearing — record WHO flipped it, WHEN,
+        # and old->new (System B / D). Without this an opt-in leaves no trail, and a
+        # contributor can't see when/how they consented to be named.
+        if audit_repository is not None:
+            audit_repository.append(
+                actor_class=credential.kind,
+                actor_identifier=credential.pubkey_hex,
+                actor_tenant_id=credential.tenant_id,
+                action="account.set_attribution",
+                resource_type="account",
+                resource_id=account_id,
+                payload={
+                    "public_attribution": account.public_attribution,
+                    "attribution_name": account.attribution_name,
+                    "previous_public_attribution": (
+                        previous.public_attribution if previous is not None else None
+                    ),
+                },
+            )
         return AccountAttributionResponse(
             account_id=account_id,
             public_attribution=account.public_attribution,

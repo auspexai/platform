@@ -82,3 +82,40 @@ def test_attribution_anonymous_forbidden(client: TestClient) -> None:
         json={"public_attribution": True},
     )
     assert r.status_code in (401, 403)
+
+
+def test_attribution_change_is_audited(
+    client: TestClient, maintainer_token: str, account_repository, audit_repository
+) -> None:
+    """A change to PUBLIC attribution is consent-bearing — it MUST leave an audit trail
+    (the gap that let an opt-in happen with no record of who/when)."""
+    account_repository.create(account_id="acct-aud", idp=IdentityProvider.GITHUB, idp_sub="gh-aud")
+    h = {"Authorization": f"Bearer {maintainer_token}"}
+    r = client.put(
+        "/api/v0/accounts/acct-aud/attribution",
+        headers=h,
+        json={"public_attribution": True, "attribution_name": "Grace"},
+    )
+    assert r.status_code == 200, r.text
+    rows = [
+        a
+        for a in audit_repository.latest(limit=20)
+        if a.action == "account.set_attribution" and a.resource_id == "acct-aud"
+    ]
+    assert rows, "consent change to public attribution was not audited"
+    payload = rows[0].payload
+    assert payload["public_attribution"] is True
+    assert payload["attribution_name"] == "Grace"
+    assert payload["previous_public_attribution"] is False  # default was opted-out
+
+    # Opting back out is also audited (old -> new captured).
+    client.put(
+        "/api/v0/accounts/acct-aud/attribution", headers=h, json={"public_attribution": False}
+    )
+    out = next(
+        a
+        for a in audit_repository.latest(limit=20)
+        if a.action == "account.set_attribution" and a.resource_id == "acct-aud"
+    )
+    assert out.payload["public_attribution"] is False
+    assert out.payload["previous_public_attribution"] is True

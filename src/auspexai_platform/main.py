@@ -378,6 +378,7 @@ def create_app(
             eligibility_thresholds=eligibility_thresholds,
             vouch_repository=vouch_repository,
             experiment_repository=experiment_repository,
+            audit_repository=audit_repository,
         ),
         prefix="/api/v0",
         tags=["receipts"],
