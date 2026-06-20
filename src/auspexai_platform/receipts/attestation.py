@@ -169,9 +169,7 @@ def _unit_agreeing_workers(per_job_db) -> dict[str, int]:
         except Exception:
             continue
         for unit_id in receipt.work_unit_ids:
-            out[unit_id] = max(
-                out.get(unit_id, 0), int(receipt.quorum_agreement.agreeing_workers)
-            )
+            out[unit_id] = max(out.get(unit_id, 0), int(receipt.quorum_agreement.agreeing_workers))
     return out
 
 

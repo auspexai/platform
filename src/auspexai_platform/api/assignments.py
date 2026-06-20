@@ -1154,9 +1154,7 @@ def finalize_completed_unit(
                 receipt_repo=receipt_repo,
                 signing_key=receipt_signing_key,
                 receipt_index_repo=receipt_index_repository,
-                containment_resolver=lambda result: _result_ran_strict(
-                    worker_repository, result
-                ),
+                containment_resolver=lambda result: _result_ran_strict(worker_repository, result),
                 attribution_resolver=lambda result: _result_account_opted_in(
                     worker_repository, account_repository, result
                 ),
