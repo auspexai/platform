@@ -296,7 +296,12 @@ def _signed_get(client, *, privkey, pubkey_hex, path):
 
 
 def insert_per_job_receipt(
-    db, *, receipt_id: str, unit_id: str, worker_pubkey_hex: str = "ab" * 32
+    db,
+    *,
+    receipt_id: str,
+    unit_id: str,
+    worker_pubkey_hex: str = "ab" * 32,
+    agreeing_workers: int = 1,
 ) -> None:
     """Seed the AUTHORITATIVE per-job receipt row. Since the 2026-06-12
     signature-scope fix, attestation/bundle membership is derived from the
@@ -321,7 +326,9 @@ def insert_per_job_receipt(
             work_unit_ids=[unit_id],
             time_window=TimeWindow(start=now, end=now),
             quorum_agreement=QuorumAgreement(
-                replication_factor=1, agreeing_workers=1, method="hash-equality"
+                replication_factor=agreeing_workers,
+                agreeing_workers=agreeing_workers,
+                method="hash-equality",
             ),
             result_hash_anchors=[
                 ResultHashAnchor(
@@ -373,7 +380,9 @@ def _seed_consensus_unit(
     )
     repo.promote_consensus(unit_id, result.result_id)
     receipt_id = f"rcpt-{unit_id}"
-    insert_per_job_receipt(db, receipt_id=receipt_id, unit_id=unit_id)
+    insert_per_job_receipt(
+        db, receipt_id=receipt_id, unit_id=unit_id, agreeing_workers=replication_target
+    )
     receipt_index_repository.record(
         receipt_id=receipt_id,
         experiment_id=experiment_id,
@@ -528,7 +537,8 @@ class TestAttestationRoute:
         receipt_index_repository,
     ):
         """Firewall #1: collect_result_set_entries tags each consensus unit's
-        integrity_basis from its replication_target — >=2 → exact, repl-1 →
+        integrity_basis from its receipt's agreeing_workers (seeded here = replication_target,
+        but it is the achieved consensus count under C14 regime-2) — >=2 → exact, repl-1 →
         process_only — straight onto the entries the predicate carries."""
         from auspexai_platform.receipts.attestation import (
             collect_result_set_entries,

@@ -70,13 +70,14 @@ INTEGRITY_BASES = frozenset(
 )
 
 
-def classify_consensus_basis(replication_target: int) -> str:
-    """Integrity basis for a CONSENSUS unit (reached agreement, holds a receipt).
-    >=2 independent corroborating replicas -> `within_cell_exact`; a repl-1 unit
-    has no peer -> `process_only` (firewall #1 D3). The reducer only issues a
-    receipt when ALL replicas agree, so a consensus unit's agreeing_workers equals
-    its replication_target — making the target a faithful corroboration count."""
-    return INTEGRITY_BASIS_EXACT if replication_target >= 2 else INTEGRITY_BASIS_PROCESS_ONLY
+def classify_consensus_basis(agreeing_workers: int) -> str:
+    """Integrity basis for a CONSENSUS unit (reached agreement, holds a receipt), from its
+    ACHIEVED corroboration: >=2 independent agreeing replicas -> `within_cell_exact`; a single
+    replica has no peer -> `process_only` (firewall #1 D3). Pass the receipt's `agreeing_workers`
+    (the immutable count recorded at issuance) — under C14 regime-2 capacity-aware completion a
+    unit's achieved replicas can be fewer than its `replication_target`, so the target is NOT a
+    faithful corroboration count."""
+    return INTEGRITY_BASIS_EXACT if agreeing_workers >= 2 else INTEGRITY_BASIS_PROCESS_ONLY
 
 
 @dataclass(frozen=True)
@@ -145,12 +146,33 @@ def _unit_payload_hashes(per_job_db) -> dict[str, str]:
     return {r["unit_id"]: unit_payload_sha256(r["payload_json"]) for r in rows}
 
 
-def _unit_replication_targets(per_job_db) -> dict[str, int]:
-    """{unit_id: replication_target} over the experiment's work units — drives the
-    firewall #1 consensus integrity basis (>=2 corroborating replicas → exact vs
-    repl-1 → process_only)."""
-    rows = per_job_db.execute("SELECT unit_id, replication_target FROM work_units")
-    return {r["unit_id"]: int(r["replication_target"]) for r in rows}
+def _unit_agreeing_workers(per_job_db) -> dict[str, int]:
+    """{unit_id: agreeing_workers} — the IMMUTABLE consensus quorum count recorded in each
+    per-job receipt body at issuance. Drives the firewall #1 integrity basis (>=2
+    corroborating replicas → within_cell_exact vs repl-1 → process_only).
+
+    It is NOT `replication_target` (which, under C14 regime-2 capacity-aware completion, can
+    exceed the replicas actually achieved — a unit aiming for 3 that settles at 2 is exact@2,
+    and one that settles at 1 is process_only) and NOT `completions_so_far` (which a late
+    post-completion replica inflates). The reducer issues a receipt only when ALL collected
+    replicas agree, recording agreeing_workers = that agreeing count — so the receipt body is
+    the faithful, late-result-proof measure. A unit's per-worker receipts all carry the same
+    count; we take the max defensively."""
+    from auspexai_platform.receipts.models import decode_cbor
+
+    out: dict[str, int] = {}
+    for row in per_job_db.execute(
+        "SELECT receipt_body_cbor FROM receipts ORDER BY issued_at, receipt_id"
+    ):
+        try:
+            receipt = decode_cbor(row["receipt_body_cbor"])
+        except Exception:
+            continue
+        for unit_id in receipt.work_unit_ids:
+            out[unit_id] = max(
+                out.get(unit_id, 0), int(receipt.quorum_agreement.agreeing_workers)
+            )
+    return out
 
 
 class IncompleteAttestationSetError(Exception):
@@ -304,7 +326,7 @@ def collect_result_set_entries(
 
     repo = ResultRepository(per_job_db)
     payload_hashes = _unit_payload_hashes(per_job_db)
-    replication_targets = _unit_replication_targets(per_job_db)
+    agreeing_workers = _unit_agreeing_workers(per_job_db)
     entries: list[ResultSetEntry] = []
     after_completed_at: str | None = None
     after_result_id: str | None = None
@@ -325,7 +347,7 @@ def collect_result_set_entries(
                     receipt_id=receipt_id,
                     unit_payload_sha256=payload_hashes.get(r.unit_id),
                     environment=r.environment,
-                    integrity_basis=classify_consensus_basis(replication_targets.get(r.unit_id, 0)),
+                    integrity_basis=classify_consensus_basis(agreeing_workers.get(r.unit_id, 0)),
                 )
             )
         if len(rows) < page_size:

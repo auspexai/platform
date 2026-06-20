@@ -259,12 +259,6 @@ def settle_sweep(
             for unit in wu_repo.list_all(status=WorkUnitStatus.IN_PROGRESS):
                 if unit.completions_so_far < exp.replication_floor:
                     continue  # below the floor → regime 3 (pause/resume), not a settle
-                if unit.completions_so_far < 2:
-                    # A 1-replica settle is process_only; until the attestation basis classifies
-                    # on the receipt's agreeing-worker count (not replication_target), settling it
-                    # would mislabel the cross-check. Default floor is 2, so this only defers a
-                    # niche floor=1 config (tracked: design §9 basis-source fix).
-                    continue
                 results = ResultRepository(per_job).list_for_unit(unit.unit_id)
                 if not results:
                     continue  # defensive — completions>=floor implies results exist
