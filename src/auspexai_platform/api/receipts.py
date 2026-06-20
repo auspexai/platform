@@ -57,6 +57,7 @@ from auspexai_platform.db.repositories import (
     ReceiptIndexRepository,
     WorkerRepository,
 )
+from auspexai_platform.db.repositories.accounts import AccountNotFoundError
 from auspexai_platform.eligibility import (
     EligibilityThresholds,
     compute_receipt_stats,
@@ -207,6 +208,20 @@ def _format_acknowledgment(named: list[str], anonymous: int) -> str:
         parts.append(f"{anonymous} anonymous volunteer{'' if anonymous == 1 else 's'}")
     who = " and ".join(parts) if parts else "no attributed contributors"
     return f"Compute contributed via the AuspexAI network by {who}."
+
+
+class AccountAttributionRequest(BaseModel):
+    """Self-service public-citation opt-in (System B, D). `public_attribution=false`
+    (the default) keeps the account anonymous in every citation; `true` names it."""
+
+    public_attribution: bool
+    attribution_name: str | None = None
+
+
+class AccountAttributionResponse(BaseModel):
+    account_id: str
+    public_attribution: bool
+    attribution_name: str | None = None
 
 
 class ReceiptSummary(BaseModel):
@@ -762,6 +777,74 @@ def build_router(
             signing_key_pubkey_hex=record.signing_key_pubkey_hex,
             cose_signed_blob_b64=base64.b64encode(record.cose_signed_blob).decode("ascii"),
             receipt=receipt_body,
+        )
+
+    # ---- D-inc4: account public-citation attribution (System B opt-in) ---
+    #
+    # Account-self (the bound worker's credential carries account_id once T1+) or
+    # maintainer. An EXPLICIT, separate consent — auth-consent is not attribution-
+    # consent — so it defaults off and is set deliberately, never implied.
+
+    @router.get(
+        "/accounts/{account_id}/attribution",
+        response_model=AccountAttributionResponse,
+    )
+    async def get_account_attribution(
+        account_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> AccountAttributionResponse:
+        """Read this account's public-citation opt-in. Account-self or maintainer."""
+        _require_account_self_or_maintainer(credential, account_id, account_repository)
+        account = account_repository.get_by_id(account_id)
+        if account is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "account_not_found",
+                        "message": f"no account with id {account_id!r}",
+                    }
+                },
+            )
+        return AccountAttributionResponse(
+            account_id=account_id,
+            public_attribution=account.public_attribution,
+            attribution_name=account.attribution_name,
+        )
+
+    @router.put(
+        "/accounts/{account_id}/attribution",
+        response_model=AccountAttributionResponse,
+    )
+    async def set_account_attribution(
+        account_id: str,
+        body: AccountAttributionRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> AccountAttributionResponse:
+        """Set this account's public-citation opt-in (System B, D). Account-self or
+        maintainer. The name (when opting in) falls back to display_name if blank."""
+        _require_account_self_or_maintainer(credential, account_id, account_repository)
+        name = (body.attribution_name or "").strip() or None
+        try:
+            account = account_repository.set_attribution(
+                account_id,
+                public_attribution=body.public_attribution,
+                attribution_name=name,
+            )
+        except AccountNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "account_not_found",
+                        "message": f"no account with id {account_id!r}",
+                    }
+                },
+            ) from None
+        return AccountAttributionResponse(
+            account_id=account_id,
+            public_attribution=account.public_attribution,
+            attribution_name=account.attribution_name,
         )
 
     # ---- M7f: GET /accounts/{account_id}/receipt-stats ------------------
