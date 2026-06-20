@@ -34,6 +34,7 @@ class ReceiptIndexEntry:
     unit_id: str | None = None  # A4 (0035): the work unit, for per-account-per-unit trust
     ran_under_strict: bool = False  # A2 (0037): STRICT containment — equal-trust accrual gate
     public_attribution_at_issue: bool = False  # System B (0039): opt-in snapshot at issue
+    account_id_at_issue: str | None = None  # 0041: account snapshot, survives worker unbind
 
 
 class ReceiptIndexRepository:
@@ -41,6 +42,17 @@ class ReceiptIndexRepository:
         self.db = db
 
     # ---- writes ----
+
+    def _resolve_account_id(self, worker_id: str) -> str | None:
+        """The worker's CURRENT account_id, snapshotted onto the index row at
+        issuance (0041). Returns None for anonymous/T0 workers (no binding) or
+        an unknown worker_id — both correctly snapshot a NULL account, matching
+        the INNER JOIN on workers that the account-scoped queries used before."""
+        rows = self.db.execute(
+            "SELECT account_id FROM workers WHERE worker_id = ?",
+            (worker_id,),
+        )
+        return rows[0]["account_id"] if rows else None
 
     def record(
         self,
@@ -68,13 +80,17 @@ class ReceiptIndexRepository:
         """
         worker_pubkey = worker_pubkey.lower()
         issued_at = datetime.now(UTC).isoformat()
+        # Snapshot the worker's account_id at issuance (0041) so a later worker
+        # unbind (account_id -> NULL) can't retroactively orphan this receipt.
+        account_id_at_issue = self._resolve_account_id(worker_id)
         try:
             self.db.execute(
                 """
                 INSERT INTO receipt_index
                   (receipt_id, experiment_id, worker_id, worker_pubkey, issued_at,
-                   result_id, unit_id, ran_under_strict, public_attribution_at_issue)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   result_id, unit_id, ran_under_strict, public_attribution_at_issue,
+                   account_id_at_issue)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     receipt_id,
@@ -86,6 +102,7 @@ class ReceiptIndexRepository:
                     unit_id,
                     1 if ran_under_strict else 0,
                     1 if public_attribution_at_issue else 0,
+                    account_id_at_issue,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -117,11 +134,15 @@ class ReceiptIndexRepository:
         accrual only COUNTS it once `trust_model_policy.equal_trust_enabled` is ON,
         and only the `ran_under_strict` rows. Idempotent (INSERT OR IGNORE on the
         (worker_id, unit_id) unique key) so a re-finalization sweep is a no-op."""
+        # Snapshot the worker's account_id at issuance (0041) — same permanence
+        # guarantee as receipt_index, so a later unbind can't orphan divergence.
+        account_id_at_issue = self._resolve_account_id(worker_id)
         self.db.execute(
             """
             INSERT OR IGNORE INTO divergence_index
-              (experiment_id, worker_id, worker_pubkey, unit_id, ran_under_strict)
-            VALUES (?, ?, ?, ?, ?)
+              (experiment_id, worker_id, worker_pubkey, unit_id, ran_under_strict,
+               account_id_at_issue)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 experiment_id,
@@ -129,6 +150,7 @@ class ReceiptIndexRepository:
                 worker_pubkey.lower(),
                 unit_id,
                 1 if ran_under_strict else 0,
+                account_id_at_issue,
             ),
         )
 
@@ -150,19 +172,19 @@ class ReceiptIndexRepository:
         return [self._row_to_entry(r) for r in rows]
 
     def list_for_account(self, account_id: str) -> list[ReceiptIndexEntry]:
-        """All receipts under any worker bound to one account_id, newest first.
+        """All receipts attributed to one account_id at issuance, newest first.
 
-        Joins receipt_index → workers via worker_id, filters on
-        workers.account_id. Anonymous / T0 workers (account_id IS NULL) are
-        not returned by this method — account-scoped listing only makes
-        sense for accounts.
+        Filters on the denormalized `account_id_at_issue` snapshot (0041) rather
+        than the live workers.account_id, so a contribution stays attributed even
+        if its worker later unbinds. Rows snapshotted with a NULL account
+        (anonymous / T0 workers) are not returned — account-scoped listing only
+        makes sense for accounts.
         """
         rows = self.db.execute(
             """
-            SELECT ri.* FROM receipt_index ri
-            INNER JOIN workers w ON w.worker_id = ri.worker_id
-            WHERE w.account_id = ?
-            ORDER BY ri.issued_at DESC
+            SELECT * FROM receipt_index
+            WHERE account_id_at_issue = ?
+            ORDER BY issued_at DESC
             """,
             (account_id,),
         )
@@ -180,9 +202,8 @@ class ReceiptIndexRepository:
             """
             SELECT COUNT(*) AS total, COUNT(DISTINCT e.tenant_id) AS tenants
             FROM receipt_index ri
-            INNER JOIN workers w     ON w.worker_id = ri.worker_id
             INNER JOIN experiments e ON e.experiment_id = ri.experiment_id
-            WHERE w.account_id = ?
+            WHERE ri.account_id_at_issue = ?
             """,
             (account_id,),
         )
@@ -216,9 +237,8 @@ class ReceiptIndexRepository:
                 SELECT COUNT(DISTINCT COALESCE(ri.unit_id, ri.receipt_id)) AS units,
                        COUNT(DISTINCT e.tenant_id) AS tenants
                 FROM receipt_index ri
-                INNER JOIN workers w     ON w.worker_id = ri.worker_id
                 INNER JOIN experiments e ON e.experiment_id = ri.experiment_id
-                WHERE w.account_id = ?
+                WHERE ri.account_id_at_issue = ?
                 """,
                 (account_id,),
             )
@@ -235,15 +255,13 @@ class ReceiptIndexRepository:
             FROM (
                 SELECT COALESCE(ri.unit_id, ri.receipt_id) AS unit, e.tenant_id AS tenant
                 FROM receipt_index ri
-                INNER JOIN workers w     ON w.worker_id = ri.worker_id
                 INNER JOIN experiments e ON e.experiment_id = ri.experiment_id
-                WHERE w.account_id = ? AND ri.ran_under_strict = 1
+                WHERE ri.account_id_at_issue = ? AND ri.ran_under_strict = 1
                 UNION
                 SELECT di.unit_id AS unit, e.tenant_id AS tenant
                 FROM divergence_index di
-                INNER JOIN workers w     ON w.worker_id = di.worker_id
                 INNER JOIN experiments e ON e.experiment_id = di.experiment_id
-                WHERE w.account_id = ? AND di.ran_under_strict = 1
+                WHERE di.account_id_at_issue = ? AND di.ran_under_strict = 1
             )
             """,
             (account_id, account_id),
@@ -318,6 +336,10 @@ class ReceiptIndexRepository:
             public_attribution_at_issue = bool(row["public_attribution_at_issue"])
         except (KeyError, IndexError):
             public_attribution_at_issue = False
+        try:
+            account_id_at_issue = row["account_id_at_issue"]
+        except (KeyError, IndexError):
+            account_id_at_issue = None
         return ReceiptIndexEntry(
             receipt_id=row["receipt_id"],
             experiment_id=row["experiment_id"],
@@ -328,4 +350,5 @@ class ReceiptIndexRepository:
             unit_id=unit_id,
             ran_under_strict=ran_under_strict,
             public_attribution_at_issue=public_attribution_at_issue,
+            account_id_at_issue=account_id_at_issue,
         )

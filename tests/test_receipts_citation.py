@@ -16,18 +16,22 @@ from auspexai_platform.api.receipts import (
 
 
 class _Entry:
-    def __init__(self, worker_id: str, at_issue: bool) -> None:
+    def __init__(self, worker_id: str, at_issue: bool, account_id_at_issue: str | None) -> None:
         self.worker_id = worker_id
         self.public_attribution_at_issue = at_issue
+        self.account_id_at_issue = account_id_at_issue  # 0041 snapshot (None = anon at issue)
 
 
 class _ReceiptIndex:
     # One receipt per agreeing worker's contribution to this experiment.
     _entries: ClassVar[list] = [
-        _Entry("w_named", True),  # opted in AT issue
-        _Entry("w_optout", True),  # opted in AT issue (but withdrew since)
-        _Entry("w_late", False),  # NOT opted in at issue (opted in afterwards)
-        _Entry("w_t0", False),  # unlinked worker, no account
+        _Entry("w_named", True, "a_named"),  # opted in AT issue
+        _Entry("w_optout", True, "a_optout"),  # opted in AT issue (but withdrew since)
+        _Entry("w_late", False, "a_late"),  # bound at issue, NOT citation-opted (opted in later)
+        _Entry("w_t0", False, None),  # anonymous AT issue (no account)
+        # Regression: anonymous AT issue, but the worker LOGGED IN since (live account set). The
+        # None snapshot must win — never resolved to the worker's current account (non-retroactive).
+        _Entry("w_relogged", False, None),
     ]
 
     def list_for_experiment(self, _eid: str):
@@ -45,6 +49,7 @@ class _WorkerRepo:
         "w_optout": _Worker("a_optout"),
         "w_late": _Worker("a_late"),
         "w_t0": _Worker(None),
+        "w_relogged": _Worker("a_relogged"),  # logged in AFTER its anonymous contribution
     }
 
     def get_by_id(self, wid: str):

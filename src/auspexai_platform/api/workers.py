@@ -635,6 +635,48 @@ def build_router(
         _publish_network_status(event_bus, worker_repository, trigger="retire")
         return filter_for_credential(_worker_to_response(worker), credential)
 
+    # ---- POST /workers/{id}/actions/unbind ------------------------------
+
+    @router.post(
+        "/workers/{worker_id}/actions/unbind",
+        response_model=WorkerResponse,
+        response_model_exclude_none=True,
+    )
+    async def unbind_worker(
+        worker_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> WorkerResponse:
+        """Worker logout: drop the GitHub-account binding, reverting to T0-anonymous WITHOUT the
+        retire purge. The worker keeps running; receipts already earned stay credited to the
+        account (the account_id_at_issue snapshot, 0041). Re-login (`/upgrade`) re-binds -- the
+        same account to keep building trust, or a new account to start fresh."""
+        _self_or_maintainer(credential, worker_id)
+        try:
+            worker = worker_repository.unbind(worker_id)
+        except WorkerNotFoundError as e:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": {
+                        "code": "worker_not_found",
+                        "message": f"no worker with id {worker_id!r}",
+                    }
+                },
+            ) from e
+
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            action="worker.unbind",
+            resource_type="worker",
+            resource_id=worker.worker_id,
+            payload={"reverted_to": "T0_anonymous"},
+        )
+
+        _publish_worker_status(event_bus, worker, trigger="unbind")
+        _publish_network_status(event_bus, worker_repository, trigger="unbind")
+        return filter_for_credential(_worker_to_response(worker), credential)
+
     # ---- POST /workers/{id}/actions/quarantine (maintainer-only) --------
 
     @router.post(

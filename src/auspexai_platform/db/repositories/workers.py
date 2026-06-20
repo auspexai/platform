@@ -93,6 +93,27 @@ class WorkerRepository:
         assert got is not None
         return got
 
+    def unbind(self, worker_id: str) -> Worker:
+        """Drop a worker's account binding (account_id -> NULL, trust_tier -> T0) WITHOUT
+        retiring it: the worker keeps running, anonymous. The inverse of bind_account -- the
+        worker logout. Receipts already issued stay credited to the account they were earned
+        under (the account_id_at_issue snapshot, 0041). Raises WorkerNotFoundError if no such
+        (non-retired) worker; idempotent on an already-anonymous worker."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE workers
+                SET account_id = NULL, trust_tier = ?
+                WHERE worker_id = ? AND retired_at IS NULL
+                """,
+                (int(TrustTier.T0_ANONYMOUS), worker_id),
+            )
+            if cur.rowcount == 0:
+                raise WorkerNotFoundError(worker_id)
+        got = self.get_by_id(worker_id)
+        assert got is not None
+        return got
+
     def record_heartbeat(
         self,
         worker_id: str,

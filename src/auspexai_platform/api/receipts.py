@@ -170,6 +170,12 @@ class ExperimentCitationResponse(BaseModel):
     acknowledgment: str
 
 
+# Distinguishes an entry with NO `account_id_at_issue` attribute at all (a pre-0041 row / a
+# test stub) from a snapshot of None (anonymous AT issuance) — the former falls back to the
+# live worker, the latter STAYS anonymous (never retroactively credited).
+_NO_ACCOUNT_SNAPSHOT = object()
+
+
 def _experiment_contributors(
     experiment_id: str, receipt_index_repository, worker_repository, account_repository
 ) -> tuple[list[str], int, int]:
@@ -179,13 +185,22 @@ def _experiment_contributors(
     `public_attribution_at_issue` snapshot) AND is still opted in now. The snapshot
     blocks retroactive opt-IN (opting in later can't credit past anonymous runs); the
     current flag preserves reversible opt-OUT (withdrawing consent while live)."""
-    # Receipts are issued one per agreeing worker, so receipt_index for an experiment
-    # IS its consensus-set contributors (divergence goes to divergence_index).
+    # Receipts are issued one per agreeing worker, so receipt_index for an experiment IS its
+    # consensus-set contributors (divergence goes to divergence_index). The account is the
+    # receipt's `account_id_at_issue` SNAPSHOT (0041): a contribution stays credited to the
+    # account it was made under even after its worker unbinds, and a snapshot of None
+    # (anonymous AT issuance) STAYS anonymous — never retroactively credited if the worker
+    # later logs in. The live-worker fallback fires ONLY when the snapshot column is wholly
+    # absent (a pre-0041 row / a test stub); no current data hits it (the backfill populated
+    # every row), so it is purely defensive.
     opted_in_at_issue: dict[str, bool] = {}
     for entry in receipt_index_repository.list_for_experiment(experiment_id):
-        w = worker_repository.get_by_id(entry.worker_id)
-        if w is not None and w.account_id:
-            opted_in_at_issue[w.account_id] = opted_in_at_issue.get(w.account_id, False) or bool(
+        account_id = getattr(entry, "account_id_at_issue", _NO_ACCOUNT_SNAPSHOT)
+        if account_id is _NO_ACCOUNT_SNAPSHOT:
+            w = worker_repository.get_by_id(entry.worker_id)
+            account_id = w.account_id if w is not None else None
+        if account_id:
+            opted_in_at_issue[account_id] = opted_in_at_issue.get(account_id, False) or bool(
                 entry.public_attribution_at_issue
             )
     named: list[str] = []
