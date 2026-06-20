@@ -57,36 +57,13 @@ from auspexai_platform.auth.resolver import CredentialResolver
 from auspexai_platform.auth.tenant_registry import TenantRegistry
 from auspexai_platform.auth.worker_registry import WorkerRegistry
 from auspexai_platform.config import Config
-from auspexai_platform.db import Database, MigrationRunner
-from auspexai_platform.db.models import TrustTier
-from auspexai_platform.db.per_job import PerJobDatabaseFactory
-from auspexai_platform.db.repositories import (
-    AccountRepository,
-    AssessmentPolicyRepository,
-    AttestationRepository,
-    AuditRepository,
-    ExperimentRepository,
-    ManifestRepository,
-    ModelPrestageRepository,
-    ModelRequestRepository,
-    PromotionPolicyRepository,
-    ReceiptIndexRepository,
-    ReleaseRepository,
-    ResultTransferRepository,
-    RetiredKeyRepository,
-    SoftwareRequestRepository,
-    TenantApplicationRepository,
-    TenantRepository,
-    TrustModelPolicyRepository,
-    WorkerRepository,
-)
-from auspexai_platform.eligibility import EligibilityThresholds
+from auspexai_platform.db import Database
 from auspexai_platform.events import EventBus
 from auspexai_platform.oauth import IdentityVerifier, build_default_verifier
 from auspexai_platform.packages import PackageStore
 from auspexai_platform.rate_limit import limiter
-from auspexai_platform.receipts import load_or_generate_signing_key
 from auspexai_platform.scheduler import Scheduler
+from auspexai_platform.services import build_coordinator_services
 
 
 def create_app(
@@ -118,132 +95,45 @@ def create_app(
     db = db or Database(config.control_db_path)
     identity_verifier = identity_verifier or build_default_verifier()
 
-    # Apply pending migrations on every startup. Idempotent: no-op if
-    # already up-to-date.
-    MigrationRunner(db).apply_all()
+    # Build the FastAPI-free data / integrity wiring once. The same factory
+    # backs an out-of-band maintenance job (a future settle-sweep), so the
+    # repos / signing-key / closures are constructed identically there.
+    svc = build_coordinator_services(config, db=db)
+    db = svc.db
+    account_repository = svc.account_repository
+    assessment_policy_repository = svc.assessment_policy_repository
+    promotion_policy_repository = svc.promotion_policy_repository
+    trust_model_policy_repository = svc.trust_model_policy_repository
+    tenant_repository = svc.tenant_repository
+    manifest_repository = svc.manifest_repository
+    experiment_repository = svc.experiment_repository
+    audit_repository = svc.audit_repository
+    worker_repository = svc.worker_repository
+    retired_key_repository = svc.retired_key_repository
+    receipt_index_repository = svc.receipt_index_repository
+    attestation_repository = svc.attestation_repository
+    result_transfer_repository = svc.result_transfer_repository
+    model_request_repository = svc.model_request_repository
+    model_prestage_repository = svc.model_prestage_repository
+    software_request_repository = svc.software_request_repository
+    tenant_application_repository = svc.tenant_application_repository
+    release_repository = svc.release_repository
+    vouch_repository = svc.vouch_repository
+    per_job_factory = svc.per_job_factory
+    receipt_signing_key = svc.receipt_signing_key
+    eligibility_thresholds = svc.eligibility_thresholds
+    _account_suspended_for_tenant = svc.account_suspended_for_tenant
+    _tenant_tier = svc.tenant_tier
+    _approved_classes = svc.approved_classes
+    _auto_approval_gate = svc.auto_approval_gate
+    _governance_footprint_for = svc.governance_footprint_for
+    _promotion_auto_t1_t2 = svc.promotion_auto_t1_t2
 
-    account_repository = AccountRepository(db)
-    assessment_policy_repository = AssessmentPolicyRepository(db)
-    promotion_policy_repository = PromotionPolicyRepository(db)
-    trust_model_policy_repository = TrustModelPolicyRepository(db)
-    tenant_repository = TenantRepository(db)
-    manifest_repository = ManifestRepository(db)
-    experiment_repository = ExperimentRepository(db)
-    audit_repository = AuditRepository(db)
-    worker_repository = WorkerRepository(db)
-    retired_key_repository = RetiredKeyRepository(db)
-    receipt_index_repository = ReceiptIndexRepository(db)
-    attestation_repository = AttestationRepository(db)
-    result_transfer_repository = ResultTransferRepository(db)
-    model_request_repository = ModelRequestRepository(db)
-    model_prestage_repository = ModelPrestageRepository(db)
-    software_request_repository = SoftwareRequestRepository(db)
-    tenant_application_repository = TenantApplicationRepository(db)
-    release_repository = ReleaseRepository(db)
-    from auspexai_platform.db.repositories.vouches import VouchRepository
-
-    vouch_repository = VouchRepository(db)
-    per_job_factory = PerJobDatabaseFactory(config.jobs_dir)
-
-    # M7b: load or generate the persistent receipt-signing key. The same
-    # key file is used in both `dev` and `operational` receipts_mode; the
-    # mode flag controls how the verifier endpoint (M7d) renders the trust
-    # posture of the resulting receipts, not which key signs them.
-    receipt_signing_key = load_or_generate_signing_key(config.receipt_signing_key_path)
     # Registries are façades over the repositories. Constructed here so the
     # auth path reads from the DB on every request.
     tenant_registry = tenant_registry or TenantRegistry(tenant_repository)
     worker_registry = WorkerRegistry(worker_repository)
     credential_resolver = CredentialResolver(tenant_registry, worker_registry)
-
-    def _account_suspended_for_tenant(tenant_id: str) -> bool:
-        # F5: tenant → account → suspended? (legacy tenants without an account
-        # have no accountability root, so they never cascade.)
-        tenant = tenant_repository.get_by_id(tenant_id)
-        if tenant is None or tenant.account_id is None:
-            return False
-        account = account_repository.get_by_id(tenant.account_id)
-        return account is not None and account.suspended_at is not None
-
-    def _tenant_tier(tenant_id: str) -> int:
-        # §9 #48: tenant → account → trust_tier. A tenant without an account
-        # (legacy) has no earned trust, so it floors at T1 — below the T2
-        # auto-approval threshold, i.e. it always routes to human review.
-        tenant = tenant_repository.get_by_id(tenant_id)
-        if tenant is None or tenant.account_id is None:
-            return int(TrustTier.T1_AUTHENTICATED)
-        account = account_repository.get_by_id(tenant.account_id)
-        return int(account.trust_tier) if account is not None else int(TrustTier.T1_AUTHENTICATED)
-
-    def _approved_classes(tenant_id: str) -> list[str] | None:
-        # §9 #48 envelope scope check: the classes the tenant was approved for.
-        return tenant_application_repository.approved_classes_for_tenant(tenant_id)
-
-    def _auto_approval_gate() -> tuple[bool, int]:
-        # §9 #48 inc-4: the maintainer's runtime auto-approval gate, read at
-        # decision time so the console toggle is authoritative. Default DISABLED.
-        policy = assessment_policy_repository.get()
-        return policy.enabled, policy.min_tier
-
-    def _governance_footprint_for(experiment, entries, diverged_units, per_job_db):
-        # Firewall #2: assemble the COSE-signed governance footprint for an
-        # experiment's attestation from control + per-job state (the asserted half;
-        # the recomputable integrity_basis half comes from entries/diverged_units).
-        from auspexai_platform.footprint import (
-            assemble_governance_footprint,
-            collect_ran_under_containment,
-            compute_independence,
-        )
-
-        tenant = tenant_repository.get_by_id(experiment.tenant_id)
-        account = (
-            account_repository.get_by_id(tenant.account_id)
-            if tenant is not None and tenant.account_id is not None
-            else None
-        )
-        tier = int(account.trust_tier) if account is not None else int(TrustTier.T1_AUTHENTICATED)
-        identity_gate = (
-            "verified"
-            if account is not None and account.identity_verified_at is not None
-            else "unsatisfied"
-        )
-        decision = experiment.assessment_decision
-        assessment = (
-            {
-                "research_class": experiment.research_class,
-                "tier": experiment.assessment_tier,
-                "envelope": experiment.assessment_envelope,
-            }
-            if decision is not None
-            else None
-        )
-
-        def _resolver(worker_id):
-            w = worker_repository.get_by_id(worker_id)
-            return w.account_id if w is not None else None
-
-        def _policy_resolver(worker_id):
-            # §41: a worker that doesn't report a sandbox policy (old worker) reads
-            # as permissive — the fail-safe assumption.
-            w = worker_repository.get_by_id(worker_id)
-            return (w.capabilities.get("sandbox_policy") if w is not None else None) or "permissive"
-
-        return assemble_governance_footprint(
-            tenant_tier=tier,
-            identity_gate=identity_gate,
-            integrity_policy=experiment.integrity_policy,
-            # 'auto' only when #48 auto-approved; review/None both routed through a human.
-            approval_experiment="auto" if decision == "auto" else "human",
-            assessment=assessment,
-            promotion_tier_set_by=account.tier_set_by_class if account is not None else None,
-            independence=compute_independence(per_job_db, _resolver),
-            containment={
-                "required": experiment.required_containment,
-                "ran_under": collect_ran_under_containment(per_job_db, _policy_resolver),
-            },
-            entries=entries,
-            diverged_units=diverged_units,
-        )
 
     scheduler = Scheduler(
         experiment_repository,
@@ -390,18 +280,6 @@ def create_app(
         tags=["trust-model-policy"],
     )
 
-    def _promotion_auto_t1_t2() -> bool:
-        # §6.2: read the mode server-authoritatively at promotion time so the
-        # console toggle is the authority. Default = `manual` (human-in-the-loop,
-        # charter §6 decision 3): qualifying accounts wait in the promotion queue.
-        # Only `auto_with_override` lets the coordinator auto-promote.
-        return promotion_policy_repository.get().auto_promote_t1_t2
-
-    eligibility_thresholds = EligibilityThresholds(
-        t2_receipt_threshold=config.tier_t2_receipt_threshold,
-        t2_distinct_tenants=config.tier_t2_distinct_tenants,
-        t2_min_account_age_days=config.tier_t2_min_account_age_days,
-    )
     app.include_router(
         account_routes.build_router(
             credential_dep,
