@@ -239,6 +239,93 @@ class TestOwnWorkerEnrichment:
         assert own["w-inelig"]["experiment_eligibility"] == "ineligible"
         assert own["w-inelig"]["experiment_ineligible_reason"]
 
+    def test_logged_out_contributor_still_listed_as_backing(
+        self,
+        client,
+        account_repository,
+        tenant_repository,
+        worker_repository,
+        receipt_index_repository,
+        manifest_repository,
+        experiment_repository,
+        per_job_factory,
+    ) -> None:
+        # A worker that backed the experiment and has since LOGGED OUT (unbind →
+        # account_id NULL) must STILL appear in own_workers as "backing": its
+        # receipts stay credited to the account via the account_id_at_issue
+        # snapshot (0041), so the own-worker list keys off that snapshot, not the
+        # live binding. The aggregate count and the unbound worker's backing both
+        # survive the logout.
+        priv, pub, experiment = _make_linked_experiment(
+            account_repository=account_repository,
+            tenant_repository=tenant_repository,
+            manifest_repository=manifest_repository,
+            experiment_repository=experiment_repository,
+            account_id="acct-own",
+            tenant_id="t-own",
+            idp_sub="gh-own",
+        )
+        own1 = _enroll_bound_worker(worker_repository, "w-own-1", "acct-own")
+        own2 = _enroll_bound_worker(worker_repository, "w-own-2", "acct-own")
+        # A genuinely third-party contributor bound to a DIFFERENT account — its
+        # receipt snapshots that other account, so it must never surface here.
+        account_repository.create(
+            account_id="acct-other", idp=IdentityProvider.GITHUB, idp_sub="gh-other"
+        )
+        other = _enroll_bound_worker(worker_repository, "w-other", "acct-other")
+
+        _seed_results(
+            per_job_factory,
+            experiment.experiment_id,
+            [
+                ("r0", "u0", "w-own-1", own1),
+                ("r1", "u1", "w-own-2", own2),
+                ("r2", "u2", "w-other", other),
+            ],
+        )
+        # Index a receipt per contribution WHILE the workers are still bound, so
+        # account_id_at_issue snapshots their account at issuance.
+        for receipt_id, worker_id, pubkey, result_id in [
+            ("rcpt-0", "w-own-1", own1, "r0"),
+            ("rcpt-1", "w-own-2", own2, "r1"),
+            ("rcpt-2", "w-other", other, "r2"),
+        ]:
+            receipt_index_repository.record(
+                receipt_id=receipt_id,
+                experiment_id=experiment.experiment_id,
+                worker_id=worker_id,
+                worker_pubkey=pubkey,
+                result_id=result_id,
+            )
+
+        # w-own-2 logs out: account binding dropped, tier → T0. It is no longer
+        # returned by worker_repository.list_for_account("acct-own").
+        worker_repository.unbind("w-own-2")
+        assert {w.worker_id for w in worker_repository.list_for_account("acct-own")} == {"w-own-1"}
+
+        resp = _signed_get(
+            client,
+            privkey=priv,
+            pubkey_hex=pub,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # All three distinct workers still count toward the anonymized aggregate.
+        assert body["active_contributor_count"] == 3
+        own = {w["worker_id"]: w for w in body["own_workers"]}
+        # BOTH own-account contributors appear — the logged-out one included.
+        assert set(own) == {"w-own-1", "w-own-2"}
+        assert own["w-own-1"]["experiment_eligibility"] == "backing"
+        assert own["w-own-2"]["experiment_eligibility"] == "backing"
+        # The logged-out worker shows its current (post-unbind) state: tier 0.
+        assert own["w-own-2"]["trust_tier"] == 0
+        assert own["w-own-2"]["result_count"] == 1
+        # The third-party contributor (different account_id_at_issue) is absent.
+        flat = repr(body["own_workers"])
+        assert "w-other" not in flat
+        assert other not in flat
+
     def test_maintainer_sees_own_workers(
         self,
         client,

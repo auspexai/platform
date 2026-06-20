@@ -41,6 +41,7 @@ from auspexai_platform.db.repositories import (
     TenantRepository,
     WorkerRepository,
 )
+from auspexai_platform.db.repositories.receipt_index import ReceiptIndexRepository
 from auspexai_platform.db.repositories.results import ResultRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.exposure import ExposureTag, is_visible
@@ -130,6 +131,7 @@ def build_router(
     per_job_factory: PerJobDatabaseFactory,
     tenant_repository: TenantRepository,
     worker_repository: WorkerRepository,
+    receipt_index_repository: ReceiptIndexRepository,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -141,17 +143,29 @@ def build_router(
 
         Returns ([], None) when the tenant isn't account-linked (b-lite
         `tenants.account_id` is NULL) — nothing to enrich, nothing to gate
-        against. Otherwise returns ALL workers bound to that account (R-D #2),
-        each tagged with its role for THIS experiment (backing / eligible /
-        ineligible) so an account worker that can't serve it shows WITH a reason
-        rather than vanishing. Third-party contributors are never included.
+        against. Otherwise returns the account's workers (R-D #2), each tagged
+        with its role for THIS experiment (backing / eligible / ineligible) so an
+        account worker that can't serve it shows WITH a reason rather than
+        vanishing. The set is the UNION of the account's CURRENT workers and the
+        workers that backed this experiment under the account's
+        `account_id_at_issue` snapshot — so a contributor that has since logged
+        out (unbound → account_id NULL) still shows as "backing" instead of
+        disappearing while its receipts stay credited. Third-party contributors
+        (a different account_id_at_issue) are never included.
         """
         tenant = tenant_repository.get_by_id(experiment.tenant_id)
         account_id = tenant.account_id if tenant is not None else None
         if account_id is None:
             return [], None
-        account_workers = worker_repository.list_for_account(account_id)
-        if not account_workers:
+        # The union of (a) workers CURRENTLY bound to this account and (b) the
+        # workers that contributed to THIS experiment under this account's
+        # issuance snapshot. (b) catches logged-out contributors that (a) drops.
+        current_map = {w.worker_id: w for w in worker_repository.list_for_account(account_id)}
+        snapshot_ids = receipt_index_repository.account_contributor_worker_ids(
+            experiment.experiment_id, account_id
+        )
+        own_ids = set(current_map) | set(snapshot_ids)
+        if not own_ids:
             return [], account_id
         # Contributions to THIS experiment, keyed by worker_id.
         contribs = {
@@ -160,8 +174,11 @@ def build_router(
         required = getattr(experiment, "required_capabilities", None) or {}
         rre = bool(getattr(experiment, "requires_real_execution", False))
         own: list[OwnWorkerActivity] = []
-        for worker in account_workers:
-            c = contribs.get(worker.worker_id)
+        for wid in own_ids:
+            worker = current_map.get(wid) or worker_repository.get_by_id(wid)
+            if worker is None:
+                continue
+            c = contribs.get(wid)
             if c is not None:
                 eligibility, reason = "backing", None
                 result_count, last_activity = c["result_count"], c["last_received_at"]

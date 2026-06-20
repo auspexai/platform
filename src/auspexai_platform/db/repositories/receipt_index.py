@@ -190,6 +190,25 @@ class ReceiptIndexRepository:
         )
         return [self._row_to_entry(r) for r in rows]
 
+    def account_contributor_worker_ids(self, experiment_id: str, account_id: str) -> list[str]:
+        """The distinct worker_ids that contributed to one experiment ON BEHALF of
+        one account, by the `account_id_at_issue` snapshot (0041) rather than the
+        live workers.account_id.
+
+        A worker that backed the experiment and has since unbound (account_id ->
+        NULL) still appears here, because the snapshot was taken at issuance — so
+        the researcher's own-worker list can keep showing a logged-out
+        contributor instead of dropping it. Rows snapshotted with a NULL account
+        (anonymous / T0 workers) are not returned."""
+        rows = self.db.execute(
+            """
+            SELECT DISTINCT worker_id FROM receipt_index
+            WHERE experiment_id = ? AND account_id_at_issue = ?
+            """,
+            (experiment_id, account_id),
+        )
+        return [r["worker_id"] for r in rows]
+
     def account_receipt_summary(self, account_id: str) -> tuple[int, int]:
         """(total_receipts, distinct_tenants) for an account — joins
         receipt_index → workers → experiments to count DISTINCT tenant_id (not

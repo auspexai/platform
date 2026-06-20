@@ -331,6 +331,7 @@ def create_app(
             per_job_factory=per_job_factory,
             tenant_repository=tenant_repository,
             worker_repository=worker_repository,
+            receipt_index_repository=receipt_index_repository,
         ),
         prefix="/api/v0",
         tags=["activity"],
