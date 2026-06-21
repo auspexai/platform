@@ -391,3 +391,31 @@ def test_cli_revoke(tmp_path):
         ]
     )
     assert r.exit_code == 0 and "revoked" in r.output
+
+
+# ---- Rekor backfill (§6.7.4 "publish") ----
+
+
+class _FakeRekor:
+    def record(self, _blob):
+        from auspexai_platform.receipts.rekor import RekorEntry
+
+        return RekorEntry(log_index=42, entry_uuid="uuid-x")
+
+
+def test_backfill_cert_rekor_anchors_and_is_idempotent(db):
+    from auspexai_platform.certification_backfill import backfill_cert_rekor
+
+    repo = CertifiedProfileRepository(db)
+    _insert(repo)  # rekor_log_index is NULL → a candidate
+    # dry-run: counts, doesn't anchor
+    dry = backfill_cert_rekor(db, rekor_client=_FakeRekor(), apply=False)
+    assert dry.candidates == 1 and not dry.anchored
+    assert repo.get_by_package("a" * 64).rekor_log_index is None
+    # apply: anchors, records the log index
+    done = backfill_cert_rekor(db, rekor_client=_FakeRekor(), apply=True)
+    assert done.anchored == ["a" * 64]
+    assert repo.get_by_package("a" * 64).rekor_log_index == 42
+    # idempotent: already anchored → no candidates
+    again = backfill_cert_rekor(db, rekor_client=_FakeRekor(), apply=True)
+    assert again.candidates == 0 and not again.anchored

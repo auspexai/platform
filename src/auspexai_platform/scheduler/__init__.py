@@ -109,10 +109,12 @@ def resolve_replication(
     exceeds the target. Returns (target, floor, derived policy label).
 
     `tier_floor_override` (the certified-starter exemption, Ethics §6.7): when set it
-    REPLACES the tenant's trust-tier floor — a gate-certified starter runs at its certified
-    floor (e.g. 2) even for a T0 newcomer, so the on-ramp doesn't stall at the T0 3x floor.
-    Anti-gaming stays on quality-weighted standing + the bounded subsidy, not the raw floor
-    (the certified profile is benign + locked, so the 3x anti-farming brake is moot)."""
+    REPLACES the tenant's trust-tier floor with the certified floor. DEFENSIVE /
+    belt-and-suspenders, NOT load-bearing: a registered tenant floors at T1 (floor 2),
+    which already equals the typical certified floor — so this only changes a hypothetical
+    T0 (anonymous) submitter (floor 3 → 2), and registered tenants are never T0. It guards
+    against a stall the current tenant model can't actually produce. (Verified live: a T1
+    newcomer's certified-starter run seeded at floor 2 with or without the override.)"""
     tier_floor = (
         int(tier_floor_override)
         if tier_floor_override is not None

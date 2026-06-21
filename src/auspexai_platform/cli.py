@@ -571,6 +571,18 @@ def certification_issue(
         repo.supersede_others(
             tenant_id=rec.tenant_id, profile_name=rec.profile_name, keep_package=rec.package_sha256
         )
+        # Publish to the transparency log (§6.7.4 "publish"): anchor the signed cert
+        # in Rekor so it is publicly auditable + contestable. Best-effort — on failure
+        # the cert is registered un-anchored and `certification backfill-rekor` catches it.
+        anchor_note = "  (Rekor anchor deferred — run `certification backfill-rekor`)"
+        try:
+            from auspexai_platform.receipts.rekor import RekorClient
+
+            entry = RekorClient(config.rekor_url, signing_key=signing_key).record(blob)
+            repo.set_rekor(envelope.package_sha256, log_index=entry.log_index)
+            anchor_note = f"  published to the transparency log: Rekor logIndex {entry.log_index}"
+        except Exception as e:
+            anchor_note = f"  (Rekor anchor deferred: {e}; run `certification backfill-rekor`)"
     finally:
         db.close()
     click.echo(
@@ -579,8 +591,8 @@ def certification_issue(
     click.echo(
         f"  signed by {signing_key.pubkey_hex[:16]}… (coordinator key, maintainer-authenticated)"
     )
-    click.echo("  Next: publish the certificate and open it to contestation per §6.7.4")
-    click.echo("  (transparency-log anchoring is a follow-on backfill, like attestations).")
+    click.echo(anchor_note)
+    click.echo("  Open it to contestation per §6.7.4 (sign + publish + contest).")
 
 
 @certification.command("revoke")
@@ -641,10 +653,51 @@ def certification_list(state_dir: Path | None) -> None:
         click.echo("No certifications.")
         return
     for r in records:
+        anchor = f"rekor {r.rekor_log_index}" if r.rekor_log_index is not None else "un-anchored"
         click.echo(
             f"{r.status:10} {r.tenant_id}/{r.profile_name} @ {r.snapshot_version}  "
-            f"pkg {r.package_sha256[:12]}…  floor {r.replication_floor}"
+            f"pkg {r.package_sha256[:12]}…  floor {r.replication_floor}  {anchor}"
         )
+
+
+@certification.command("backfill-rekor")
+@_state_dir_option
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Actually anchor un-anchored certifications in Rekor. Default is a dry-run count.",
+)
+@click.option(
+    "--rekor-url", default=None, help="Rekor instance URL (default: config / public sigstore)."
+)
+def certification_backfill_rekor(
+    state_dir: Path | None, apply_changes: bool, rekor_url: str | None
+) -> None:
+    """Anchor signed certifications in the transparency log (§6.7.4 "publish").
+
+    `certification issue` anchors inline; this sweep catches anything left
+    un-anchored (a Rekor hiccup, or a cert issued before anchoring shipped).
+    DRY-RUN by default — pass `--apply`. Idempotent + per-row fault-tolerant;
+    intended to run from a systemd timer alongside the attestation backfill."""
+    from auspexai_platform.certification_backfill import backfill_cert_rekor
+    from auspexai_platform.db.database import Database
+    from auspexai_platform.db.migrations import MigrationRunner
+    from auspexai_platform.receipts.rekor import RekorClient
+    from auspexai_platform.receipts.signing import load_or_generate_signing_key
+
+    config = _resolve_config(state_dir)
+    db = Database(config.control_db_path)
+    try:
+        MigrationRunner(db).apply_all()
+        signing_key = load_or_generate_signing_key(config.receipt_signing_key_path)
+        client = RekorClient(rekor_url or config.rekor_url, signing_key=signing_key)
+        report = backfill_cert_rekor(db, rekor_client=client, apply=apply_changes)
+    finally:
+        db.close()
+    click.echo(report.summary())
+    if not apply_changes and report.candidates:
+        click.echo("\nRe-run with --apply to anchor these in Rekor.")
 
 
 if __name__ == "__main__":

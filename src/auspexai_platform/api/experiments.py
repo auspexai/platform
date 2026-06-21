@@ -553,8 +553,9 @@ def build_router(
             # C14: decouple replication from the {1,3,5} ladder so repl-2 is expressible.
             # The manifest's replication_factor is the TARGET; replication_floor defaults
             # to 2 (a real cross-check), both floored by the tenant's trust tier.
-            # §6.7: a gate-certified starter runs at its CERTIFIED floor (e.g. 2) even for
-            # a T0 newcomer — so the on-ramp doesn't stall at the T0 3x tier floor.
+            # §6.7: a gate-certified starter runs at its CERTIFIED floor. DEFENSIVE only —
+            # registered tenants floor at T1 (already 2), so this bites only a hypothetical
+            # T0 (anonymous) submitter; not load-bearing for real newcomer-tenants.
             cert = (
                 certified_match(body.manifest, certified_profile_repository)
                 if certified_profile_repository is not None
