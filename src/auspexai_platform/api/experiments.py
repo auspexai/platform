@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 from auspexai_platform.assessment import assess_envelope, decide
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.dependency import require_maintainer
+from auspexai_platform.certification import certified_match
 from auspexai_platform.db.models import (
     INTEGRITY_POLICY_REPLICATION,
     ExperimentStatus,
@@ -48,6 +49,7 @@ from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AttestationRepository,
     AuditRepository,
+    CertifiedProfileRepository,
     ExperimentRepository,
     ManifestRepository,
     ReceiptIndexRepository,
@@ -393,6 +395,9 @@ def build_router(
     receipt_index_repository: ReceiptIndexRepository | None = None,
     signing_key: SigningKey | None = None,
     attestation_repository: AttestationRepository | None = None,
+    # Promotion-gate certifications (RFC 0001 / Ethics §6.7). Optional so the
+    # router builds in tests without it; absent → no run is ever certified-cleared.
+    certified_profile_repository: CertifiedProfileRepository | None = None,
     # §9 #48: injected lookups (wired in main.py from the account/application
     # repos, à la the scheduler's account_suspended_for_tenant). All optional so
     # the router builds in tests without them — defaults make every experiment
@@ -548,10 +553,18 @@ def build_router(
             # C14: decouple replication from the {1,3,5} ladder so repl-2 is expressible.
             # The manifest's replication_factor is the TARGET; replication_floor defaults
             # to 2 (a real cross-check), both floored by the tenant's trust tier.
+            # §6.7: a gate-certified starter runs at its CERTIFIED floor (e.g. 2) even for
+            # a T0 newcomer — so the on-ramp doesn't stall at the T0 3x tier floor.
+            cert = (
+                certified_match(body.manifest, certified_profile_repository)
+                if certified_profile_repository is not None
+                else None
+            )
             _target, _floor, _policy = resolve_replication(
                 requested_target=int(body.manifest.get("replication_factor", 1) or 1),
                 requested_floor=body.manifest.get("replication_floor"),
                 tenant_tier=tier,
+                tier_floor_override=cert.replication_floor if cert else None,
             )
             experiment_repository.set_replication(
                 experiment.experiment_id,
@@ -827,12 +840,21 @@ def build_router(
             # Unwired (a test that doesn't exercise the gate): DISABLED is the
             # safe default — production always wires the reader in main.py.
             gate_enabled, gate_min_tier = False, int(TrustTier.T2_TRUSTED)
+        # §6.7.5: a certified-profile run auto-clears regardless of accrued tier
+        # (certification substitutes for standing). Both submit and assess resolve
+        # the cert independently from the manifest's package digest — no marker column.
+        cert = (
+            certified_match(manifest_json, certified_profile_repository)
+            if certified_profile_repository is not None
+            else None
+        )
         verdict = decide(
             research_class=research_class,
             tenant_tier=tier,
             envelope=envelope,
             auto_tier=gate_min_tier,
             auto_approval_enabled=gate_enabled,
+            certified=cert is not None,
         )
         assessed_by = credential.maintainer_login or "maintainer"
         experiment = experiment_repository.set_assessment(

@@ -99,14 +99,25 @@ def resolve_replication(
     requested_target: int,
     requested_floor: int | None,
     tenant_tier: TrustTier | int,
+    tier_floor_override: int | None = None,
 ) -> tuple[int, int, IntegrityPolicy]:
     """C14: resolve an experiment's (replication_target, replication_floor) from the
     researcher's request — decoupled from the {1,3,5} ladder so repl-2 is expressible.
     The tier floor is the COORDINATOR's trust requirement (lower tenant trust → more
     corroboration); it floors both. `requested_floor` defaults to 2 (a real cross-check);
     the floor is DORMANT until capacity-aware completion (regime 2) consumes it, and never
-    exceeds the target. Returns (target, floor, derived policy label)."""
-    tier_floor = _TIER_REPLICATION_FLOOR.get(TrustTier(int(tenant_tier)), 3)
+    exceeds the target. Returns (target, floor, derived policy label).
+
+    `tier_floor_override` (the certified-starter exemption, Ethics §6.7): when set it
+    REPLACES the tenant's trust-tier floor — a gate-certified starter runs at its certified
+    floor (e.g. 2) even for a T0 newcomer, so the on-ramp doesn't stall at the T0 3x floor.
+    Anti-gaming stays on quality-weighted standing + the bounded subsidy, not the raw floor
+    (the certified profile is benign + locked, so the 3x anti-farming brake is moot)."""
+    tier_floor = (
+        int(tier_floor_override)
+        if tier_floor_override is not None
+        else _TIER_REPLICATION_FLOOR.get(TrustTier(int(tenant_tier)), 3)
+    )
     target = max(int(requested_target), tier_floor)
     floor = max(int(requested_floor) if requested_floor is not None else 2, tier_floor)
     floor = min(floor, target)

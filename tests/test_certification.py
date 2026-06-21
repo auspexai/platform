@@ -5,9 +5,11 @@ from __future__ import annotations
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from auspexai_platform.assessment import EnvelopeCheck, EnvelopeResult, decide
 from auspexai_platform.certification import (
     CertificateEnvelope,
     auto_check,
+    certified_match,
     envelope_from_manifest,
     match,
     sign_certificate,
@@ -21,6 +23,11 @@ from auspexai_platform.receipts.signing import (
     SigningKey,
     cose_sign1_decode,
 )
+from auspexai_platform.scheduler import resolve_replication
+
+
+def _envelope(passed: bool = True) -> EnvelopeResult:
+    return EnvelopeResult([EnvelopeCheck("x", passed)])
 
 
 def _starter_manifest(**over):
@@ -189,3 +196,195 @@ def test_match_passes_for_certified_profile(db):
 def test_match_rejects_locked_field_changes(db, over):
     rec = _insert(CertifiedProfileRepository(db))
     assert not match(_starter_manifest(**over), rec).passed
+
+
+# ---- certified_match (the combined lookup + match used by submit/assess) ----
+
+
+def test_certified_match_resolves_active_cert(db):
+    repo = CertifiedProfileRepository(db)
+    _insert(repo)
+    assert certified_match(_starter_manifest(), repo) is not None
+    # not matching (locked field changed) → None
+    assert certified_match(_starter_manifest(sensitive_content_flags=["x"]), repo) is None
+    # revoked → None
+    repo.revoke("a" * 64, reason="test")
+    assert certified_match(_starter_manifest(), repo) is None
+
+
+def test_certified_match_is_defensive(db):
+    repo = CertifiedProfileRepository(db)
+    # a legacy/loose manifest with a string executor (no content-addressed package)
+    assert certified_match({"executor": "python -m x"}, repo) is None
+    assert certified_match({}, repo) is None
+
+
+# ---- decide(): certification substitutes for tier (§6.7.5) ----
+
+
+def test_decide_certified_auto_clears_low_tier():
+    # a T0/T1 newcomer who could never reach the T2 auto-approval floor...
+    v = decide(
+        research_class="behavioral_drift",
+        tenant_tier=0,
+        envelope=_envelope(True),
+        auto_approval_enabled=True,
+        certified=True,
+    )
+    assert v.decision == "auto" and "certified" in v.rationale
+
+
+def test_decide_certified_respects_global_gate():
+    v = decide(
+        research_class="behavioral_drift",
+        tenant_tier=0,
+        envelope=_envelope(True),
+        auto_approval_enabled=False,  # maintainer kill-switch
+        certified=True,
+    )
+    assert v.decision == "review"
+
+
+def test_decide_certified_respects_envelope():
+    v = decide(
+        research_class="behavioral_drift",
+        tenant_tier=0,
+        envelope=_envelope(False),  # an envelope check failed
+        auto_approval_enabled=True,
+        certified=True,
+    )
+    assert v.decision == "review"
+
+
+def test_decide_uncertified_low_tier_still_reviews():
+    v = decide(
+        research_class="behavioral_drift",
+        tenant_tier=0,
+        envelope=_envelope(True),
+        auto_approval_enabled=True,
+        certified=False,
+    )
+    assert v.decision == "review"
+
+
+# ---- the certified-floor exemption (§6.7 / C14) ----
+
+
+def test_resolve_replication_floor_exemption():
+    # T0's tier floor is 3 → a 2-worker fleet would stall...
+    t, f, _ = resolve_replication(requested_target=2, requested_floor=2, tenant_tier=0)
+    assert (t, f) == (3, 3)
+    # ...but a certified starter runs at its certified floor (2), no stall.
+    t, f, _ = resolve_replication(
+        requested_target=2, requested_floor=2, tenant_tier=0, tier_floor_override=2
+    )
+    assert (t, f) == (2, 2)
+
+
+# ---- the maintainer CLI (issue / list / revoke) ----
+
+
+def _write_starter_manifest(tmp_path):
+    import json as _json
+
+    p = tmp_path / "manifest.json"
+    p.write_text(_json.dumps(_starter_manifest()))
+    return p
+
+
+def _run(args):
+    from click.testing import CliRunner
+
+    from auspexai_platform.cli import main
+
+    return CliRunner().invoke(main, args)
+
+
+def test_cli_issue_dry_run_then_apply_then_list(tmp_path):
+    manifest = _write_starter_manifest(tmp_path)
+    common = [
+        "certification",
+        "issue",
+        "--state-dir",
+        str(tmp_path),
+        "--manifest",
+        str(manifest),
+        "--snapshot",
+        "vigiles-tenant@v0.1.0",
+        "--profile",
+        "starter",
+        "--certified-by",
+        "maintainer:test",
+    ]
+    dry = _run(common)
+    assert dry.exit_code == 0 and "DRY-RUN" in dry.output
+
+    applied = _run([*common, "--apply"])
+    assert applied.exit_code == 0 and "✓ certified" in applied.output
+
+    listed = _run(["certification", "list", "--state-dir", str(tmp_path)])
+    assert "vigiles-lab/starter" in listed.output and "certified" in listed.output
+
+    # idempotent: re-issuing identical content is rejected
+    again = _run([*common, "--apply"])
+    assert again.exit_code == 1 and "Already certified" in again.output
+
+
+def test_cli_issue_rejects_non_starter(tmp_path):
+    import json as _json
+
+    bad = tmp_path / "bad.json"
+    bad.write_text(_json.dumps(_starter_manifest(sensitive_content_flags=["jailbreak"])))
+    r = _run(
+        [
+            "certification",
+            "issue",
+            "--state-dir",
+            str(tmp_path),
+            "--manifest",
+            str(bad),
+            "--snapshot",
+            "s",
+            "--profile",
+            "starter",
+            "--certified-by",
+            "m",
+        ]
+    )
+    assert r.exit_code == 1 and "FAILED" in r.output
+
+
+def test_cli_revoke(tmp_path):
+    manifest = _write_starter_manifest(tmp_path)
+    _run(
+        [
+            "certification",
+            "issue",
+            "--state-dir",
+            str(tmp_path),
+            "--manifest",
+            str(manifest),
+            "--snapshot",
+            "s",
+            "--profile",
+            "starter",
+            "--certified-by",
+            "m",
+            "--apply",
+        ]
+    )
+    pkg = "a" * 64
+    r = _run(
+        [
+            "certification",
+            "revoke",
+            "--state-dir",
+            str(tmp_path),
+            "--package",
+            pkg,
+            "--reason",
+            "x",
+            "--apply",
+        ]
+    )
+    assert r.exit_code == 0 and "revoked" in r.output

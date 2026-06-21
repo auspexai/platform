@@ -427,5 +427,225 @@ def token_revoke(state_dir: Path | None, login: str) -> None:
         click.echo(f"Revoked {count} token(s) for {login}.")
 
 
+@main.group("certification")
+def certification() -> None:
+    """Promotion-gate certifications (RFC 0001 / Research Ethics Policy §6.7)."""
+
+
+@certification.command("issue")
+@_state_dir_option
+@click.option(
+    "--manifest",
+    "manifest_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Built starter manifest.json (e.g. `experiment build pkg/ --profile starter`).",
+)
+@click.option(
+    "--snapshot", required=True, help="Released snapshot version, e.g. vigiles-tenant@v0.1.0."
+)
+@click.option(
+    "--profile",
+    "profile_name",
+    required=True,
+    help="The profile name being certified (e.g. starter).",
+)
+@click.option(
+    "--certified-by",
+    "certified_by",
+    required=True,
+    help="Maintainer identity recorded on the certificate.",
+)
+@click.option(
+    "--advisor",
+    default=None,
+    help="External advisor co-signer — HIGH-risk certs only; omit for a low-risk starter (§6.7.4).",
+)
+@click.option(
+    "--max-units",
+    "max_units_ceiling",
+    type=int,
+    default=None,
+    help="Certified unit-count ceiling (§6.7.3).",
+)
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Actually sign + register. Default is a dry-run that runs the §6.7.2 checks.",
+)
+def certification_issue(
+    state_dir: Path | None,
+    manifest_path: Path,
+    snapshot: str,
+    profile_name: str,
+    certified_by: str,
+    advisor: str | None,
+    max_units_ceiling: int | None,
+    apply_changes: bool,
+) -> None:
+    """Certify a curated starter profile (§6.7): auto-check the §6.7.2 bar, sign the
+    certificate with the coordinator key, and register it so runs of this exact
+    profile auto-clear §6 (§6.7.5). DRY-RUN by default — `--apply` to commit.
+
+    Low-risk path (the default): the certificate is coordinator-signed and
+    maintainer-authenticated; independence is transparency + contestability (no
+    advisor). Pass `--advisor` only for a high-risk certification."""
+    import json as _json
+
+    from auspexai_platform.certification import (
+        auto_check,
+        envelope_from_manifest,
+        sign_certificate,
+    )
+    from auspexai_platform.db.database import Database
+    from auspexai_platform.db.migrations import MigrationRunner
+    from auspexai_platform.db.repositories.certified_profiles import (
+        CertifiedProfileRepository,
+        DuplicateCertificationError,
+    )
+    from auspexai_platform.receipts.signing import load_or_generate_signing_key
+
+    manifest = _json.loads(manifest_path.read_text())
+    check = auto_check(manifest)
+    if not check.passed:
+        click.echo("FAILED the §6.7.2 safe-to-expose auto-checks:", err=True)
+        for f in check.failures:
+            click.echo(f"  - {f}", err=True)
+        raise SystemExit(1)
+
+    envelope = envelope_from_manifest(
+        manifest,
+        snapshot_version=snapshot,
+        profile_name=profile_name,
+        certified_by=certified_by,
+        advisor=advisor,
+        max_units_ceiling=max_units_ceiling,
+    )
+    click.echo("Certifying (review before --apply):")
+    click.echo(f"  snapshot:       {envelope.snapshot_version}")
+    click.echo(f"  tenant/profile: {envelope.tenant_id} / {envelope.profile_name}")
+    click.echo(f"  package:        {envelope.package_sha256[:16]}…")
+    click.echo(f"  model(s):       {', '.join(envelope.model_ids)}")
+    click.echo(f"  research_class: {envelope.research_class}")
+    click.echo(f"  sensitive flags: {envelope.sensitive_content_flags}")
+    click.echo(f"  replication floor: {envelope.replication_floor}")
+    click.echo(f"  duration ≤:     {envelope.duration_hours_ceiling}")
+    click.echo(f"  advisor:        {envelope.advisor or '(none — low-risk: publish + contest)'}")
+    click.echo("  §6.7.2 auto-checks: PASS")
+    if not apply_changes:
+        click.echo("\nDRY-RUN. Re-run with --apply to sign + register.")
+        return
+
+    config = _resolve_config(state_dir)
+    db = Database(config.control_db_path)
+    try:
+        MigrationRunner(db).apply_all()
+        signing_key = load_or_generate_signing_key(config.receipt_signing_key_path)
+        blob = sign_certificate(envelope, signing_key=signing_key)
+        repo = CertifiedProfileRepository(db)
+        try:
+            rec = repo.insert(
+                package_sha256=envelope.package_sha256,
+                snapshot_version=envelope.snapshot_version,
+                tenant_id=envelope.tenant_id,
+                profile_name=envelope.profile_name,
+                research_class=envelope.research_class,
+                sensitive_content_flags=envelope.sensitive_content_flags,
+                model_ids=envelope.model_ids,
+                replication_floor=envelope.replication_floor,
+                max_units_ceiling=envelope.max_units_ceiling,
+                duration_hours_ceiling=envelope.duration_hours_ceiling,
+                cose_signed_blob=blob,
+                signing_key_pubkey_hex=signing_key.pubkey_hex,
+                certified_by=envelope.certified_by,
+                advisor=envelope.advisor,
+            )
+        except DuplicateCertificationError:
+            click.echo(
+                f"Already certified: package {envelope.package_sha256[:16]}… is in the registry "
+                "(re-certifying identical content is a no-op).",
+                err=True,
+            )
+            raise SystemExit(1) from None
+        repo.supersede_others(
+            tenant_id=rec.tenant_id, profile_name=rec.profile_name, keep_package=rec.package_sha256
+        )
+    finally:
+        db.close()
+    click.echo(
+        f"\n✓ certified {envelope.tenant_id}/{envelope.profile_name} @ {envelope.snapshot_version}"
+    )
+    click.echo(
+        f"  signed by {signing_key.pubkey_hex[:16]}… (coordinator key, maintainer-authenticated)"
+    )
+    click.echo("  Next: publish the certificate and open it to contestation per §6.7.4")
+    click.echo("  (transparency-log anchoring is a follow-on backfill, like attestations).")
+
+
+@certification.command("revoke")
+@_state_dir_option
+@click.option(
+    "--package", "package_sha256", required=True, help="The certified package digest to revoke."
+)
+@click.option("--reason", required=True, help="Why it is revoked (recorded; §6.7.6).")
+@click.option(
+    "--apply", "apply_changes", is_flag=True, help="Actually revoke. Default is a dry-run."
+)
+def certification_revoke(
+    state_dir: Path | None, package_sha256: str, reason: str, apply_changes: bool
+) -> None:
+    """Revoke a certification (§6.7.6): its standing approval is removed and runs
+    of that profile revert to requiring a §6.1 application. DRY-RUN by default."""
+    from auspexai_platform.db.database import Database
+    from auspexai_platform.db.migrations import MigrationRunner
+    from auspexai_platform.db.repositories.certified_profiles import CertifiedProfileRepository
+
+    config = _resolve_config(state_dir)
+    db = Database(config.control_db_path)
+    try:
+        MigrationRunner(db).apply_all()
+        repo = CertifiedProfileRepository(db)
+        rec = repo.get_by_package(package_sha256)
+        if rec is None:
+            click.echo(f"No certification for package {package_sha256[:16]}….", err=True)
+            raise SystemExit(1)
+        click.echo(
+            f"{rec.tenant_id}/{rec.profile_name} @ {rec.snapshot_version} (status: {rec.status})"
+        )
+        if not apply_changes:
+            click.echo("DRY-RUN. Re-run with --apply to revoke.")
+            return
+        repo.revoke(package_sha256, reason=reason)
+    finally:
+        db.close()
+    click.echo("✓ revoked — the standing approval is removed.")
+
+
+@certification.command("list")
+@_state_dir_option
+def certification_list(state_dir: Path | None) -> None:
+    """List the certifications in the registry."""
+    from auspexai_platform.db.database import Database
+    from auspexai_platform.db.migrations import MigrationRunner
+    from auspexai_platform.db.repositories.certified_profiles import CertifiedProfileRepository
+
+    config = _resolve_config(state_dir)
+    db = Database(config.control_db_path)
+    try:
+        MigrationRunner(db).apply_all()
+        records = CertifiedProfileRepository(db).list_all()
+    finally:
+        db.close()
+    if not records:
+        click.echo("No certifications.")
+        return
+    for r in records:
+        click.echo(
+            f"{r.status:10} {r.tenant_id}/{r.profile_name} @ {r.snapshot_version}  "
+            f"pkg {r.package_sha256[:12]}…  floor {r.replication_floor}"
+        )
+
+
 if __name__ == "__main__":
     main()

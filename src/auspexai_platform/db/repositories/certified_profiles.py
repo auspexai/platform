@@ -176,6 +176,11 @@ class CertifiedProfileRepository:
         )
         return [self._row_to_record(r) for r in rows]
 
+    def list_all(self) -> list[CertifiedProfileRecord]:
+        """All certifications, newest first (the maintainer `certification list` view)."""
+        rows = self.db.execute("SELECT * FROM certified_profiles ORDER BY certified_at DESC")
+        return [self._row_to_record(r) for r in rows]
+
     # ---- helpers ----
 
     @staticmethod

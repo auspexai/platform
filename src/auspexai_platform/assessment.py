@@ -174,10 +174,16 @@ def decide(
     envelope: EnvelopeResult,
     auto_tier: TrustTier | int = AUTO_APPROVE_TIER,
     auto_approval_enabled: bool = True,
+    certified: bool = False,
 ) -> AssessmentDecision:
-    """The authoritative admission decision. `auto` requires ALL of: the
-    maintainer's auto-approval gate ON, routine class, tenant tier >= auto_tier,
-    every envelope check passing.
+    """The authoritative admission decision. `auto` requires the maintainer's
+    auto-approval gate ON, every envelope check passing, AND either a certified
+    profile OR (routine class + tenant tier >= auto_tier).
+
+    `certified` (Ethics §6.7.5 standing approval): a gate-certified-profile run
+    auto-clears regardless of accrued tier — certification SUBSTITUTES for standing
+    (it was vetted + signed once, per release). It still respects the global gate
+    and the envelope checks (defense in depth).
 
     `auto_approval_enabled` is the §9 #48-inc4 runtime gate (sourced from
     `AssessmentPolicyRepository`). Default True keeps this pure function
@@ -186,10 +192,16 @@ def decide(
     until a maintainer turns the gate on from the console."""
     track = class_track(research_class)
     tier_ok = int(tenant_tier) >= int(auto_tier)
-    auto = auto_approval_enabled and track == "routine" and tier_ok and envelope.passed
+    auto = (
+        auto_approval_enabled
+        and envelope.passed
+        and (certified or (track == "routine" and tier_ok))
+    )
 
     if not auto_approval_enabled:
         rationale = "auto-approval gate is off (maintainer) → human review"
+    elif certified and envelope.passed:
+        rationale = "certified profile (§6.7.5 standing approval) → auto-approve regardless of tier"
     elif track == "elevated":
         rationale = f"{research_class} is elevated-ethics → human review"
     elif track == "unknown":

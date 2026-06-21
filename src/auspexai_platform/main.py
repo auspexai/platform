@@ -112,6 +112,7 @@ def create_app(
     retired_key_repository = svc.retired_key_repository
     receipt_index_repository = svc.receipt_index_repository
     attestation_repository = svc.attestation_repository
+    certified_profile_repository = svc.certified_profile_repository
     result_transfer_repository = svc.result_transfer_repository
     model_request_repository = svc.model_request_repository
     model_prestage_repository = svc.model_prestage_repository
@@ -243,6 +244,7 @@ def create_app(
             receipt_index_repository=receipt_index_repository,
             signing_key=receipt_signing_key,
             attestation_repository=attestation_repository,
+            certified_profile_repository=certified_profile_repository,
             tenant_tier=_tenant_tier,  # §9 #48 class-by-tier auto-approval
             approved_classes=_approved_classes,
             auto_approval_gate=_auto_approval_gate,  # §9 #48 inc-4 runtime gate

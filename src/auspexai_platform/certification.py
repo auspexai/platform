@@ -157,7 +157,8 @@ def match(manifest: dict[str, Any], cert: Any) -> CheckResult:
     may differ; every LOCKED field must match the certified envelope."""
     failures: list[str] = []
 
-    pkg = (manifest.get("executor") or {}).get("package_sha256")
+    executor = manifest.get("executor")
+    pkg = executor.get("package_sha256") if isinstance(executor, dict) else None
     if pkg != cert.package_sha256:
         failures.append("executor package digest differs from the certified profile")
     if manifest.get("research_class") != cert.research_class:
@@ -183,3 +184,18 @@ def match(manifest: dict[str, Any], cert: Any) -> CheckResult:
             f"expected_duration_hours exceeds the certified ceiling ({cert.duration_hours_ceiling})"
         )
     return CheckResult(passed=not failures, failures=failures)
+
+
+def certified_match(manifest: dict[str, Any], repo: Any) -> Any:
+    """Resolve a submitted manifest to its ACTIVE certification, or None — the
+    single check both the submit-time floor exemption and the auto-approval branch
+    use. Combines the registry lookup (by content-addressed package digest) with
+    the §6.7.3 locked-field `match`. `repo` is a CertifiedProfileRepository."""
+    executor = manifest.get("executor")
+    pkg = executor.get("package_sha256") if isinstance(executor, dict) else None
+    if not pkg:
+        return None
+    cert = repo.get_by_package(pkg)
+    if cert is None or not cert.is_active:
+        return None
+    return cert if match(manifest, cert).passed else None
