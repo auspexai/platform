@@ -858,13 +858,28 @@ def build_router(
             certified=cert is not None,
         )
         assessed_by = credential.maintainer_login or "maintainer"
+        # Denormalize the certification provenance onto the experiment's rationale so
+        # it surfaces wherever the rationale renders (researcher dashboard, console,
+        # API) — including the Rekor logIndex, the public proof handle. (Cheaper than
+        # a marker column; the cert stays resolvable from the package digest.)
+        rationale = verdict.rationale
+        if cert is not None:
+            anchor = (
+                f"Rekor logIndex {cert.rekor_log_index}"
+                if cert.rekor_log_index is not None
+                else "Rekor anchor pending"
+            )
+            rationale = (
+                f"{rationale} · certified {cert.tenant_id}/{cert.profile_name} "
+                f"(pkg {cert.package_sha256[:12]}…, {anchor})"
+            )
         experiment = experiment_repository.set_assessment(
             experiment_id,
             research_class=research_class,
             decision=verdict.decision,
             tier=tier,
             envelope=envelope.as_json(),
-            rationale=verdict.rationale,
+            rationale=rationale,
             assessed_by=assessed_by,
         )
         audit_repository.append(
