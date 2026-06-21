@@ -176,40 +176,45 @@ def decide(
     auto_approval_enabled: bool = True,
     certified: bool = False,
 ) -> AssessmentDecision:
-    """The authoritative admission decision. `auto` requires the maintainer's
-    auto-approval gate ON, every envelope check passing, AND either a certified
-    profile OR (routine class + tenant tier >= auto_tier).
+    """The authoritative admission decision. `auto` requires every envelope check
+    to pass, AND one of two INDEPENDENT paths:
 
-    `certified` (Ethics §6.7.5 standing approval): a gate-certified-profile run
-    auto-clears regardless of accrued tier — certification SUBSTITUTES for standing
-    (it was vetted + signed once, per release). It still respects the global gate
-    and the envelope checks (defense in depth).
+      - **certified path** — a certified profile (Ethics §6.7.5 standing approval);
+        OR
+      - **routine-tier path** — the maintainer's auto-approval gate ON + a routine
+        class + tenant tier >= auto_tier.
+
+    The two are deliberately DECOUPLED. Certification is a per-profile, signed,
+    standing approval — it is self-sufficient (certify = on, revoke = off) and does
+    NOT ride `auto_approval_enabled`. That global switch exists only for the
+    *un-vetted* routine-tier path, which trusts a tenant's accrued tier to auto-run
+    arbitrary routine experiments and so needs a coarse master enable; a certified
+    run, individually vetted + signed, does not. The "safe default" still holds:
+    certifying a profile is itself the deliberate, audited maintainer act (a
+    signature), so it needs no second global lock.
 
     `auto_approval_enabled` is the §9 #48-inc4 runtime gate (sourced from
     `AssessmentPolicyRepository`). Default True keeps this pure function
     policy-neutral for unit tests; the SAFE default (OFF) lives in the storage
-    row + the endpoint's no-reader fallback, so production can never auto-approve
-    until a maintainer turns the gate on from the console."""
+    row + the endpoint's no-reader fallback, so the routine-tier path can never
+    auto-approve until a maintainer turns the gate on."""
     track = class_track(research_class)
     tier_ok = int(tenant_tier) >= int(auto_tier)
-    auto = (
-        auto_approval_enabled
-        and envelope.passed
-        and (certified or (track == "routine" and tier_ok))
-    )
+    routine_auto = auto_approval_enabled and track == "routine" and tier_ok
+    auto = envelope.passed and (certified or routine_auto)
 
-    if not auto_approval_enabled:
-        rationale = "auto-approval gate is off (maintainer) → human review"
-    elif certified and envelope.passed:
-        rationale = "certified profile (§6.7.5 standing approval) → auto-approve regardless of tier"
+    if not envelope.passed:
+        rationale = f"envelope checks failed ({', '.join(envelope.failures)}) → human review"
+    elif certified:
+        rationale = "certified profile (§6.7.5 standing approval) → auto-approve (independent of the tier gate)"
+    elif not auto_approval_enabled:
+        rationale = "routine-tier auto-approval gate is off (maintainer) → human review"
     elif track == "elevated":
         rationale = f"{research_class} is elevated-ethics → human review"
     elif track == "unknown":
         rationale = f"class {research_class!r} is not routine → human review"
     elif not tier_ok:
         rationale = f"tenant tier T{tenant_tier} below T{int(auto_tier)} → human review"
-    elif not envelope.passed:
-        rationale = f"envelope checks failed ({', '.join(envelope.failures)}) → human review"
     else:
         rationale = (
             f"{research_class} routine + tier T{tenant_tier} >= T{int(auto_tier)} + envelope pass "

@@ -234,15 +234,18 @@ def test_decide_certified_auto_clears_low_tier():
     assert v.decision == "auto" and "certified" in v.rationale
 
 
-def test_decide_certified_respects_global_gate():
+def test_decide_certified_ignores_tier_gate():
+    # Certification is DECOUPLED from the routine-tier gate: a certified run
+    # auto-clears even with that gate OFF (certify = on, revoke = off). The
+    # certification — per-profile + signed — is its own enable.
     v = decide(
         research_class="behavioral_drift",
         tenant_tier=0,
         envelope=_envelope(True),
-        auto_approval_enabled=False,  # maintainer kill-switch
+        auto_approval_enabled=False,  # routine-tier gate off
         certified=True,
     )
-    assert v.decision == "review"
+    assert v.decision == "auto"
 
 
 def test_decide_certified_respects_envelope():
