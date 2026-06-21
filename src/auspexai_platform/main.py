@@ -33,6 +33,7 @@ from auspexai_platform.api import assessment_policy as assessment_policy_routes
 from auspexai_platform.api import assignments as assignment_routes
 from auspexai_platform.api import audit as audit_routes
 from auspexai_platform.api import auth as auth_routes
+from auspexai_platform.api import certifications as certification_routes
 from auspexai_platform.api import events as event_routes
 from auspexai_platform.api import experiments as experiment_routes
 from auspexai_platform.api import github_webhook as github_webhook_routes
@@ -262,6 +263,15 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["assessment-policy"],
+    )
+    app.include_router(
+        certification_routes.build_router(
+            credential_dep,
+            certified_profile_repository,
+            audit_repository,
+        ),
+        prefix="/api/v0",
+        tags=["certifications"],
     )
     app.include_router(
         promotion_policy_routes.build_router(
