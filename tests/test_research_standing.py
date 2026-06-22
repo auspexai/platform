@@ -149,3 +149,101 @@ class TestResearchStandingSummary:
         assert s.current == ResearchStanding.R2_ESTABLISHED
         # Already R2 → the R1→R2 review gate no longer applies.
         assert s.eligible_for_r2_review is False
+
+
+class TestResearchStandingRoute:
+    """Increment 2 — the promotion action (human, audited, gate-warned, never auto)
+    + the reviewer dossier (D8)."""
+
+    @staticmethod
+    def _h(maintainer_token):
+        return {"Authorization": f"Bearer {maintainer_token}"}
+
+    def _earn(self, manifest_repository, experiment_repository, db, tenant_id, n=3):
+        attestations = AttestationRepository(db)
+        for i in range(n):
+            mh = _manifest(manifest_repository, tenant_id, {"experiment_id": f"e{i}", "n": i})
+            _experiment(experiment_repository, attestations, tenant_id, f"e{i}", mh)
+
+    def test_dossier_returns_summary_and_history(
+        self, client, maintainer_token, manifest_repository, experiment_repository, db, acct_tenant
+    ):
+        account_id, tenant_id = acct_tenant
+        self._earn(manifest_repository, experiment_repository, db, tenant_id, n=1)
+        r = client.get(
+            f"/api/v0/accounts/{account_id}/research-standing", headers=self._h(maintainer_token)
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["current_name"] == "R1_VERIFIED"
+        assert body["distinct_clean_completed_verified"] == 1
+        assert len(body["experiments"]) == 1 and body["experiments"][0]["experiment_id"]
+
+    def test_promote_eligible_no_warning(
+        self,
+        client,
+        maintainer_token,
+        account_repository,
+        manifest_repository,
+        experiment_repository,
+        db,
+        acct_tenant,
+    ):
+        account_id, tenant_id = acct_tenant
+        self._earn(manifest_repository, experiment_repository, db, tenant_id, n=3)
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/promote-research-standing",
+            headers=self._h(maintainer_token),
+            json={"target": 2, "reason": "3 clean drift studies, ethics-reviewed"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["research_standing"] == 2
+        assert r.json()["gate_override"] is False and r.json()["gate_warnings"] == []
+        assert (
+            account_repository.get_by_id(account_id).research_standing
+            == ResearchStanding.R2_ESTABLISHED
+        )
+
+    def test_promote_below_floor_warns_but_allows(
+        self, client, maintainer_token, account_repository, acct_tenant
+    ):
+        account_id, _ = acct_tenant  # no experiments → below the competence floor
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/promote-research-standing",
+            headers=self._h(maintainer_token),
+            json={"target": 2, "reason": "trusted colleague, fast-tracking"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["research_standing"] == 2  # warn-but-ALLOW (mandatory reason recorded)
+        assert r.json()["gate_override"] is True
+        assert any("threshold not met" in w for w in r.json()["gate_warnings"])
+
+    def test_promote_must_be_one_step(self, client, maintainer_token, acct_tenant):
+        account_id, _ = acct_tenant  # current R1
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/promote-research-standing",
+            headers=self._h(maintainer_token),
+            json={"target": 3, "reason": "skip R2"},  # R1→R3 is not one step
+        )
+        assert r.status_code == 422
+
+    def test_promote_r2_to_r3_warns_out_of_band(self, client, maintainer_token, acct_tenant, db):
+        account_id, _ = acct_tenant
+        with db.transaction() as cur:
+            cur.execute(
+                "UPDATE accounts SET research_standing = 2 WHERE account_id = ?", (account_id,)
+            )
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/promote-research-standing",
+            headers=self._h(maintainer_token),
+            json={"target": 3, "reason": "extended clean R2 record, vetted"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["research_standing"] == 3
+        # R3 is a trust judgment (arc §3.3) — surfaces the out-of-band reminder.
+        assert any("out-of-band" in w for w in r.json()["gate_warnings"])
+
+    def test_dossier_requires_maintainer(self, client, acct_tenant):
+        account_id, _ = acct_tenant
+        r = client.get(f"/api/v0/accounts/{account_id}/research-standing")  # no auth
+        assert r.status_code in (401, 403)

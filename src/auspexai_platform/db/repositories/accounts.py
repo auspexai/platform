@@ -330,6 +330,57 @@ class AccountRepository:
             eligible_for_r2_review=eligible,
         )
 
+    def research_standing_history(self, account_id: str) -> list[dict]:
+        """The attested experiment history behind the summary — the DOSSIER a
+        reviewer judges (D8): WHAT the researcher actually ran, not just a count.
+        One row per completed, evidence-attested experiment, newest first. The
+        human R2/R3 review reads this (plus the §6.1 application materials surfaced
+        in the tenant-applications queue), so the gate isn't a rubber-stamp on a
+        GitHub handle. See vigiles_onramp_phase4_design.md §1.4."""
+        rows = self.db.execute(
+            """
+            SELECT e.experiment_id, e.tenant_id, e.manifest_hash, e.research_class,
+                   e.completed_at, a.rekor_log_index
+            FROM experiments e
+            JOIN tenants t ON e.tenant_id = t.tenant_id
+            JOIN attestations a
+              ON a.experiment_id = e.experiment_id AND a.partial = 0
+            WHERE t.account_id = ? AND e.status = 'completed'
+            ORDER BY e.completed_at DESC
+            """,
+            (account_id,),
+        )
+        return [
+            {
+                "experiment_id": r["experiment_id"],
+                "tenant_id": r["tenant_id"],
+                "manifest_hash": r["manifest_hash"],
+                "research_class": r["research_class"],
+                "completed_at": r["completed_at"],
+                "rekor_log_index": r["rekor_log_index"],
+            }
+            for r in rows
+        ]
+
+    def set_research_standing(self, account_id: str, *, new_standing: ResearchStanding) -> Account:
+        """Set the account's research_standing — a HUMAN act (ethics review /
+        maintainer vetting), NEVER auto: the standing summary only earns the review.
+        Caller does the gate validation + audit (the API endpoint). Raises
+        AccountNotFoundError if unknown / retired / suspended."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE accounts SET research_standing = ?
+                WHERE account_id = ? AND retired_at IS NULL AND suspended_at IS NULL
+                """,
+                (int(new_standing), account_id),
+            )
+            if cur.rowcount == 0:
+                raise AccountNotFoundError(account_id)
+        got = self.get_by_id(account_id)
+        assert got is not None
+        return got
+
     # ---- binding-token writes ----
 
     def issue_binding(

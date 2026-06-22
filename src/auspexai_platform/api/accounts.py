@@ -46,6 +46,7 @@ from auspexai_platform.auth.dependency import enforce_worker_active
 from auspexai_platform.db.models import (
     IdentityProvider,
     IdentityVerificationMethod,
+    ResearchStanding,
     TrustTier,
 )
 from auspexai_platform.db.repositories import AccountRepository, AuditRepository
@@ -111,6 +112,34 @@ class AccountTrustResponse(BaseModel):
     affected_worker_ids: list[str] = Field(default_factory=list)
     gate_override: bool = False
     gate_warnings: list[str] = Field(default_factory=list)
+
+
+class PromoteResearchStandingRequest(BaseModel):
+    # R2 (established → BYOT) or R3 (trusted → high-risk eligible). R1 is the bound
+    # default; R0 is the no-account state. One step up at a time.
+    target: int = Field(ge=2, le=3)
+    reason: str  # mandatory — every trust action carries a recorded reason
+
+
+class ResearchStandingResponse(BaseModel):
+    account_id: str
+    research_standing: int
+    research_standing_name: str
+    gate_override: bool = False
+    gate_warnings: list[str] = Field(default_factory=list)
+
+
+class ResearchDossierResponse(BaseModel):
+    """The reviewer's view (D8): the standing summary + the attested experiment
+    history a human judges before promoting — not a rubber-stamp on a handle."""
+
+    account_id: str
+    current: int
+    current_name: str
+    distinct_clean_completed_verified: int
+    threshold: int
+    eligible_for_r2_review: bool
+    experiments: list[dict] = Field(default_factory=list)
 
 
 class VouchRequest(BaseModel):
@@ -452,6 +481,107 @@ def build_router(
             affected_worker_ids=affected,
             gate_override=bool(gate_warnings),
             gate_warnings=gate_warnings,
+        )
+
+    @router.post(
+        "/accounts/{account_id}/actions/promote-research-standing",
+        response_model=ResearchStandingResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def promote_research_standing(
+        account_id: str,
+        body: PromoteResearchStandingRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ResearchStandingResponse:
+        """Promote an account's research-standing ONE step (R1→R2 / R2→R3). A HUMAN
+        act (ethics review / maintainer vetting) — NEVER auto: the standing summary
+        only earns the review. Warn-but-allow on the R2 competence gate; the reason
+        is recorded either way. See vigiles_onramp_phase4_design.md §0/§1/§8 D2."""
+        _require_maintainer(credential)
+        account = account_repository.get_by_id(account_id)
+        if account is None or account.retired_at is not None:
+            raise HTTPException(status_code=404, detail="account not found")
+        if account.suspended_at is not None:
+            raise HTTPException(status_code=409, detail="account is suspended")
+
+        current = account.research_standing
+        target = ResearchStanding(body.target)
+        if int(target) != int(current) + 1:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"can only promote one step: current={int(current)}, requested={int(target)}"
+                ),
+            )
+
+        gate_warnings: list[str] = []
+        if target == ResearchStanding.R2_ESTABLISHED:
+            summary = account_repository.research_standing_summary(account_id)
+            if not summary.eligible_for_r2_review:
+                gate_warnings.append(
+                    "R2 competence threshold not met "
+                    f"({summary.distinct_clean_completed_verified}/{summary.threshold} "
+                    "distinct, completed, evidence-attested experiments) — promoting "
+                    "below the floor"
+                )
+        elif target == ResearchStanding.R3_TRUSTED:
+            # R2→R3 is a trust judgment competence can't prove (arc §3.3): NO
+            # mechanical criterion — out-of-band vetting (verify a real affiliation /
+            # linked ORCID) before granting high-risk eligibility.
+            if account.identity_verified_at is None:
+                gate_warnings.append(
+                    "R3 is a trust judgment, not a competence threshold — verify the "
+                    "researcher's real identity/affiliation (e.g. a linked ORCID) "
+                    "out-of-band; on-network history cannot establish it"
+                )
+
+        account = account_repository.set_research_standing(account_id, new_standing=target)
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=credential.maintainer_login,
+            action="account.promote_research_standing",
+            resource_type="account",
+            resource_id=account_id,
+            payload={
+                "old_standing": int(current),
+                "new_standing": int(target),
+                "reason": body.reason,
+                "gate_override": bool(gate_warnings),
+                "gate_warnings": gate_warnings,
+            },
+        )
+        return ResearchStandingResponse(
+            account_id=account_id,
+            research_standing=int(target),
+            research_standing_name=target.name,
+            gate_override=bool(gate_warnings),
+            gate_warnings=gate_warnings,
+        )
+
+    @router.get(
+        "/accounts/{account_id}/research-standing",
+        response_model=ResearchDossierResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def research_standing_dossier(
+        account_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ResearchDossierResponse:
+        """The reviewer's dossier (D8): the standing summary + the attested
+        experiment history a human reads before promoting. Maintainer-only."""
+        _require_maintainer(credential)
+        account = account_repository.get_by_id(account_id)
+        if account is None or account.retired_at is not None:
+            raise HTTPException(status_code=404, detail="account not found")
+        summary = account_repository.research_standing_summary(account_id)
+        return ResearchDossierResponse(
+            account_id=account_id,
+            current=int(summary.current),
+            current_name=summary.current.name,
+            distinct_clean_completed_verified=summary.distinct_clean_completed_verified,
+            threshold=summary.threshold,
+            eligible_for_r2_review=summary.eligible_for_r2_review,
+            experiments=account_repository.research_standing_history(account_id),
         )
 
     @router.post(
