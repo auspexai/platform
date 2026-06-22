@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from auspexai_platform.db.models import TrustTier
+from auspexai_platform.db.models import ResearchStanding, TrustTier
 
 # The §11 taxonomy (single source = api.tenant_applications.RESEARCH_CLASSES;
 # duplicated here for clean layering, guarded by a drift test).
@@ -175,6 +175,9 @@ def decide(
     auto_tier: TrustTier | int = AUTO_APPROVE_TIER,
     auto_approval_enabled: bool = True,
     certified: bool = False,
+    # D9 Phase 4 (§2). Default R2 so this stays policy-neutral for unit tests; the
+    # real caller passes the submitting account's research_standing.
+    research_standing: int = int(ResearchStanding.R2_ESTABLISHED),
 ) -> AssessmentDecision:
     """The authoritative admission decision. `auto` requires every envelope check
     to pass, AND one of two INDEPENDENT paths:
@@ -200,7 +203,14 @@ def decide(
     auto-approve until a maintainer turns the gate on."""
     track = class_track(research_class)
     tier_ok = int(tenant_tier) >= int(auto_tier)
-    routine_auto = auto_approval_enabled and track == "routine" and tier_ok
+    # D9 Phase 4 (§2, warn-but-allow): the routine-tier path runs UNCERTIFIED (own /
+    # frontier) code, so it requires research-standing R2 (BYOT). Below R2 → no
+    # auto-approval; routed to human review (the maintainer promotes to R2, or
+    # approves per-experiment). The CERTIFIED path is EXEMPT — a certified starter
+    # auto-clears for any R1+. R-standing is "necessary, never sufficient": it gates
+    # auto-approval; the §6 review still decides.
+    byot_ok = int(research_standing) >= int(ResearchStanding.R2_ESTABLISHED)
+    routine_auto = auto_approval_enabled and track == "routine" and tier_ok and byot_ok
     auto = envelope.passed and (certified or routine_auto)
 
     if not envelope.passed:
@@ -215,6 +225,12 @@ def decide(
         rationale = f"class {research_class!r} is not routine → human review"
     elif not tier_ok:
         rationale = f"tenant tier T{tenant_tier} below T{int(auto_tier)} → human review"
+    elif not byot_ok:
+        rationale = (
+            f"research-standing R{research_standing} below R2 → bringing own "
+            "(uncertified) code is BYOT (R2+); routed to human review (promote to R2, "
+            "or approve per-experiment)"
+        )
     else:
         rationale = (
             f"{research_class} routine + tier T{tenant_tier} >= T{int(auto_tier)} + envelope pass "

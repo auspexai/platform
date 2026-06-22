@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from auspexai_platform.config import Config
 from auspexai_platform.db import Database, MigrationRunner
-from auspexai_platform.db.models import TrustTier
+from auspexai_platform.db.models import ResearchStanding, TrustTier
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AccountRepository,
@@ -83,6 +83,7 @@ class CoordinatorServices:
     eligibility_thresholds: EligibilityThresholds
     account_suspended_for_tenant: Callable[[str], bool]
     tenant_tier: Callable[[str], int]
+    tenant_research_standing: Callable[[str], int]  # D9 Phase 4: the BYOT gate input
     approved_classes: Callable[[str], list[str] | None]
     auto_approval_gate: Callable[[], tuple[bool, int]]
     governance_footprint_for: Callable
@@ -151,6 +152,20 @@ def build_coordinator_services(
             return int(TrustTier.T1_AUTHENTICATED)
         account = account_repository.get_by_id(tenant.account_id)
         return int(account.trust_tier) if account is not None else int(TrustTier.T1_AUTHENTICATED)
+
+    def _tenant_research_standing(tenant_id: str) -> int:
+        # D9 Phase 4 (§2): tenant → account → research_standing (R0-R3), the BYOT gate
+        # input. A tenant without an account (legacy) floors at R1 — below R2, so it
+        # can't bring uncertified (frontier) code; it runs certified starters only.
+        tenant = tenant_repository.get_by_id(tenant_id)
+        if tenant is None or tenant.account_id is None:
+            return int(ResearchStanding.R1_VERIFIED)
+        account = account_repository.get_by_id(tenant.account_id)
+        return (
+            int(account.research_standing)
+            if account is not None
+            else int(ResearchStanding.R1_VERIFIED)
+        )
 
     def _approved_classes(tenant_id: str) -> list[str] | None:
         # §9 #48 envelope scope check: the classes the tenant was approved for.
@@ -263,6 +278,7 @@ def build_coordinator_services(
         eligibility_thresholds=eligibility_thresholds,
         account_suspended_for_tenant=_account_suspended_for_tenant,
         tenant_tier=_tenant_tier,
+        tenant_research_standing=_tenant_research_standing,
         approved_classes=_approved_classes,
         auto_approval_gate=_auto_approval_gate,
         governance_footprint_for=_governance_footprint_for,

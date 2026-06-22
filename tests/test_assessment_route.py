@@ -11,7 +11,12 @@ import secrets
 
 from fastapi.testclient import TestClient
 
-from auspexai_platform.db.models import ExperimentStatus, IdentityProvider, TrustTier
+from auspexai_platform.db.models import (
+    ExperimentStatus,
+    IdentityProvider,
+    ResearchStanding,
+    TrustTier,
+)
 
 
 def _pub() -> str:
@@ -41,6 +46,11 @@ def _t2_tenant(account_repo, tenant_repo, tenant_id):
         idp=IdentityProvider.GITHUB,
         idp_sub=f"gh-{tenant_id}",
         trust_tier=TrustTier.T2_TRUSTED,
+    )
+    # D9 Phase 4: a trusted tenant whose researcher is also ESTABLISHED (R2) — eligible
+    # to BYOT, so its uncertified routine work auto-approves (T2 compute + R2 research).
+    account_repo.set_research_standing(
+        acct.account_id, new_standing=ResearchStanding.R2_ESTABLISHED
     )
     tenant_repo.register(tenant_id=tenant_id, maintainer_pubkey=_pub(), account_id=acct.account_id)
 
@@ -85,6 +95,41 @@ def test_routine_trusted_auto_approves(
     got = experiment_repository.get_by_id(exp.experiment_id)
     assert got.status == ExperimentStatus.APPROVED
     assert got.assessment_decision == "auto" and got.research_class == "behavioral_drift"
+
+
+def test_byot_below_r2_routes_to_review(
+    client: TestClient,
+    maintainer_token,
+    account_repository,
+    tenant_repository,
+    manifest_repository,
+    experiment_repository,
+):
+    """D9 Phase 4 (§2, warn-but-allow): a T2-COMPUTE but R1-RESEARCH tenant is trusted
+    to contribute compute, but not yet ESTABLISHED to bring its own (uncertified) code.
+    Its routine work routes to REVIEW, not auto — the BYOT R2 gate. (§6 review then
+    decides; promoting to R2 clears it.)"""
+    acct = account_repository.create(
+        account_id="acct-byot",
+        idp=IdentityProvider.GITHUB,
+        idp_sub="gh-byot",
+        trust_tier=TrustTier.T2_TRUSTED,
+    )  # research_standing left at the R1 default
+    tenant_repository.register(
+        tenant_id="byot-lab", maintainer_pubkey=_pub(), account_id=acct.account_id
+    )
+    exp = _submit_exp(
+        manifest_repository,
+        experiment_repository,
+        tenant_id="byot-lab",
+        label="byot-1",
+        research_class="behavioral_drift",
+    )
+    r = _assess(client, exp.experiment_id, maintainer_token)
+    assert r.status_code == 200, r.text
+    # T2 compute + routine class would normally auto-approve; R1 research holds it back.
+    assert r.json()["decision"] == "review"
+    assert experiment_repository.get_by_id(exp.experiment_id).status != ExperimentStatus.APPROVED
 
 
 def test_elevated_never_auto_even_at_t2(

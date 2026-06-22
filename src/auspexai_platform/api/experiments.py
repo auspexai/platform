@@ -43,6 +43,7 @@ from auspexai_platform.db.models import (
     INTEGRITY_POLICY_REPLICATION,
     ExperimentStatus,
     IntegrityPolicy,
+    ResearchStanding,
     TrustTier,
 )
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
@@ -403,6 +404,9 @@ def build_router(
     # the router builds in tests without them — defaults make every experiment
     # route to human review (tier T1, no scope, no catalog).
     tenant_tier: Callable[[str], int] | None = None,
+    # D9 Phase 4 (§2): tenant → research_standing (R0-R3), the BYOT gate input. None
+    # in tests / unwired → the gate is a no-op (no frontier submission is rejected).
+    tenant_research_standing: Callable[[str], int] | None = None,
     approved_classes: Callable[[str], list[str] | None] | None = None,
     served_model_ids: Callable[[], set[str] | None] | None = None,
     # §9 #48 inc-4: the runtime auto-approval gate, read server-authoritatively
@@ -826,6 +830,11 @@ def build_router(
             if tenant_tier is not None
             else int(TrustTier.T1_AUTHENTICATED)
         )
+        r_standing = (
+            tenant_research_standing(experiment.tenant_id)
+            if tenant_research_standing is not None
+            else int(ResearchStanding.R2_ESTABLISHED)
+        )
         approved = approved_classes(experiment.tenant_id) if approved_classes is not None else None
         served = served_model_ids() if served_model_ids is not None else None
 
@@ -856,6 +865,7 @@ def build_router(
             auto_tier=gate_min_tier,
             auto_approval_enabled=gate_enabled,
             certified=cert is not None,
+            research_standing=r_standing,
         )
         assessed_by = credential.maintainer_login or "maintainer"
         # Denormalize the certification provenance onto the experiment's rationale so
