@@ -37,6 +37,34 @@ class TrustTier(IntEnum):
     T3_VETTED = 3
 
 
+# K — the R2-review threshold (vigiles_onramp_phase4_design.md §8 D1). Clearing it
+# earns the R2 ETHICS REVIEW, never the promotion itself. There is no statistical
+# optimum — K is a competence floor + spam-cost lever, not a reliability estimate;
+# the rigor is the quality-weighting + the human review, not K's magnitude.
+R2_REVIEW_THRESHOLD = 3
+
+
+class ResearchStanding(IntEnum):
+    """Researcher research-standing (R0-R3) — the Vigiles on-ramp ladder (D9 Phase 4).
+
+    ORTHOGONAL to TrustTier (compute): R measures "proposes and sees through
+    well-formed, ethics-clean experiments"; T measures "contributes honest
+    compute." They must not be collapsed (running many experiments must never
+    lower your own experiments' replication floor — that privilege lives on T).
+
+    Stored as INTEGER so >=/<= gating works (R2+ → BYOT; R3 → high-risk eligible).
+    R0 is the no-account state (SDK installed, unverified); a bound account is R1+
+    (OAuth-verified). R1→R2 and R2→R3 are HUMAN promotions (ethics review /
+    maintainer vetting) — NEVER auto-promoted; the standing summary only earns the
+    review. See vigiles_onramp_phase4_design.md §0/§1.
+    """
+
+    R0_UNVERIFIED = 0
+    R1_VERIFIED = 1
+    R2_ESTABLISHED = 2
+    R3_TRUSTED = 3
+
+
 class IdentityProvider(StrEnum):
     """Identity providers the coordinator accepts for account binding.
 
@@ -222,6 +250,26 @@ class IdentityVerificationMethod(StrEnum):
     INSTITUTIONAL_EMAIL = "institutional_email"
 
 
+class ResearchStandingSummary(BaseModel):
+    """Recomputed (never stored) research-standing evidence for an account — the
+    R2-review eligibility signal derived from the account's ATTESTED experiment
+    history. Reward-independent and externally verifiable (the firewall property);
+    it earns the human R2 ethics review, it does not promote. See
+    AccountRepository.research_standing_summary + vigiles_onramp_phase4_design.md §1.2.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: str
+    current: ResearchStanding
+    # distinct (by manifest_hash), completed (terminal consensus), evidence-attested
+    # (a final attestation exists) experiments the account has run.
+    distinct_clean_completed_verified: int
+    threshold: int = R2_REVIEW_THRESHOLD
+    # current == R1 AND count >= threshold. Eligibility only; the promotion is human.
+    eligible_for_r2_review: bool
+
+
 class Account(BaseModel):
     """A row in the `accounts` table — one human identity bound to one IdP."""
 
@@ -238,6 +286,10 @@ class Account(BaseModel):
     public_attribution: bool = False
     attribution_name: str | None = None
     trust_tier: TrustTier = TrustTier.T1_AUTHENTICATED
+    # Research-standing (R0-R3), ORTHOGONAL to trust_tier (compute). A bound account
+    # defaults to R1 (OAuth-verified); R2/R3 are reached only by HUMAN promotion
+    # (ethics review / maintainer vetting). See research_standing_summary + §1 design.
+    research_standing: ResearchStanding = ResearchStanding.R1_VERIFIED
     created_at: datetime
     retired_at: datetime | None = None
     identity_verified_at: datetime | None = None

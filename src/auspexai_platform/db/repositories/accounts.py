@@ -21,10 +21,13 @@ from datetime import UTC, datetime, timedelta
 
 from auspexai_platform.db.database import Database
 from auspexai_platform.db.models import (
+    R2_REVIEW_THRESHOLD,
     Account,
     IdentityProvider,
     IdentityVerificationMethod,
     OAuthBinding,
+    ResearchStanding,
+    ResearchStandingSummary,
     TrustTier,
 )
 
@@ -289,6 +292,44 @@ class AccountRepository:
         )
         return self._row_to_account(rows[0]) if rows else None
 
+    def research_standing_summary(self, account_id: str) -> ResearchStandingSummary:
+        """Recompute (never store) the account's research-standing evidence — the
+        count of DISTINCT-config, completed, evidence-attested experiments it has
+        run — and whether that clears the R2-review threshold. Reward-independent,
+        derived from attested history (the firewall property): it earns the human
+        R2 ethics review, it does NOT promote (R1→R2 is a human act). See
+        vigiles_onramp_phase4_design.md §1.2/§1.3.
+
+        - distinct  = distinct experiments.manifest_hash (content-addressed config;
+          trivial reruns share a hash → counted once),
+        - completed = experiments.status == 'completed' (terminal consensus; an
+          aborted/declined run is excluded — the increment-1 proxy for ethics-clean,
+          refinable later with a finer violation signal),
+        - verified  = a FINAL attestation (partial = 0) exists for the experiment.
+        """
+        rows = self.db.execute(
+            """
+            SELECT COUNT(DISTINCT e.manifest_hash) AS n
+            FROM experiments e
+            JOIN tenants t ON e.tenant_id = t.tenant_id
+            JOIN attestations a
+              ON a.experiment_id = e.experiment_id AND a.partial = 0
+            WHERE t.account_id = ? AND e.status = 'completed'
+            """,
+            (account_id,),
+        )
+        count = int(rows[0]["n"]) if rows else 0
+        acct = self.get_by_id(account_id)
+        current = acct.research_standing if acct else ResearchStanding.R0_UNVERIFIED
+        eligible = current == ResearchStanding.R1_VERIFIED and count >= R2_REVIEW_THRESHOLD
+        return ResearchStandingSummary(
+            account_id=account_id,
+            current=current,
+            distinct_clean_completed_verified=count,
+            threshold=R2_REVIEW_THRESHOLD,
+            eligible_for_r2_review=eligible,
+        )
+
     # ---- binding-token writes ----
 
     def issue_binding(
@@ -375,6 +416,9 @@ class AccountRepository:
             display_name=row["display_name"],
             email=row["email"],
             trust_tier=TrustTier(row["trust_tier"]),
+            research_standing=ResearchStanding(
+                row["research_standing"] if "research_standing" in row.keys() else 1
+            ),
             created_at=datetime.fromisoformat(row["created_at"]),
             retired_at=(datetime.fromisoformat(row["retired_at"]) if row["retired_at"] else None),
             identity_verified_at=(
