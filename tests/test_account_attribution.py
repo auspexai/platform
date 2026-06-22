@@ -25,7 +25,8 @@ def test_attribution_default_off_then_opt_in_and_out(
     assert r.json()["public_attribution"] is False
     assert r.json()["attribution_name"] is None
 
-    # Opt in with a chosen name.
+    # Opt in — a client-supplied name is IGNORED (hardened: credit always uses the
+    # verified GitHub identity = display_name, so a citation can't carry a fake name).
     r = client.put(
         "/api/v0/accounts/acct-ada/attribution",
         headers=h,
@@ -34,7 +35,7 @@ def test_attribution_default_off_then_opt_in_and_out(
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["public_attribution"] is True
-    assert body["attribution_name"] == "Ada Lovelace"
+    assert body["attribution_name"] is None  # sent name dropped — verified identity only
 
     # Persists across a fresh GET.
     assert (
@@ -105,7 +106,7 @@ def test_attribution_change_is_audited(
     assert rows, "consent change to public attribution was not audited"
     payload = rows[0].payload
     assert payload["public_attribution"] is True
-    assert payload["attribution_name"] == "Grace"
+    assert payload["attribution_name"] is None  # client-supplied name ignored (hardened)
     assert payload["previous_public_attribution"] is False  # default was opted-out
 
     # Opting back out is also audited (old -> new captured).

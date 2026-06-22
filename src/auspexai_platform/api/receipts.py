@@ -209,7 +209,11 @@ def _experiment_contributors(
     for account_id, at_issue in opted_in_at_issue.items():
         acct = account_repository.get_by_id(account_id)
         if at_issue and acct is not None and acct.public_attribution:
-            named.append(acct.attribution_name or acct.display_name or account_id)
+            # Credit ALWAYS uses the verified identity (display_name = the GitHub login
+            # captured at OAuth), never a self-set attribution_name — citation is only
+            # meaningful with real credentials. attribution_name is vestigial (the PUT
+            # ignores it); ignored here too so any legacy value can't surface.
+            named.append(acct.display_name or account_id)
         else:
             anonymous += 1
     named.sort(key=str.lower)
@@ -839,9 +843,13 @@ def build_router(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> AccountAttributionResponse:
         """Set this account's public-citation opt-in (System B, D). Account-self or
-        maintainer. The name (when opting in) falls back to display_name if blank."""
+        maintainer. Credit ALWAYS uses the verified GitHub identity (display_name) — any
+        `attribution_name` in the body is ignored, so a citation can't carry a fake name."""
         _require_account_self_or_maintainer(credential, account_id, account_repository)
-        name = (body.attribution_name or "").strip() or None
+        # HARDENED: ignore body.attribution_name entirely — even a hand-crafted signed
+        # request can't store a self-chosen name. The credit chain uses display_name only;
+        # the field is accepted-but-ignored for client back-compat (vestigial).
+        name = None
         previous = account_repository.get_by_id(account_id)
         try:
             account = account_repository.set_attribution(

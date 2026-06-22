@@ -65,7 +65,9 @@ class _Account:
 
 class _AcctRepo:
     _map: ClassVar[dict] = {
-        "a_named": _Account(True, "Ada Lovelace", "ada"),  # at_issue=T, now=T → NAMED
+        # at_issue=T, now=T → NAMED as the verified display_name "ada" (the GitHub
+        # login); the attribution_name "Ada Lovelace" is IGNORED (hardened — no fake names).
+        "a_named": _Account(True, "Ada Lovelace", "ada"),
         "a_optout": _Account(False, None, "bob"),  # at_issue=T, now=F → anon (opt-out)
         "a_late": _Account(True, "Grace", "grace"),  # at_issue=F, now=T → anon (non-retroactive)
     }
@@ -78,8 +80,9 @@ def test_contributors_non_retroactive_and_reversible() -> None:
     named, anonymous, total = _experiment_contributors(
         "exp-x", _ReceiptIndex(), _WorkerRepo(), _AcctRepo()
     )
-    # Only a_named: opted in at contribution AND still opted in.
-    assert named == ["Ada Lovelace"]
+    # Only a_named: opted in at contribution AND still opted in. Credit = the verified
+    # display_name ("ada"), NOT the now-ignored attribution_name ("Ada Lovelace").
+    assert named == ["ada"]
     # a_optout (withdrew consent) + a_late (opted in only AFTER contributing) both anonymous.
     assert anonymous == 2
     # 3 contributor accounts; w_t0 has no account → not counted.
