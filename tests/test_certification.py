@@ -419,3 +419,59 @@ def test_backfill_cert_rekor_anchors_and_is_idempotent(db):
     # idempotent: already anchored → no candidates
     again = backfill_cert_rekor(db, rekor_client=_FakeRekor(), apply=True)
     assert again.candidates == 0 and not again.anchored
+
+
+# ---- reissue (label correction / snapshot re-cut, §6.7) ----
+
+
+def test_reissue_relabels_resigns_and_resets_anchor(db):
+    repo = CertifiedProfileRepository(db)
+    _insert(repo)  # snapshot vigiles-tenant@v0.1.0
+    repo.set_rekor("a" * 64, log_index=999)  # pretend the v0.1.0 cert was anchored
+    assert repo.get_by_package("a" * 64).rekor_log_index == 999
+
+    old, _rec = repo.reissue(
+        package_sha256="a" * 64,
+        snapshot_version="vigiles-tenant@v0.1.1",
+        tenant_id="vigiles-lab",
+        profile_name="starter",
+        research_class="behavioral_drift",
+        sensitive_content_flags=[],
+        model_ids=["gemma-3-1b-it-q4"],
+        replication_floor=2,
+        max_units_ceiling=None,
+        duration_hours_ceiling=1.0,
+        cose_signed_blob=b"\x09\x09",  # re-signed blob
+        signing_key_pubkey_hex="ff" * 32,
+        certified_by="maintainer:jasongagne-git",
+    )
+    assert old == "vigiles-tenant@v0.1.0"
+    got = repo.get_by_package("a" * 64)
+    assert got.snapshot_version == "vigiles-tenant@v0.1.1"  # re-labeled
+    assert got.status == "certified"
+    assert got.cose_signed_blob == b"\x09\x09"  # re-signed
+    assert got.rekor_log_index is None  # reset → the new cert re-anchors
+    # still exactly one row for this package (content key is the PK)
+    assert len(repo.list_all()) == 1
+
+
+def test_reissue_missing_raises(db):
+    from auspexai_platform.db.repositories.certified_profiles import NoCertificationError
+
+    repo = CertifiedProfileRepository(db)
+    with pytest.raises(NoCertificationError):
+        repo.reissue(
+            package_sha256="b" * 64,
+            snapshot_version="x",
+            tenant_id="t",
+            profile_name="p",
+            research_class=None,
+            sensitive_content_flags=[],
+            model_ids=[],
+            replication_floor=2,
+            max_units_ceiling=None,
+            duration_hours_ceiling=None,
+            cose_signed_blob=b"x",
+            signing_key_pubkey_hex="ff",
+            certified_by="m",
+        )

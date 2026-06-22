@@ -29,6 +29,10 @@ class DuplicateCertificationError(Exception):
     a new row."""
 
 
+class NoCertificationError(Exception):
+    """`reissue` was asked to replace a certification that does not exist."""
+
+
 @dataclass(frozen=True)
 class CertifiedProfileRecord:
     """One certification. `cose_signed_blob` is the verifiable artifact; the rest
@@ -82,14 +86,18 @@ class CertifiedProfileRepository:
         signing_key_pubkey_hex: str,
         certified_by: str,
         advisor: str | None = None,
+        replace: bool = False,
     ) -> CertifiedProfileRecord:
         """Register a certification. Raises DuplicateCertificationError if this
-        exact package digest is already certified."""
+        exact package digest is already certified — UNLESS `replace=True` (an
+        atomic INSERT OR REPLACE for `reissue`, which resets the Rekor anchor so
+        the new label re-anchors)."""
         certified_at = datetime.now(UTC).isoformat()
+        verb = "INSERT OR REPLACE INTO" if replace else "INSERT INTO"
         try:
             self.db.execute(
-                """
-                INSERT INTO certified_profiles
+                f"""
+                {verb} certified_profiles
                   (package_sha256, snapshot_version, tenant_id, profile_name,
                    research_class, sensitive_content_flags, model_ids,
                    replication_floor, max_units_ceiling, duration_hours_ceiling,
@@ -120,6 +128,54 @@ class CertifiedProfileRepository:
         got = self.get_by_package(package_sha256)
         assert got is not None
         return got
+
+    def reissue(
+        self,
+        *,
+        package_sha256: str,
+        snapshot_version: str,
+        tenant_id: str,
+        profile_name: str,
+        research_class: str | None,
+        sensitive_content_flags: list[str],
+        model_ids: list[str],
+        replication_floor: int,
+        max_units_ceiling: int | None,
+        duration_hours_ceiling: float | None,
+        cose_signed_blob: bytes,
+        signing_key_pubkey_hex: str,
+        certified_by: str,
+        advisor: str | None = None,
+    ) -> tuple[str, CertifiedProfileRecord]:
+        """Replace the certification for an ALREADY-certified package — a label /
+        snapshot-version correction, or a re-cut release of identical content. The
+        content binding (`package_sha256`) is unchanged; this re-signs + re-labels the
+        row in place (atomic INSERT OR REPLACE) and resets the Rekor anchor so the new
+        certificate re-anchors. Returns (previous snapshot_version, new record) for the
+        audit trail. Raises NoCertificationError if there is nothing to reissue."""
+        existing = self.get_by_package(package_sha256)
+        if existing is None:
+            raise NoCertificationError(
+                f"no certification for package {package_sha256[:16]}… to reissue"
+            )
+        rec = self.insert(
+            package_sha256=package_sha256,
+            snapshot_version=snapshot_version,
+            tenant_id=tenant_id,
+            profile_name=profile_name,
+            research_class=research_class,
+            sensitive_content_flags=sensitive_content_flags,
+            model_ids=model_ids,
+            replication_floor=replication_floor,
+            max_units_ceiling=max_units_ceiling,
+            duration_hours_ceiling=duration_hours_ceiling,
+            cose_signed_blob=cose_signed_blob,
+            signing_key_pubkey_hex=signing_key_pubkey_hex,
+            certified_by=certified_by,
+            advisor=advisor,
+            replace=True,
+        )
+        return existing.snapshot_version, rec
 
     def revoke(self, package_sha256: str, *, reason: str) -> None:
         """§6.7.6 — remove a certification's standing approval. Runs of that

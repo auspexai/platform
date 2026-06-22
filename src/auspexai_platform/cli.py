@@ -474,6 +474,13 @@ def certification() -> None:
     is_flag=True,
     help="Actually sign + register. Default is a dry-run that runs the §6.7.2 checks.",
 )
+@click.option(
+    "--reissue",
+    "reissue",
+    is_flag=True,
+    help="Replace an EXISTING certification for this package (label/version correction "
+    "or re-cut release of identical content). Re-signs, re-labels, re-anchors; audited.",
+)
 def certification_issue(
     state_dir: Path | None,
     manifest_path: Path,
@@ -483,6 +490,7 @@ def certification_issue(
     advisor: str | None,
     max_units_ceiling: int | None,
     apply_changes: bool,
+    reissue: bool,
 ) -> None:
     """Certify a curated starter profile (§6.7): auto-check the §6.7.2 bar, sign the
     certificate with the coordinator key, and register it so runs of this exact
@@ -503,6 +511,7 @@ def certification_issue(
     from auspexai_platform.db.repositories.certified_profiles import (
         CertifiedProfileRepository,
         DuplicateCertificationError,
+        NoCertificationError,
     )
     from auspexai_platform.receipts.signing import load_or_generate_signing_key
 
@@ -544,30 +553,55 @@ def certification_issue(
         signing_key = load_or_generate_signing_key(config.receipt_signing_key_path)
         blob = sign_certificate(envelope, signing_key=signing_key)
         repo = CertifiedProfileRepository(db)
-        try:
-            rec = repo.insert(
-                package_sha256=envelope.package_sha256,
-                snapshot_version=envelope.snapshot_version,
-                tenant_id=envelope.tenant_id,
-                profile_name=envelope.profile_name,
-                research_class=envelope.research_class,
-                sensitive_content_flags=envelope.sensitive_content_flags,
-                model_ids=envelope.model_ids,
-                replication_floor=envelope.replication_floor,
-                max_units_ceiling=envelope.max_units_ceiling,
-                duration_hours_ceiling=envelope.duration_hours_ceiling,
-                cose_signed_blob=blob,
-                signing_key_pubkey_hex=signing_key.pubkey_hex,
-                certified_by=envelope.certified_by,
-                advisor=envelope.advisor,
+        _cert_fields = dict(
+            package_sha256=envelope.package_sha256,
+            snapshot_version=envelope.snapshot_version,
+            tenant_id=envelope.tenant_id,
+            profile_name=envelope.profile_name,
+            research_class=envelope.research_class,
+            sensitive_content_flags=envelope.sensitive_content_flags,
+            model_ids=envelope.model_ids,
+            replication_floor=envelope.replication_floor,
+            max_units_ceiling=envelope.max_units_ceiling,
+            duration_hours_ceiling=envelope.duration_hours_ceiling,
+            cose_signed_blob=blob,
+            signing_key_pubkey_hex=signing_key.pubkey_hex,
+            certified_by=envelope.certified_by,
+            advisor=envelope.advisor,
+        )
+        if reissue:
+            from auspexai_platform.auth.credential import CredentialClass
+            from auspexai_platform.db.repositories import AuditRepository
+
+            try:
+                old_snapshot, rec = repo.reissue(**_cert_fields)
+            except NoCertificationError as e:
+                click.echo(f"--reissue: {e}. Drop --reissue to certify a new package.", err=True)
+                raise SystemExit(1) from None
+            AuditRepository(db).append(
+                actor_class=CredentialClass.MAINTAINER,
+                actor_identifier=envelope.certified_by,
+                actor_tenant_id=None,
+                action="certification.reissue",
+                resource_type="certified_profile",
+                resource_id=envelope.package_sha256,
+                payload={
+                    "from_snapshot": old_snapshot,
+                    "to_snapshot": envelope.snapshot_version,
+                    "profile": f"{envelope.tenant_id}/{envelope.profile_name}",
+                },
             )
-        except DuplicateCertificationError:
-            click.echo(
-                f"Already certified: package {envelope.package_sha256[:16]}… is in the registry "
-                "(re-certifying identical content is a no-op).",
-                err=True,
-            )
-            raise SystemExit(1) from None
+            click.echo(f"  reissued: {old_snapshot} → {envelope.snapshot_version}")
+        else:
+            try:
+                rec = repo.insert(**_cert_fields)
+            except DuplicateCertificationError:
+                click.echo(
+                    f"Already certified: package {envelope.package_sha256[:16]}… is in the registry. "
+                    "Re-certifying identical content is a no-op; pass --reissue to re-label/re-cut.",
+                    err=True,
+                )
+                raise SystemExit(1) from None
         repo.supersede_others(
             tenant_id=rec.tenant_id, profile_name=rec.profile_name, keep_package=rec.package_sha256
         )
