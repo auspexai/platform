@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from auspexai_platform.auth.signature import sign_request
-from auspexai_platform.db.models import IdentityProvider
+from auspexai_platform.db.models import IdentityProvider, ResearchStanding
 from auspexai_platform.db.repositories import TenantApplicationRepository
 from auspexai_platform.events import GLOBAL
 from auspexai_platform.oauth.identity import IdentityClaim
@@ -496,8 +496,14 @@ def test_approve_creates_tenant_binds_key_and_links_account(
         path="/api/v0/auth/whoami",
     )
     assert r.status_code == 200
-    assert r.json()["credential_class"] == "researcher"
-    assert r.json()["tenant_id"] == "vigiles"
+    who = r.json()
+    assert who["credential_class"] == "researcher"
+    assert who["tenant_id"] == "vigiles"
+    # D6 contract: approval lands the researcher at R1 (the account default) —
+    # never higher. The R2 review is not yet eligible (no attested experiments);
+    # R-promotion stays a later human act, never granted at onboarding.
+    assert who["research_standing"] == int(ResearchStanding.R1_VERIFIED)
+    assert who["research_standing_eligible_for_r2"] is False
 
     assert ev.type == "application.resolved"
     assert ev.data["status"] == "approved"
