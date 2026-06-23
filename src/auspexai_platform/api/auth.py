@@ -62,6 +62,23 @@ class WhoamiResponse(BaseModel):
         default=None,
         description="Account holder only: the maintainer's reason for the suspension.",
     )
+    # D9 Phase 4 (D4): the researcher's OWN research-standing + progress toward the
+    # R2 review — surfaced to the account holder so the on-ramp is legible. Folded
+    # into whoami so the dashboard renders it beside the existing identity/readiness
+    # block (one coherent surface, no extra round-trip).
+    research_standing: Annotated[int | None, ExposureTag.ACCOUNT_SCOPED] = Field(
+        default=None, description="Account holder only: current research-standing (0-3)."
+    )
+    research_standing_distinct: Annotated[int | None, ExposureTag.ACCOUNT_SCOPED] = Field(
+        default=None,
+        description="Account holder only: distinct completed+attested experiments toward R2.",
+    )
+    research_standing_threshold: Annotated[int | None, ExposureTag.ACCOUNT_SCOPED] = Field(
+        default=None, description="Account holder only: the R2-review threshold (K)."
+    )
+    research_standing_eligible_for_r2: Annotated[bool | None, ExposureTag.ACCOUNT_SCOPED] = Field(
+        default=None, description="Account holder only: cleared the R2-review threshold."
+    )
 
 
 def build_router(credential_dep, account_repository: AccountRepository | None = None) -> APIRouter:
@@ -82,11 +99,20 @@ def build_router(credential_dep, account_repository: AccountRepository | None = 
     ) -> WhoamiResponse:
         suspended_at = None
         suspension_reason = None
+        research_standing = None
+        rs_distinct = None
+        rs_threshold = None
+        rs_eligible = None
         if account_repository is not None and credential.account_id is not None:
             account = account_repository.get_by_id(credential.account_id)
             if account is not None:
                 suspended_at = account.suspended_at
                 suspension_reason = account.suspension_reason
+                rs = account_repository.research_standing_summary(credential.account_id)
+                research_standing = int(rs.current)
+                rs_distinct = rs.distinct_clean_completed_verified
+                rs_threshold = rs.threshold
+                rs_eligible = rs.eligible_for_r2_review
 
         payload = WhoamiResponse(
             credential_class=credential.kind,
@@ -94,6 +120,10 @@ def build_router(credential_dep, account_repository: AccountRepository | None = 
             pubkey_hex=credential.pubkey_hex,
             suspended_at=suspended_at,
             suspension_reason=suspension_reason,
+            research_standing=research_standing,
+            research_standing_distinct=rs_distinct,
+            research_standing_threshold=rs_threshold,
+            research_standing_eligible_for_r2=rs_eligible,
         )
         return filter_for_credential(
             payload,
