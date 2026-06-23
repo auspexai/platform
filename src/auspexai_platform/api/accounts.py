@@ -332,6 +332,21 @@ def build_router(
                 "ready": elig.ready_for_human_review,
             }
 
+        def _r2_readiness(account) -> dict | None:
+            """Proactive R2 review-readiness for an R1 account (the R1→R2 step):
+            distinct attested experiments toward the threshold, so the maintainer sees
+            WHO has earned the review AT A GLANCE on the list, not buried in a detail
+            page. Only computed for R1 (the promotable research tier). Mirrors
+            `_t2_readiness` (compute side)."""
+            if account.research_standing != ResearchStanding.R1_VERIFIED:
+                return None
+            s = account_repository.research_standing_summary(account.account_id)
+            return {
+                "distinct": s.distinct_clean_completed_verified,
+                "threshold": s.threshold,
+                "ready": s.eligible_for_r2_review,
+            }
+
         return {
             "accounts": [
                 {
@@ -352,6 +367,8 @@ def build_router(
                     if a.identity_verification_method
                     else None,
                     "t2_readiness": _t2_readiness(a),
+                    "research_standing": int(a.research_standing),
+                    "r2_readiness": _r2_readiness(a),
                 }
                 for a in accounts
             ]
