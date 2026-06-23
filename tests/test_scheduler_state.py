@@ -169,7 +169,7 @@ def test_not_blocked_when_capable_and_tier_eligible(
     assert w["eligible_experiment_count"] == 1
 
 
-def test_blocked_below_tier_floor(
+def test_low_tier_worker_eligible_for_trusted_experiment(
     client: TestClient,
     maintainer_token: str,
     registered_tenant,
@@ -178,8 +178,11 @@ def test_blocked_below_tier_floor(
     per_job_factory,
     worker_repository,
 ) -> None:
+    # D9 Phase 4 (worker-participation accrual): a freshly-onboarded T0 worker
+    # holding m-x is ELIGIBLE for a TRUSTED (repl-1) experiment it can satisfy —
+    # the worker trust-tier no longer gates eligibility. Corroboration rides the
+    # experiment's (target, floor), not the worker's tier, so no stranding.
     _, binding = registered_tenant
-    # T0 worker holds m-x, but TRUSTED (repl 1) needs T2+ → capable, not eligible.
     _active_worker(worker_repository, worker_id="w-t0", pubkey="3" * 64, models=["m-x"])
     exp = _approved_exp(
         manifest_repository,
@@ -194,10 +197,10 @@ def test_blocked_below_tier_floor(
         client.get("/api/v0/scheduler/state", headers=_mtnr(maintainer_token)).json(),
         exp.experiment_id,
     )
-    assert e["blocked"] is True
-    assert e["block_reason"] == "below_tier_floor"
-    assert e["capable_worker_count"] == 1  # capable but not tier-eligible
-    assert e["eligible_worker_count"] == 0
+    assert e["blocked"] is False
+    assert e["block_reason"] is None
+    assert e["capable_worker_count"] == 1
+    assert e["eligible_worker_count"] == 1  # capable ⇒ eligible regardless of tier
 
 
 def test_blocked_empty_pool(

@@ -8,7 +8,8 @@ GET /workers/{id}/prestage:
   1. **Mark-acquired** any of the worker's open directives whose model now
      appears in its heartbeat inventory (the pull finished).
   2. **Plan** new directives: for each approved experiment the worker is
-     tier-eligible for, for each required model the worker lacks that the
+     capable for (D9 Phase 4: worker tier no longer gates eligibility), for
+     each required model the worker lacks that the
      manifest gives acquisition coords for, create a directive **iff** the
      model is under-supplied — `holders + in-flight pre-stages < replication
      need + churn_margin`. The supply check bounds the fan-out (no thundering
@@ -32,7 +33,6 @@ from auspexai_platform.db.repositories import (
     ModelPrestageRepository,
     WorkerRepository,
 )
-from auspexai_platform.scheduler import replication_floor_for_tier
 
 DEFAULT_CHURN_MARGIN = 1
 
@@ -77,14 +77,13 @@ def plan_prestage_for_worker(
 
     # 2. Plan — only for auto-acquire workers (others won't honour a directive).
     if worker.capabilities.get("auto_acquire") is True:
-        tier_floor = replication_floor_for_tier(worker.trust_tier)
         for exp in experiment_repository.list_all(status=ExperimentStatus.APPROVED):
             required = (exp.required_capabilities or {}).get("models", [])
             if not required:
                 continue
             repl = exp.replication_target  # C14: source of truth (decoupled from the map)
-            if tier_floor > repl:
-                continue  # worker can't take this experiment's units anyway
+            # D9 Phase 4: worker tier no longer gates eligibility, so the
+            # pre-stage plan no longer skips this experiment by tier-floor.
             need = repl + churn_margin
             manifest = manifest_repository.get(exp.manifest_hash)
             if manifest is None:

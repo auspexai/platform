@@ -15,10 +15,13 @@ Eligibility:
   - Worker hasn't already been assigned this unit
   - Unit's total assignment count < unit.replication_target
     (no over-assignment beyond the quorum target)
-  - **Per-tier replication floor (ratified 2026-05-24)**: workers are
-    only eligible for units whose replication_target meets or exceeds
-    their tier floor. T0 requires N≥3, T1 N≥2, T2+ N≥1. A T0 worker
-    is skipped for units with replication_target < 3.
+  - **NO per-worker tier floor (D9 Phase 4 — worker-participation accrual):**
+    a worker's trust tier does NOT gate which units it may take. Any
+    consenting, enrolled worker (capability-satisfied, not retired /
+    quarantined / paused) is eligible — so a freshly-onboarded low-tier
+    worker is never stranded. The experiment's corroboration rides its
+    (target, floor) + A4 account-weighted independence; the worker's tier
+    governs only its own compute-standing accrual, not participation.
 
 **Capability matching (#30, M1):** per §5.8 the scheduler matches a worker's
 locally-held models against the experiment's `required_capabilities` (derived at
@@ -68,9 +71,10 @@ def integrity_policy_for_request(
     *, replication_factor: int, tenant_tier: TrustTier | int
 ) -> IntegrityPolicy:
     """A' (§9): seed an experiment's integrity policy from the researcher's
-    requested replication, FLOORED by the tenant's trust tier — the same
-    `_TIER_REPLICATION_FLOOR` that gates worker eligibility, applied to the
-    tenant. A tenant earns lower replication (less consensus cross-check) only as
+    requested replication, FLOORED by the tenant's trust tier via
+    `_TIER_REPLICATION_FLOOR` (the TENANT-side floor; D9 Phase 4 removed the
+    worker-side eligibility use of this map). A tenant earns lower replication
+    (less consensus cross-check) only as
     its account earns trust (receipts). Effective replication = max(requested,
     tier floor), rounded UP to a policy tier (1 trusted / 3 standard / 5 high).
     Net: only T2+ tenants reach trusted/repl-1; T0/T1 floor at standard."""
@@ -419,7 +423,6 @@ class Scheduler:
         # hold — resource-owner sovereignty). Distinct from the operator pause.
         if worker_is_self_paused(worker):
             return None
-        tier_floor = replication_floor_for_tier(worker.trust_tier)
 
         for experiment in self._experiments.list_all(status=ExperimentStatus.APPROVED):
             # #30 (M1): skip the whole experiment when this worker lacks a model
@@ -462,10 +465,8 @@ class Scheduler:
                 # M4-tail pin / force-assign: a pinned unit is offered ONLY to
                 # its pinned worker (the maintainer override). Other workers skip
                 # it; the pinned worker takes it through the normal eligibility
-                # path below (it still respects tier-floor + replication).
+                # path below (replication-count, not tier — D9 Phase 4).
                 if unit.pinned_worker_id is not None and unit.pinned_worker_id != worker.worker_id:
-                    continue
-                if unit.replication_target < tier_floor:
                     continue
                 # §2.1 #8 (dispatch-retry): an existing assignment row only
                 # blocks re-offer when it's active (still working / completed)

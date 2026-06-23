@@ -789,27 +789,17 @@ def test_late_result_does_not_refire_completion(
     db = per_job_factory.get_or_create(experiment.experiment_id)
     WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
 
-    # Warm the APP-side per-job cache: submit_result's `_find_assignment` scans the
-    # app factory's cached DBs, and a GET runs the scheduler (which get_or_creates the
-    # experiment DB) even when it returns no work — here the T0 tier floor (3) refuses
-    # the target=1 unit, so the GET is null but the cache is warmed.
+    # D9 Phase 4: the worker tier no longer gates eligibility, so this T0 worker
+    # is now assigned the target=1 unit through the normal scheduler path. The GET
+    # returns the unit AND creates worker A's assignment (the warm-the-cache side
+    # effect is now the real dispatch). leg 3 then exercises submit-path idempotency.
     warm = _signed_get(
         client,
         privkey=privkey,
         pubkey_hex=worker.pubkey_hex,
         path=f"/api/v0/workers/{worker.worker_id}/assignments",
     )
-    assert warm.json()["work_unit"] is None
-
-    # Pre-create worker A's assignment directly — leg 3 exercises the submit-path
-    # idempotency, not scheduling, so we bypass pick_for_worker (whose T0 tier floor
-    # of 3 would refuse a replication_target=1 unit anyway).
-    AssignmentRepository(db).create(
-        assignment_id="asg-a",
-        unit_id="u1",
-        worker_id=worker.worker_id,
-        worker_pubkey_hex=worker.pubkey_hex,
-    )
+    assert warm.json()["work_unit"]["unit_id"] == "u1"
     first = _signed_post(
         client,
         privkey=privkey,

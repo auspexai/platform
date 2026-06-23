@@ -12,8 +12,9 @@ the stall isn't a silent surprise.
 This module is the read-only substrate: given the worker about to leave the pool,
 which APPROVED, needs-work experiments would lose their *last* eligible worker. It
 reuses the exact eligibility logic the M4 `/scheduler/state` view uses
-(`worker_satisfies` + `replication_floor_for_tier` + `INTEGRITY_POLICY_REPLICATION`)
-so the warning and the observability view can never disagree.
+(`worker_satisfies` over the schedulable workforce — D9 Phase 4 removed the
+worker tier-floor eligibility filter) so the warning and the observability view
+can never disagree.
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import ExperimentRepository, WorkUnitRepository
 from auspexai_platform.db.repositories.workers import WorkerRepository
 from auspexai_platform.scheduler import (
-    replication_floor_for_tier,
     worker_is_degraded,
     worker_is_self_paused,
     worker_satisfies,
@@ -75,6 +75,9 @@ def _eligible(
     requires_real_execution: bool = False,
     required_containment: str = "permissive",
 ) -> list[Worker]:
+    # D9 Phase 4: worker trust-tier no longer gates eligibility — a capable,
+    # schedulable worker is eligible regardless of tier. `repl` is retained in
+    # the signature for callers but no longer filters the worker pool.
     return [
         w
         for w in workforce
@@ -84,7 +87,6 @@ def _eligible(
             requires_real_execution=requires_real_execution,
             required_containment=required_containment,
         )
-        and replication_floor_for_tier(w.trust_tier) <= repl
     ]
 
 
@@ -148,7 +150,7 @@ def unit_fleet_exhausted(
     """C14 regime-2: True when no further replica can arrive for this unit from the current
     fleet — every SCHEDULABLE worker eligible for it has already delivered a result or
     terminally refused, so none is still available to take it and none is mid-execution with a
-    pending result. Reuses the M9 capacity eligibility (`worker_satisfies` + the tier floor) so
+    pending result. Reuses the M9 capacity eligibility (`worker_satisfies`; D9 Phase 4 dropped the worker tier-floor) so
     the two never disagree. An OFFLINE worker's stale in-flight assignment does NOT block (it
     isn't schedulable); a transiently-offline worker is covered by the sweep's quiescence window.
     Vacuously True when no eligible worker exists at all (nothing can contribute)."""

@@ -42,7 +42,6 @@ from auspexai_platform.db.repositories import (
 from auspexai_platform.db.repositories.model_prestage import DuplicatePrestageError
 from auspexai_platform.scheduler import (
     reoffer_eligible,
-    replication_floor_for_tier,
     worker_is_degraded,
     worker_is_self_paused,
     worker_satisfies,
@@ -182,7 +181,6 @@ def build_router(
             in_progress = counts.get("in_progress", 0)
             completed = counts.get("completed", 0)
             needs_work = pending + in_progress  # in-progress units may still need replicas
-            repl = exp.replication_target  # C14: source of truth (decoupled from the policy map)
             required = exp.required_capabilities or {}
             capable = [
                 w
@@ -194,7 +192,12 @@ def build_router(
                     required_containment=exp.required_containment,
                 )
             ]
-            eligible = [w for w in capable if replication_floor_for_tier(w.trust_tier) <= repl]
+            # D9 Phase 4: worker trust-tier no longer gates ELIGIBILITY. Any
+            # capable, schedulable worker is eligible; corroboration rides the
+            # experiment's (target, floor) + A4 account-weighted independence,
+            # not the worker's tier. `capable` already = worker_satisfies over
+            # the schedulable workforce, so eligibility == capability here.
+            eligible = capable
             if needs_work > 0:
                 for w in eligible:
                     elig_count[w.worker_id] += 1
@@ -203,10 +206,8 @@ def build_router(
             if blocked:
                 if not workforce:
                     reason = "empty_pool"
-                elif not capable:
-                    reason = "missing_capability"
                 else:
-                    reason = "below_tier_floor"
+                    reason = "missing_capability"
             experiments_out.append(
                 SchedulerExperiment(
                     experiment_id=exp.experiment_id,
@@ -287,8 +288,9 @@ def build_router(
                 continue
             hf_repo, hf_filename = coords[model_id]
             for w in on_network:
-                if replication_floor_for_tier(w.trust_tier) > repl:
-                    continue
+                # D9 Phase 4: worker tier no longer gates eligibility, so a
+                # pre-stage is planned for any auto-acquire worker that lacks
+                # the model (subject to the supply bound below).
                 if model_id in (w.capabilities.get("models") or []):
                     continue
                 if prestage_repository.has_open(model_id=model_id, worker_id=w.worker_id):

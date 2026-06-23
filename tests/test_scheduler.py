@@ -394,6 +394,63 @@ def test_skips_units_worker_already_assigned(
     assert scheduler.pick_for_worker(worker) is None
 
 
+def test_t0_worker_assigned_low_replication_unit(
+    registered_tenant,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+    manifest_repository: ManifestRepository,
+) -> None:
+    """D9 Phase 4 (worker-participation accrual): a freshly-onboarded T0
+    worker is NOT stranded — it is assigned a low-replication (repl-1) unit it
+    can satisfy. The worker trust-tier no longer gates eligibility; corroboration
+    rides the experiment's (target, floor), not the worker's tier. The
+    SELF-CORROBORATION guard still holds for the same T0 worker, and a security
+    skip (paused) still refuses it.
+    """
+    _, binding = registered_tenant
+    exp = _make_experiment(
+        manifest_repository=manifest_repository,
+        experiment_repository=experiment_repository,
+        tenant_id=binding.tenant_id,
+        label="t0-repl1",
+        required_capabilities={"models": ["m-x"]},
+    )
+    db = per_job_factory.get_or_create(exp.experiment_id)
+    # repl-2 so the same-worker guard (not the replication cap) is the unambiguous
+    # cause of the self-corroboration refusal below.
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=2)
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+
+    # T0 worker holding m-x is offered the low-replication unit (previously:
+    # stranded by the T0 tier floor of 3 > 2).
+    t0 = _worker(worker_id="wkr-t0", models=["m-x"], tier=TrustTier.T0_ANONYMOUS)
+    pick = scheduler.pick_for_worker(t0)
+    assert pick is not None
+    assert pick.work_unit.unit_id == "u1"
+
+    # SELF-CORROBORATION guard intact: once this T0 worker holds an assignment for
+    # u1, it is NOT offered a second replica of the same unit (the unit still
+    # needs a 2nd replica, so only the same-worker guard can refuse it here).
+    AssignmentRepository(db).create(
+        assignment_id="asg-t0",
+        unit_id="u1",
+        worker_id=t0.worker_id,
+        worker_pubkey_hex=t0.pubkey_hex,
+    )
+    assert scheduler.pick_for_worker(t0) is None
+
+    # SECURITY/availability gate intact: a paused T0 worker is still refused.
+    paused_t0 = Worker(
+        worker_id="wkr-t0-paused",
+        pubkey_hex="b" * 64,
+        trust_tier=TrustTier.T0_ANONYMOUS,
+        capabilities={"os": "linux", "models": ["m-x"], "execute_tenant_code": "provisioned"},
+        registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+        paused_at=datetime(2026, 6, 2, tzinfo=UTC),
+    )
+    assert scheduler.pick_for_worker(paused_t0) is None
+
+
 def test_skips_units_at_replication_target(
     enrolled_worker,
     approved_experiment,
