@@ -232,6 +232,42 @@ class AccountRepository:
         assert got is not None
         return got
 
+    def link_orcid(
+        self, account_id: str, *, orcid_id: str, display_name: str | None = None
+    ) -> Account:
+        """Link an ORCID iD to the account (D8) and mark identity verified.
+
+        Stores the ORCID iD AND sets identity_verified_* with method=ORCID in one
+        transaction — the ORCID link IS the identity verification the R2→R3 gate
+        reads. `identity_verified_by` records the linked iD for the audit trail.
+        Raises AccountNotFoundError if unknown."""
+        now = datetime.now(UTC).isoformat()
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE accounts
+                SET orcid_id = ?,
+                    identity_verified_at = ?,
+                    identity_verified_by = ?,
+                    identity_verification_method = ?,
+                    identity_verification_note = ?
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (
+                    orcid_id,
+                    now,
+                    f"orcid:{orcid_id}",
+                    IdentityVerificationMethod.ORCID.value,
+                    display_name,
+                    account_id,
+                ),
+            )
+            if cur.rowcount == 0:
+                raise AccountNotFoundError(account_id)
+        got = self.get_by_id(account_id)
+        assert got is not None
+        return got
+
     def revoke_identity(self, account_id: str) -> Account:
         """Clear identity verification. Raises AccountNotFoundError if unknown."""
         with self.db.transaction() as cur:
@@ -241,7 +277,8 @@ class AccountRepository:
                 SET identity_verified_at = NULL,
                     identity_verified_by = NULL,
                     identity_verification_method = NULL,
-                    identity_verification_note = NULL
+                    identity_verification_note = NULL,
+                    orcid_id = NULL
                 WHERE account_id = ? AND retired_at IS NULL
                 """,
                 (account_id,),
@@ -484,6 +521,7 @@ class AccountRepository:
                 else None
             ),
             identity_verification_note=row["identity_verification_note"],
+            orcid_id=(row["orcid_id"] if "orcid_id" in row.keys() else None),
             suspended_at=(
                 datetime.fromisoformat(row["suspended_at"]) if row["suspended_at"] else None
             ),

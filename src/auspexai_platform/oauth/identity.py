@@ -58,7 +58,13 @@ class DispatchingVerifier:
 
 
 def build_default_verifier() -> DispatchingVerifier:
-    """Build the production verifier — GitHub only in Phase 1."""
+    """Build the production verifier — GitHub (account root) + ORCID (D8, linked)."""
     from auspexai_platform.oauth.github import GitHubVerifier
+    from auspexai_platform.oauth.orcid import OrcidVerifier
 
-    return DispatchingVerifier({IdentityProvider.GITHUB: GitHubVerifier()})
+    return DispatchingVerifier(
+        {
+            IdentityProvider.GITHUB: GitHubVerifier(),
+            IdentityProvider.ORCID: OrcidVerifier(),
+        }
+    )

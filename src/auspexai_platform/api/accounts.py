@@ -142,6 +142,19 @@ class ResearchDossierResponse(BaseModel):
     experiments: list[dict] = Field(default_factory=list)
 
 
+class LinkOrcidRequest(BaseModel):
+    # The ORCID OAuth access token from the researcher's ORCID sign-in. idp is
+    # implicitly ORCID — this endpoint links, it does not root an account.
+    access_token: str = Field(min_length=1, description="ORCID OAuth access token")
+
+
+class LinkOrcidResponse(BaseModel):
+    account_id: str
+    orcid_id: str
+    identity_verified_at: datetime | None = None
+    identity_verification_method: str | None = None
+
+
 class VouchRequest(BaseModel):
     rationale: str | None = None
 
@@ -366,6 +379,7 @@ def build_router(
                     "identity_verification_method": a.identity_verification_method.value
                     if a.identity_verification_method
                     else None,
+                    "orcid_id": a.orcid_id,
                     "t2_readiness": _t2_readiness(a),
                     "research_standing": int(a.research_standing),
                     "r2_readiness": _r2_readiness(a),
@@ -573,6 +587,76 @@ def build_router(
             research_standing_name=target.name,
             gate_override=bool(gate_warnings),
             gate_warnings=gate_warnings,
+        )
+
+    @router.post(
+        "/accounts/{account_id}/actions/link-orcid",
+        response_model=LinkOrcidResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def link_orcid(
+        account_id: str,
+        body: LinkOrcidRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> LinkOrcidResponse:
+        """Link an ORCID iD to the account (D8) — the citation-grade academic
+        identity. Self-service (the account owner) or maintainer-on-behalf.
+        Verifies the ORCID access token via the IdP, stores the ORCID iD, and
+        marks the account identity-verified (method=ORCID) — which the R2→R3
+        vetting gate reads. A *linked* identity: the account stays GitHub-rooted.
+        Audited."""
+        is_maintainer = credential.kind == CredentialClass.MAINTAINER
+        if not is_maintainer and credential.account_id != account_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="you can only link an ORCID to your own account",
+            )
+        account = account_repository.get_by_id(account_id)
+        if account is None or account.retired_at is not None:
+            raise HTTPException(status_code=404, detail="account not found")
+        if account.suspended_at is not None:
+            raise HTTPException(status_code=409, detail="account is suspended")
+        try:
+            claim = identity_verifier.verify(IdentityProvider.ORCID, body.access_token)
+        except UnknownIdentityProviderError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="ORCID identity provider is not enabled",
+            ) from e
+        except InvalidAccessTokenError as e:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "error": {
+                        "code": "invalid_access_token",
+                        "message": "ORCID did not accept the supplied access token",
+                        "details": {"reason": str(e)},
+                    }
+                },
+            ) from e
+        account = account_repository.link_orcid(
+            account_id, orcid_id=claim.idp_sub, display_name=claim.display_name
+        )
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.maintainer_login or credential.account_id or "self",
+            action="account.link_orcid",
+            resource_type="account",
+            resource_id=account_id,
+            payload={
+                "orcid_id": claim.idp_sub,
+                "linked_by": "maintainer" if is_maintainer else "self",
+            },
+        )
+        return LinkOrcidResponse(
+            account_id=account_id,
+            orcid_id=claim.idp_sub,
+            identity_verified_at=account.identity_verified_at,
+            identity_verification_method=(
+                account.identity_verification_method.value
+                if account.identity_verification_method
+                else None
+            ),
         )
 
     @router.get(

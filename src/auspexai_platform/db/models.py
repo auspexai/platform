@@ -68,11 +68,14 @@ class ResearchStanding(IntEnum):
 class IdentityProvider(StrEnum):
     """Identity providers the coordinator accepts for account binding.
 
-    Phase 1: GitHub only (auspexai org OAuth App). Adding a new IdP requires
-    a migration to relax the accounts.idp CHECK constraint.
+    Phase 1 rooted accounts: GitHub only (auspexai org OAuth App) — rooting an
+    account by a new IdP requires a migration to relax the accounts.idp CHECK.
+    ORCID (D8) is supported as a *linked* identity (the account stays
+    GitHub-rooted; the ORCID iD is a separate column), so it needs no CHECK change.
     """
 
     GITHUB = "github"
+    ORCID = "orcid"
 
 
 class IntegrityPolicy(StrEnum):
@@ -248,6 +251,7 @@ class IdentityVerificationMethod(StrEnum):
     MAINTAINER_ATTESTED = "maintainer_attested"
     GITHUB_PROFILE = "github_profile"
     INSTITUTIONAL_EMAIL = "institutional_email"
+    ORCID = "orcid"
 
 
 class ResearchStandingSummary(BaseModel):
@@ -296,6 +300,11 @@ class Account(BaseModel):
     identity_verified_by: str | None = None
     identity_verification_method: IdentityVerificationMethod | None = None
     identity_verification_note: str | None = None
+    # D8: a linked ORCID iD (e.g. "0000-0002-1825-0097"), set when the researcher
+    # links their ORCID (the citation-grade academic identity). Linking also sets
+    # identity_verified_at (method=ORCID) — the R2→R3 vetting gate reads that flag,
+    # and the iD is surfaced to the reviewer. NULL = no ORCID linked.
+    orcid_id: str | None = None
     suspended_at: datetime | None = None
     # Maintainer's reason for the suspension. Set on suspend(), cleared on
     # unsuspend(). Account-scoped: surfaced to the account holder (whoami /
