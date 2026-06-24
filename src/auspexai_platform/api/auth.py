@@ -79,6 +79,9 @@ class WhoamiResponse(BaseModel):
     research_standing_eligible_for_r2: Annotated[bool | None, ExposureTag.ACCOUNT_SCOPED] = Field(
         default=None, description="Account holder only: cleared the R2-review threshold."
     )
+    orcid_id: Annotated[str | None, ExposureTag.ACCOUNT_SCOPED] = Field(
+        default=None, description="Account holder only: the linked ORCID iD (D8), if any."
+    )
 
 
 def build_router(credential_dep, account_repository: AccountRepository | None = None) -> APIRouter:
@@ -103,11 +106,13 @@ def build_router(credential_dep, account_repository: AccountRepository | None = 
         rs_distinct = None
         rs_threshold = None
         rs_eligible = None
+        orcid_id = None
         if account_repository is not None and credential.account_id is not None:
             account = account_repository.get_by_id(credential.account_id)
             if account is not None:
                 suspended_at = account.suspended_at
                 suspension_reason = account.suspension_reason
+                orcid_id = account.orcid_id
                 rs = account_repository.research_standing_summary(credential.account_id)
                 research_standing = int(rs.current)
                 rs_distinct = rs.distinct_clean_completed_verified
@@ -124,6 +129,7 @@ def build_router(credential_dep, account_repository: AccountRepository | None = 
             research_standing_distinct=rs_distinct,
             research_standing_threshold=rs_threshold,
             research_standing_eligible_for_r2=rs_eligible,
+            orcid_id=orcid_id,
         )
         return filter_for_credential(
             payload,

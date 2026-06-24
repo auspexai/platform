@@ -7,7 +7,11 @@ import pytest
 
 from auspexai_platform.db.models import IdentityProvider
 from auspexai_platform.oauth.identity import InvalidAccessTokenError
-from auspexai_platform.oauth.orcid import ORCID_USERINFO_PROD, OrcidVerifier
+from auspexai_platform.oauth.orcid import (
+    ORCID_USERINFO_PROD,
+    OrcidOAuthClient,
+    OrcidVerifier,
+)
 
 
 def _client(handler) -> httpx.Client:
@@ -85,3 +89,56 @@ def test_verify_raises_on_transport_error() -> None:
     verifier = OrcidVerifier(client=_client(handler))
     with pytest.raises(InvalidAccessTokenError, match="user-info call failed"):
         verifier.verify(IdentityProvider.ORCID, "x")
+
+
+# ---- OrcidOAuthClient (server-side auth-code flow) ---------------------------
+
+
+def _oauth(handler, **kw) -> OrcidOAuthClient:
+    return OrcidOAuthClient(
+        client_id="APP-TEST",
+        client_secret="sekret",
+        redirect_uri="https://coord.test/cb",
+        base="https://orcid.test",
+        client=_client(handler),
+        **kw,
+    )
+
+
+def test_is_configured() -> None:
+    assert _oauth(lambda r: httpx.Response(200)).is_configured is True
+    bare = OrcidOAuthClient(client_id=None, client_secret=None, redirect_uri=None)
+    assert bare.is_configured is False
+
+
+def test_authorize_url_carries_public_id_scope_state() -> None:
+    url = _oauth(lambda r: httpx.Response(200)).authorize_url("st-abc")
+    assert url.startswith("https://orcid.test/oauth/authorize?")
+    assert "client_id=APP-TEST" in url
+    assert "scope=%2Fauthenticate" in url  # /authenticate, url-encoded
+    assert "state=st-abc" in url
+    assert "sekret" not in url  # the secret never appears in the browser URL
+
+
+def test_exchange_code_returns_orcid_and_name() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == httpx.URL("https://orcid.test/oauth/token")
+        body = request.content.decode()
+        assert "grant_type=authorization_code" in body
+        assert "code=the-code" in body
+        assert "client_secret=sekret" in body
+        return httpx.Response(200, json={"orcid": "0000-0002-1825-0097", "name": "Josiah"})
+
+    link = _oauth(handler).exchange_code("the-code")
+    assert link.orcid_id == "0000-0002-1825-0097"
+    assert link.name == "Josiah"
+
+
+def test_exchange_code_raises_on_non_200() -> None:
+    with pytest.raises(InvalidAccessTokenError, match="token endpoint returned 400"):
+        _oauth(lambda r: httpx.Response(400, json={"error": "invalid_grant"})).exchange_code("x")
+
+
+def test_exchange_code_raises_on_missing_orcid() -> None:
+    with pytest.raises(InvalidAccessTokenError, match="missing 'orcid'"):
+        _oauth(lambda r: httpx.Response(200, json={"name": "x"})).exchange_code("x")

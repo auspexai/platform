@@ -268,6 +268,33 @@ class AccountRepository:
         assert got is not None
         return got
 
+    # ---- ORCID OAuth link flow (D8) ----
+
+    def create_orcid_state(self, state: str, account_id: str) -> None:
+        """Store a single-use ORCID OAuth state bound to an account."""
+        now = datetime.now(UTC).isoformat()
+        with self.db.transaction() as cur:
+            cur.execute(
+                "INSERT INTO orcid_oauth_states (state, account_id, created_at) VALUES (?, ?, ?)",
+                (state, account_id, now),
+            )
+
+    def consume_orcid_state(self, state: str, *, max_age_seconds: int = 600) -> str | None:
+        """Pop a state, returning its account_id if present and not expired —
+        single-use: the row is deleted regardless. None if unknown or too old."""
+        rows = self.db.execute(
+            "SELECT account_id, created_at FROM orcid_oauth_states WHERE state = ?",
+            (state,),
+        )
+        with self.db.transaction() as cur:
+            cur.execute("DELETE FROM orcid_oauth_states WHERE state = ?", (state,))
+        if not rows:
+            return None
+        age = (datetime.now(UTC) - datetime.fromisoformat(rows[0]["created_at"])).total_seconds()
+        if age > max_age_seconds:
+            return None
+        return rows[0]["account_id"]
+
     def revoke_identity(self, account_id: str) -> Account:
         """Clear identity verification. Raises AccountNotFoundError if unknown."""
         with self.db.transaction() as cur:

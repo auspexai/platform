@@ -34,11 +34,13 @@ mis-classifies it as a Query param (every POST-body route then 422s). Keeping
 annotations as real objects sidesteps that. See CI-red postmortem 2026-05-30.
 """
 
+import os
 import secrets
 from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
@@ -59,7 +61,13 @@ from auspexai_platform.oauth import (
     InvalidAccessTokenError,
     UnknownIdentityProviderError,
 )
+from auspexai_platform.oauth.orcid import OrcidOAuthClient
 from auspexai_platform.rate_limit import limiter
+
+# Where the ORCID callback bounces the researcher's browser when done. It's
+# their OWN local dashboard (127.0.0.1 resolves to each researcher's machine),
+# so one default works for everyone; the SPA reads ?orcid=… and shows the result.
+_ORCID_SUCCESS_URL = os.environ.get("AUSPEXAI_ORCID_SUCCESS_URL", "http://127.0.0.1:4228/")
 
 # §6.2.2 anti-Sybil vouch gate: a voucher must have done real work across more
 # than one tenant before its vouch can feed a peer's identity gate — so a single
@@ -201,10 +209,12 @@ def build_router(
     vouch_min_receipts: int = VOUCH_MIN_RECEIPTS,
     vouch_min_distinct_tenants: int = VOUCH_MIN_DISTINCT_TENANTS,
     trust_model_policy_repository=None,  # firewall #1 (A2) flip toggle; OFF when unwired
+    orcid_oauth_client: OrcidOAuthClient | None = None,  # D8; reads env config when None
 ) -> APIRouter:
     """Build /accounts router bound to repository instances + verifier."""
 
     router = APIRouter()
+    orcid_oauth_client = orcid_oauth_client or OrcidOAuthClient()
 
     @router.post(
         "/accounts/oauth/exchange",
@@ -658,6 +668,65 @@ def build_router(
                 else None
             ),
         )
+
+    @router.post("/accounts/orcid/start", status_code=status.HTTP_200_OK)
+    async def orcid_start(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> dict:
+        """Begin linking the caller's ORCID (D8). Returns the ORCID authorize URL
+        the dashboard opens; a single-use state binds the eventual callback to the
+        caller's account. Requires an account (researcher) credential."""
+        if credential.account_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="an account credential is required to link ORCID",
+            )
+        if not orcid_oauth_client.is_configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="ORCID linking is not configured on this coordinator",
+            )
+        state = secrets.token_urlsafe(24)
+        account_repository.create_orcid_state(state, credential.account_id)
+        return {"authorize_url": orcid_oauth_client.authorize_url(state)}
+
+    @router.get("/accounts/orcid/callback")
+    async def orcid_callback(
+        code: str | None = None,
+        state: str | None = None,
+        error: str | None = None,
+    ) -> RedirectResponse:
+        """ORCID redirects the researcher's browser here after they authorize.
+        Public (no credential): the single-use `state` is the binding to the
+        account. Exchanges the code for the ORCID iD, links it, and bounces the
+        browser back to the researcher's local dashboard with ?orcid=…."""
+
+        def _back(result: str) -> RedirectResponse:
+            sep = "&" if "?" in _ORCID_SUCCESS_URL else "?"
+            return RedirectResponse(f"{_ORCID_SUCCESS_URL}{sep}orcid={result}", status_code=302)
+
+        if error or not code or not state:
+            return _back("error")
+        account_id = account_repository.consume_orcid_state(state)
+        if account_id is None:
+            return _back("expired")
+        try:
+            link = orcid_oauth_client.exchange_code(code)
+        except InvalidAccessTokenError:
+            return _back("error")
+        try:
+            account_repository.link_orcid(account_id, orcid_id=link.orcid_id, display_name=link.name)
+        except AccountNotFoundError:
+            return _back("error")
+        audit_repository.append(
+            actor_class=CredentialClass.ANONYMOUS,
+            actor_identifier=account_id,
+            action="account.link_orcid",
+            resource_type="account",
+            resource_id=account_id,
+            payload={"orcid_id": link.orcid_id, "linked_by": "self_orcid_oauth"},
+        )
+        return _back("linked")
 
     @router.get(
         "/accounts/{account_id}/research-standing",

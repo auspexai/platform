@@ -84,3 +84,58 @@ def test_repo_link_orcid_then_revoke_clears_it(account_repository: AccountReposi
     acct = account_repository.get_by_id("acct-rv")
     assert acct.orcid_id is None
     assert acct.identity_verified_at is None
+
+
+# ---- single-use state repo + the live OAuth flow endpoints -------------------
+
+
+def test_state_create_consume_single_use(account_repository: AccountRepository) -> None:
+    account_repository.create(account_id="acct-s", idp=IdentityProvider.GITHUB, idp_sub="gh-s")
+    account_repository.create_orcid_state("st-1", "acct-s")
+    assert account_repository.consume_orcid_state("st-1") == "acct-s"
+    # single-use: a second consume finds nothing.
+    assert account_repository.consume_orcid_state("st-1") is None
+
+
+def test_state_expiry_and_unknown(account_repository: AccountRepository) -> None:
+    account_repository.create(account_id="acct-e", idp=IdentityProvider.GITHUB, idp_sub="gh-e")
+    account_repository.create_orcid_state("st-2", "acct-e")
+    # max_age 0 → already expired (and still consumed/deleted).
+    assert account_repository.consume_orcid_state("st-2", max_age_seconds=0) is None
+    assert account_repository.consume_orcid_state("never-made") is None
+
+
+def test_callback_links_and_redirects(client, account_repository, monkeypatch) -> None:
+    from auspexai_platform.oauth.orcid import OrcidLink, OrcidOAuthClient
+
+    account_repository.create(account_id="acct-cb", idp=IdentityProvider.GITHUB, idp_sub="gh-cb")
+    account_repository.create_orcid_state("st-cb", "acct-cb")
+    monkeypatch.setattr(
+        OrcidOAuthClient,
+        "exchange_code",
+        lambda self, code: OrcidLink(orcid_id=ORCID, name="JC"),
+    )
+    r = client.get("/api/v0/accounts/orcid/callback?code=abc&state=st-cb", follow_redirects=False)
+    assert r.status_code == 302
+    assert "orcid=linked" in r.headers["location"]
+    acct = account_repository.get_by_id("acct-cb")
+    assert acct.orcid_id == ORCID
+    assert acct.identity_verification_method is IdentityVerificationMethod.ORCID
+
+
+def test_callback_unknown_state_is_expired(client) -> None:
+    r = client.get("/api/v0/accounts/orcid/callback?code=abc&state=nope", follow_redirects=False)
+    assert r.status_code == 302
+    assert "orcid=expired" in r.headers["location"]
+
+
+def test_callback_error_param_redirects_error(client) -> None:
+    r = client.get("/api/v0/accounts/orcid/callback?error=access_denied", follow_redirects=False)
+    assert r.status_code == 302
+    assert "orcid=error" in r.headers["location"]
+
+
+def test_start_requires_an_account(client, maintainer_token) -> None:
+    # A maintainer token has no account_id → can't self-link.
+    r = client.post("/api/v0/accounts/orcid/start", headers=_mh(maintainer_token))
+    assert r.status_code == 403
