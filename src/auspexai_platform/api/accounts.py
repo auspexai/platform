@@ -715,12 +715,18 @@ def build_router(
         except InvalidAccessTokenError:
             return _back("error")
         try:
-            account_repository.link_orcid(account_id, orcid_id=link.orcid_id, display_name=link.name)
+            account = account_repository.link_orcid(
+                account_id, orcid_id=link.orcid_id, display_name=link.name
+            )
         except AccountNotFoundError:
             return _back("error")
+        # The browser callback is unauthenticated (an ORCID redirect carries no
+        # credential), but the single-use `state` proves the ACCOUNT owner drove
+        # it — attribute the link to that researcher account (its verified login),
+        # not anonymous, so the audit is legible.
         audit_repository.append(
-            actor_class=CredentialClass.ANONYMOUS,
-            actor_identifier=account_id,
+            actor_class=CredentialClass.RESEARCHER,
+            actor_identifier=account.display_name or account_id,
             action="account.link_orcid",
             resource_type="account",
             resource_id=account_id,

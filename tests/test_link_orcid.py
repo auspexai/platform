@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from auspexai_platform.auth.credential import CredentialClass
 from auspexai_platform.db.models import IdentityProvider, IdentityVerificationMethod
 from auspexai_platform.db.repositories import AccountRepository
 from auspexai_platform.oauth.identity import IdentityClaim
@@ -105,7 +106,9 @@ def test_state_expiry_and_unknown(account_repository: AccountRepository) -> None
     assert account_repository.consume_orcid_state("never-made") is None
 
 
-def test_callback_links_and_redirects(client, account_repository, monkeypatch) -> None:
+def test_callback_links_and_redirects(
+    client, account_repository, audit_repository, monkeypatch
+) -> None:
     from auspexai_platform.oauth.orcid import OrcidLink, OrcidOAuthClient
 
     account_repository.create(account_id="acct-cb", idp=IdentityProvider.GITHUB, idp_sub="gh-cb")
@@ -121,6 +124,11 @@ def test_callback_links_and_redirects(client, account_repository, monkeypatch) -
     acct = account_repository.get_by_id("acct-cb")
     assert acct.orcid_id == ORCID
     assert acct.identity_verification_method is IdentityVerificationMethod.ORCID
+    # The unauthenticated OAuth callback attributes the link to the ACCOUNT owner
+    # (proven by the single-use state), NOT anonymous — audit legibility.
+    link_audit = next(e for e in audit_repository.latest() if e.action == "account.link_orcid")
+    assert link_audit.actor_class == CredentialClass.RESEARCHER
+    assert link_audit.actor_identifier == (acct.display_name or "acct-cb")
 
 
 def test_callback_unknown_state_is_expired(client) -> None:
