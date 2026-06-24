@@ -186,6 +186,18 @@ def match(manifest: dict[str, Any], cert: Any) -> CheckResult:
     return CheckResult(passed=not failures, failures=failures)
 
 
+def is_newer_build(manifest: dict[str, Any], cert: Any) -> bool:
+    """True iff `manifest` is a NEWER BUILD of `cert`'s certified profile: it
+    matches the certification on every locked field EXCEPT the executor package
+    digest (same models / research_class / sensitive flags / replication /
+    duration, different package). That is the precise "re-certify this" signal —
+    an unrelated experiment from the same tenant fails on more than just the
+    package, so it is not flagged. A run that fully matches is already certified.
+    """
+    res = match(manifest, cert)
+    return (not res.passed) and len(res.failures) == 1 and "package digest" in res.failures[0]
+
+
 def certified_match(manifest: dict[str, Any], repo: Any) -> Any:
     """Resolve a submitted manifest to its ACTIVE certification, or None — the
     single check both the submit-time floor exemption and the auto-approval branch

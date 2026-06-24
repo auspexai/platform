@@ -11,6 +11,7 @@ from auspexai_platform.certification import (
     auto_check,
     certified_match,
     envelope_from_manifest,
+    is_newer_build,
     match,
     sign_certificate,
 )
@@ -196,6 +197,22 @@ def test_match_passes_for_certified_profile(db):
 def test_match_rejects_locked_field_changes(db, over):
     rec = _insert(CertifiedProfileRepository(db))
     assert not match(_starter_manifest(**over), rec).passed
+
+
+# ---- is_newer_build (the re-certification staleness signal) ----
+
+
+def test_is_newer_build_only_for_package_only_change(db):
+    rec = _insert(CertifiedProfileRepository(db))
+    # same profile, NEW package digest only → a newer build → re-certify candidate
+    assert is_newer_build(_starter_manifest(executor={"package_sha256": "b" * 64}), rec)
+    # an exact-match run is already certified, not "newer"
+    assert not is_newer_build(_starter_manifest(), rec)
+    # a different package AND another locked field (model) → an unrelated run, not
+    # a re-build of this profile → NOT flagged (avoids false positives)
+    assert not is_newer_build(
+        _starter_manifest(executor={"package_sha256": "b" * 64}, models=[{"id": "other"}]), rec
+    )
 
 
 # ---- certified_match (the combined lookup + match used by submit/assess) ----

@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.dependency import require_maintainer
+from auspexai_platform.certification import is_newer_build
 from auspexai_platform.db.repositories import AuditRepository, CertifiedProfileRepository
 
 
@@ -65,6 +66,7 @@ def build_router(
     credential_dep,
     certified_profile_repository: CertifiedProfileRepository,
     audit_repository: AuditRepository,
+    manifest_repository,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -72,6 +74,39 @@ def build_router(
     async def list_certifications() -> dict[str, Any]:
         # Anonymous-public: this list IS the published registry (§6.7.4 publish).
         return {"certifications": [_payload(r) for r in certified_profile_repository.list_all()]}
+
+    # Defined BEFORE /certifications/{package_sha256} so "staleness" isn't matched
+    # as a package digest.
+    @router.get("/certifications/staleness")
+    async def certification_staleness(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Maintainer-only: per active certification, whether a NEWER BUILD of its
+        profile has been submitted (same locked fields, different package digest —
+        it reverted to review by the content-addressed gate; surface it so the
+        Maintainer can re-certify). NOT on the public registry — it reflects
+        submission activity. Keyed by the certified `package_sha256`."""
+        require_maintainer(credential)
+        active = [c for c in certified_profile_repository.list_all() if c.status == "certified"]
+        by_tenant: dict[str, list[Any]] = {}
+        for c in active:
+            by_tenant.setdefault(c.tenant_id, []).append(c)
+        stale: dict[str, Any] = {}
+        for tenant_id, tcerts in by_tenant.items():
+            manifests = manifest_repository.list_for_tenant(tenant_id)  # ascending by uploaded_at
+            for cert in tcerts:
+                newer = None
+                for m in manifests:
+                    if is_newer_build(m.manifest_json, cert):
+                        newer = m  # keep the latest match (list is ascending)
+                if newer is not None:
+                    pkg = (newer.manifest_json.get("executor") or {}).get("package_sha256", "")
+                    stale[cert.package_sha256] = {
+                        "newer_build_seen": True,
+                        "newer_package_sha256": pkg,
+                        "seen_at": newer.uploaded_at.isoformat(),
+                    }
+        return {"stale": stale}
 
     @router.get("/certifications/{package_sha256}")
     async def get_certification(package_sha256: str) -> dict[str, Any]:

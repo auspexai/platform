@@ -271,6 +271,7 @@ def create_app(
             credential_dep,
             certified_profile_repository,
             audit_repository,
+            manifest_repository,
         ),
         prefix="/api/v0",
         tags=["certifications"],
