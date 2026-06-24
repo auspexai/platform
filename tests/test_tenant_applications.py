@@ -33,6 +33,13 @@ _GH_CLAIM = IdentityClaim(
     email="vigiles@example.org",
 )
 
+_ORCID_TOKEN = "orcid_applicant_token"
+_ORCID_CLAIM = IdentityClaim(
+    idp=IdentityProvider.ORCID,
+    idp_sub="0000-0002-1825-0097",
+    display_name="Josiah Carberry",
+)
+
 
 def _apply_body(**overrides) -> dict:
     body = {
@@ -719,3 +726,87 @@ def test_submit_surfaces_existing_account_tenants(
     )
     assert r.status_code == 201, r.text
     assert r.json()["account_existing_tenants"] == ["prior-lab"]
+
+
+# ---- ORCID-rooted applicants (the researcher persona) ----------------------
+
+
+def test_submit_orcid_roots_the_account(
+    client: TestClient,
+    identity_verifier,
+    applicant_keypair,
+    account_repository,
+    application_repository,
+) -> None:
+    priv, pub = applicant_keypair
+    identity_verifier.register(_ORCID_TOKEN, _ORCID_CLAIM)
+    r = _signed_post(
+        client,
+        privkey=priv,
+        pubkey_hex=pub,
+        path=APPLY_PATH,
+        body=_apply_body(github_access_token=None, orcid_access_token=_ORCID_TOKEN),
+    )
+    assert r.status_code == 201, r.text
+    # The account is ORCID-ROOTED and identity-verified by construction (no link step).
+    account = account_repository.get_by_idp_subject(IdentityProvider.ORCID, _ORCID_CLAIM.idp_sub)
+    assert account is not None
+    assert account.idp is IdentityProvider.ORCID
+    assert account.orcid_id == _ORCID_CLAIM.idp_sub
+    assert account.identity_verified_at is not None
+    # github_login is null for an ORCID root (its identity is the orcid_id).
+    row = application_repository.get_by_id(r.json()["application_id"])
+    assert row is not None and row.github_login is None
+
+
+def test_submit_rejects_zero_or_two_identity_tokens(
+    client: TestClient,
+    applicant_keypair,
+) -> None:
+    priv, pub = applicant_keypair
+    # both present → 422 (github default + orcid override)
+    r = _signed_post(
+        client,
+        privkey=priv,
+        pubkey_hex=pub,
+        path=APPLY_PATH,
+        body=_apply_body(orcid_access_token=_ORCID_TOKEN),
+    )
+    assert r.status_code == 422, r.text
+    # neither present → 422
+    r = _signed_post(
+        client,
+        privkey=priv,
+        pubkey_hex=pub,
+        path=APPLY_PATH,
+        body=_apply_body(github_access_token=None),
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_approve_orcid_application_sets_orcid_contact(
+    client: TestClient,
+    identity_verifier,
+    applicant_keypair,
+    maintainer_token,
+    tenant_repository,
+) -> None:
+    priv, pub = applicant_keypair
+    identity_verifier.register(_ORCID_TOKEN, _ORCID_CLAIM)
+    applied = _signed_post(
+        client,
+        privkey=priv,
+        pubkey_hex=pub,
+        path=APPLY_PATH,
+        body=_apply_body(github_access_token=None, orcid_access_token=_ORCID_TOKEN),
+    ).json()
+    r = client.post(
+        f"{APPLY_PATH}/{applied['application_id']}/actions/approve",
+        json={},
+        headers=_mtnr(maintainer_token),
+    )
+    assert r.status_code == 200, r.text
+    # The public contact is the ORCID iD (not a github handle) for an ORCID root.
+    tenant = tenant_repository.get_by_id("vigiles")
+    assert tenant is not None
+    assert tenant.contact_public == "orcid:0000-0002-1825-0097"

@@ -94,8 +94,17 @@ _RESEARCH_CLASS_SET = frozenset(RESEARCH_CLASSES)
 
 
 class TenantApplicationCreate(BaseModel):
-    github_access_token: str = Field(
-        min_length=1, description="Access token from the caller's GitHub device flow"
+    # Exactly one identity token roots the account: GitHub (the default) or ORCID
+    # (the researcher persona — an ORCID-rooted account is identity-verified at
+    # creation, so it reaches R3 without a separate link). Enforced by
+    # _require_exactly_one_identity below.
+    github_access_token: str | None = Field(
+        default=None, min_length=1, description="Access token from the caller's GitHub device flow"
+    )
+    orcid_access_token: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Access token from the caller's ORCID OAuth — roots the account on ORCID",
     )
     requested_tenant_id: str = Field(min_length=1, max_length=64)
     contact_name: str = Field(min_length=1, max_length=200)
@@ -126,6 +135,12 @@ class TenantApplicationCreate(BaseModel):
                 "at least one of research_classes (non-empty list) or "
                 "research_summary (non-empty string) is required"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _require_exactly_one_identity(self) -> "TenantApplicationCreate":
+        if bool(self.github_access_token) == bool(self.orcid_access_token):
+            raise ValueError("provide exactly one of github_access_token or orcid_access_token")
         return self
 
 
@@ -322,17 +337,22 @@ def build_router(
         #    the applying key is unregistered by design.
         pubkey_hex = await _verify_applying_key(request)
 
-        # 2. Verify the GitHub access token via the same identity machinery
-        #    as volunteer enrollment (token forgery is the IdP's threat model).
+        # 2. Verify the identity token (GitHub or ORCID — exactly one, enforced
+        #    by the request model). ORCID roots the account on ORCID (researcher
+        #    persona); GitHub is the default. Same identity machinery as volunteer
+        #    enrollment (token forgery is the IdP's threat model).
+        idp = IdentityProvider.ORCID if body.orcid_access_token else IdentityProvider.GITHUB
+        token = body.orcid_access_token or body.github_access_token
+        assert token is not None  # exactly-one enforced by TenantApplicationCreate
         try:
-            claim = identity_verifier.verify(IdentityProvider.GITHUB, body.github_access_token)
+            claim = identity_verifier.verify(idp, token)
         except UnknownIdentityProviderError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={
                     "error": {
                         "code": "unsupported_idp",
-                        "message": "identity provider 'github' not enabled",
+                        "message": f"identity provider {idp.value!r} not enabled",
                         "details": {},
                     }
                 },
@@ -348,6 +368,11 @@ def build_router(
                     }
                 },
             ) from e
+
+        # The application's github_login is the GitHub handle, or None for an
+        # ORCID root (its identity is the account's orcid_id, surfaced at approval
+        # as the public contact).
+        github_login = claim.display_name if claim.idp is IdentityProvider.GITHUB else None
 
         # 3. Resolve-or-create the account row (volunteer-enrollment pattern,
         #    including the create race).
@@ -397,7 +422,7 @@ def build_router(
 
         application = tenant_application_repository.create(
             account_id=account.account_id,
-            github_login=claim.display_name,
+            github_login=github_login,
             requested_tenant_id=body.requested_tenant_id,
             contact_name=body.contact_name,
             affiliation=body.affiliation,
@@ -414,7 +439,8 @@ def build_router(
             resource_id=application.application_id,
             payload={
                 "account_id": account.account_id,
-                "github_login": claim.display_name,
+                "idp": claim.idp.value,
+                "github_login": github_login,
                 "requested_tenant_id": body.requested_tenant_id,
                 "is_new_account": is_new,
                 "status": application.status,
@@ -425,7 +451,8 @@ def build_router(
             {
                 "application_id": application.application_id,
                 "account_id": account.account_id,
-                "github_login": claim.display_name,
+                "idp": claim.idp.value,
+                "github_login": github_login,
                 "requested_tenant_id": body.requested_tenant_id,
                 "status": application.status,
             },

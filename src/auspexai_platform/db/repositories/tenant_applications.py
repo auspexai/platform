@@ -197,6 +197,19 @@ class TenantApplicationRepository:
                 display_name = application.contact_name
                 if application.affiliation and application.affiliation != application.contact_name:
                     display_name = f"{application.contact_name} ({application.affiliation})"
+                # Public contact handle: the GitHub login, or the ORCID iD for an
+                # ORCID-rooted applicant (whose github_login is null). Read from the
+                # account so an ORCID root surfaces orcid.org/{iD} to operators.
+                acct = cur.execute(
+                    "SELECT idp, orcid_id FROM accounts WHERE account_id = ?",
+                    (application.account_id,),
+                ).fetchone()
+                if acct is not None and acct["idp"] == "orcid" and acct["orcid_id"]:
+                    contact_public = f"orcid:{acct['orcid_id']}"
+                elif application.github_login:
+                    contact_public = f"github:{application.github_login}"
+                else:
+                    contact_public = None
                 cur.execute(
                     """
                     INSERT INTO tenants (
@@ -209,7 +222,7 @@ class TenantApplicationRepository:
                         tenant_id,
                         application.pubkey_hex.lower(),
                         display_name or None,
-                        f"github:{application.github_login}" if application.github_login else None,
+                        contact_public,
                         " ".join(description_parts) or None,
                         application.account_id,
                         now,
