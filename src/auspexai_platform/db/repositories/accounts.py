@@ -72,15 +72,27 @@ class AccountRepository:
         email: str | None = None,
         trust_tier: TrustTier = TrustTier.T1_AUTHENTICATED,
     ) -> Account:
-        """Insert an account. Raises DuplicateAccountError on (idp, idp_sub) collision."""
+        """Insert an account. Raises DuplicateAccountError on (idp, idp_sub) collision.
+
+        An ORCID-ROOTED account is identity-verified BY CONSTRUCTION — rooting on
+        ORCID is the same proof the D8 link captures — so we stamp the
+        identity_verified_* columns + orcid_id at creation (R3-grade on day one,
+        method=ORCID; the iD is the idp_sub). A GitHub root is NOT
+        identity-verified for R3 (that still needs an explicit ORCID link),
+        matching the existing model.
+        """
         created_at = datetime.now(UTC).isoformat()
+        is_orcid_root = idp is IdentityProvider.ORCID
         try:
             self.db.execute(
                 """
                 INSERT INTO accounts (
                     account_id, idp, idp_sub, display_name, email,
-                    trust_tier, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    trust_tier, created_at,
+                    identity_verified_at, identity_verified_by,
+                    identity_verification_method, identity_verification_note,
+                    orcid_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_id,
@@ -90,6 +102,11 @@ class AccountRepository:
                     email,
                     int(trust_tier),
                     created_at,
+                    created_at if is_orcid_root else None,
+                    f"orcid:{idp_sub}" if is_orcid_root else None,
+                    IdentityVerificationMethod.ORCID.value if is_orcid_root else None,
+                    display_name if is_orcid_root else None,
+                    idp_sub if is_orcid_root else None,
                 ),
             )
         except sqlite3.IntegrityError as e:

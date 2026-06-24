@@ -68,10 +68,12 @@ class ResearchStanding(IntEnum):
 class IdentityProvider(StrEnum):
     """Identity providers the coordinator accepts for account binding.
 
-    Phase 1 rooted accounts: GitHub only (auspexai org OAuth App) — rooting an
-    account by a new IdP requires a migration to relax the accounts.idp CHECK.
-    ORCID (D8) is supported as a *linked* identity (the account stays
-    GitHub-rooted; the ORCID iD is a separate column), so it needs no CHECK change.
+    A rooted account's idp may be GITHUB or ORCID (the accounts.idp CHECK was
+    relaxed in migration 0047). Researchers may root on ORCID (the academic
+    identity + the R3 basis); workers stay GitHub-rooted (the device flow). An
+    ORCID root is identity-verified by construction (AccountRepository.create
+    stamps identity_verified_*, method=ORCID). ORCID also remains LINKABLE to a
+    GitHub-rooted account (D8) — the iD lives in the orcid_id column either way.
     """
 
     GITHUB = "github"

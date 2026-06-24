@@ -7,7 +7,11 @@ from datetime import timedelta
 
 import pytest
 
-from auspexai_platform.db.models import IdentityProvider, TrustTier
+from auspexai_platform.db.models import (
+    IdentityProvider,
+    IdentityVerificationMethod,
+    TrustTier,
+)
 from auspexai_platform.db.repositories import AccountRepository
 from auspexai_platform.db.repositories.accounts import (
     BindingTokenConsumedError,
@@ -56,6 +60,37 @@ def test_create_returns_account_with_defaults(account_repository: AccountReposit
     assert account.display_name == "jasongagne-git"
     assert account.trust_tier is TrustTier.T1_AUTHENTICATED
     assert account.retired_at is None
+
+
+def test_create_orcid_root_is_identity_verified(account_repository: AccountRepository) -> None:
+    # An ORCID root is identity-verified BY CONSTRUCTION (migration 0047 relaxed
+    # the idp CHECK; create() stamps the identity columns) — R3-grade on day one,
+    # no separate link step. The idp_sub IS the ORCID iD, mirrored into orcid_id.
+    account = account_repository.create(
+        account_id="acct-orcidroot",
+        idp=IdentityProvider.ORCID,
+        idp_sub="0000-0002-1825-0097",
+        display_name="Josiah Carberry",
+    )
+    assert account.idp is IdentityProvider.ORCID
+    assert account.orcid_id == "0000-0002-1825-0097"
+    assert account.identity_verified_at is not None
+    assert account.identity_verification_method is IdentityVerificationMethod.ORCID
+    assert account.identity_verified_by == "orcid:0000-0002-1825-0097"
+
+
+def test_create_github_root_is_not_identity_verified(account_repository: AccountRepository) -> None:
+    # GitHub roots are NOT identity-verified for R3 (that still needs an explicit
+    # ORCID link) — the existing model is unchanged.
+    account = account_repository.create(
+        account_id="acct-ghroot",
+        idp=IdentityProvider.GITHUB,
+        idp_sub="246774008",
+        display_name="jasongagne-git",
+    )
+    assert account.identity_verified_at is None
+    assert account.identity_verification_method is None
+    assert account.orcid_id is None
 
 
 def test_create_duplicate_idp_sub_raises(account_repository: AccountRepository) -> None:
