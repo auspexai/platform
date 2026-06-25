@@ -72,11 +72,23 @@ def is_visible(
         return True
 
     if tag is ExposureTag.TENANT_SCOPED:
-        return (
+        if (
             credential.is_researcher()
             and credential.tenant_id is not None
             and resource_tenant_id is not None
             and credential.tenant_id == resource_tenant_id
+        ):
+            return True
+        # Tier-1: the ACCOUNT that RAN this experiment (under a public tenant it
+        # does not own) sees its OWN run's tenant-scoped fields. Scoped strictly
+        # to the runner account (account_id == resource_account_id, which the
+        # experiment routes set to submitted_by_account_id) — so an account never
+        # sees another account's run, nor the owning tenant's other rows.
+        return (
+            credential.is_account()
+            and credential.account_id is not None
+            and resource_account_id is not None
+            and credential.account_id == resource_account_id
         )
 
     if tag is ExposureTag.ACCOUNT_SCOPED:

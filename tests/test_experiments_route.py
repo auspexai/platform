@@ -66,7 +66,7 @@ def test_submit_requires_researcher_credential(
         json={"manifest": {"tenant_id": "x", "experiment_id": "y"}, "signature": {}},
     )
     assert response.status_code == 403
-    assert response.json()["detail"]["error"]["code"] == "researcher_required"
+    assert response.json()["detail"]["error"]["code"] == "researcher_or_account_required"
 
 
 def test_submit_rejects_maintainer_credential(client: TestClient, maintainer_token: str) -> None:

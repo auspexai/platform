@@ -48,6 +48,7 @@ from auspexai_platform.db.models import (
 )
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
+    AccountRepository,
     AttestationRepository,
     AuditRepository,
     CertifiedProfileRepository,
@@ -293,7 +294,15 @@ def _can_view(credential: Credential, experiment) -> bool:
     owning-tenant researcher. Tenant-private — no anonymous/cross-tenant view."""
     if credential.is_maintainer():
         return True
-    return credential.is_researcher() and credential.tenant_id == experiment.tenant_id
+    if credential.is_researcher() and credential.tenant_id == experiment.tenant_id:
+        return True
+    # Tier-1: the account that RAN this experiment may view it (it ran under a
+    # public tenant it does not own, so tenant-match would not apply).
+    return (
+        credential.is_account()
+        and credential.account_id is not None
+        and experiment.submitted_by_account_id == credential.account_id
+    )
 
 
 def _experiment_not_found(experiment_id: str) -> HTTPException:
@@ -399,6 +408,10 @@ def build_router(
     # Promotion-gate certifications (RFC 0001 / Ethics §6.7). Optional so the
     # router builds in tests without it; absent → no run is ever certified-cleared.
     certified_profile_repository: CertifiedProfileRepository | None = None,
+    # Tier-1: a connected ACCOUNT (no tenant) may run a public tenant's certified
+    # starter. Used to gate the account path on suspension + research standing
+    # (the other lookups here are tenant-scoped and don't apply to an account).
+    account_repository: AccountRepository | None = None,
     # §9 #48: injected lookups (wired in main.py from the account/application
     # repos, à la the scheduler's account_suspended_for_tenant). All optional so
     # the router builds in tests without them — defaults make every experiment
@@ -432,18 +445,8 @@ def build_router(
         body: ExperimentSubmissionRequest,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ExperimentResponse:
-        if not credential.is_researcher():
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={
-                    "error": {
-                        "code": "researcher_required",
-                        "message": "experiment submission requires a researcher credential",
-                        "details": {"credential_class": credential.kind.value},
-                    }
-                },
-            )
-
+        # Extract the manifest identity first — the account path's public-starter
+        # check below needs it.
         try:
             manifest_tenant, manifest_label = _extract_manifest_identity(body.manifest)
         except ValueError as e:
@@ -458,20 +461,94 @@ def build_router(
                 },
             ) from e
 
-        if manifest_tenant != credential.tenant_id:
+        # The certified profile (if any) is the PUBLIC-ACCESS GRANT: a connected
+        # account may run a public tenant's certified starter. Computed once and
+        # reused for the replication-floor seed below.
+        cert = (
+            certified_match(body.manifest, certified_profile_repository)
+            if certified_profile_repository is not None
+            else None
+        )
+
+        # Authorize. A tenant owner (Tier-2) submits under their OWN tenant. A
+        # connected ACCOUNT (Tier-1, no tenant) may run a public tenant's
+        # certified starter — the certification record IS the public grant; the
+        # account must be unsuspended + R1+ (a connected account is R1 by default).
+        if credential.is_researcher():
+            if manifest_tenant != credential.tenant_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": {
+                            "code": "manifest_tenant_mismatch",
+                            "message": (
+                                f"manifest tenant_id {manifest_tenant!r} does not match "
+                                f"the signing credential's tenant {credential.tenant_id!r}"
+                            ),
+                            "details": {
+                                "manifest_tenant": manifest_tenant,
+                                "credential_tenant": credential.tenant_id,
+                            },
+                        }
+                    },
+                )
+        elif credential.is_account():
+            if cert is None or cert.tenant_id != manifest_tenant:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": {
+                            "code": "not_a_public_certified_starter",
+                            "message": (
+                                "a connected account may only run a public tenant's "
+                                "certified starter; this manifest is not certified for "
+                                f"tenant {manifest_tenant!r}"
+                            ),
+                            "details": {"manifest_tenant": manifest_tenant},
+                        }
+                    },
+                )
+            # Fail-safe: without the account lookup we cannot verify suspension /
+            # standing, so the account path is rejected (acct stays None → 403).
+            acct = (
+                account_repository.get_by_id(credential.account_id)
+                if account_repository is not None and credential.account_id is not None
+                else None
+            )
+            if acct is None or acct.suspended_at is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": {
+                            "code": "account_not_runnable",
+                            "message": "this account is not authorized to run experiments",
+                            "details": {},
+                        }
+                    },
+                )
+            standing = account_repository.research_standing_summary(credential.account_id)
+            if int(standing.current) < int(ResearchStanding.R1_VERIFIED):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": {
+                            "code": "research_standing_too_low",
+                            "message": "running a certified starter requires research standing R1+",
+                            "details": {"research_standing": int(standing.current)},
+                        }
+                    },
+                )
+        else:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={
                     "error": {
-                        "code": "manifest_tenant_mismatch",
+                        "code": "researcher_or_account_required",
                         "message": (
-                            f"manifest tenant_id {manifest_tenant!r} does not match "
-                            f"the signing credential's tenant {credential.tenant_id!r}"
+                            "experiment submission requires a researcher or "
+                            "connected-account credential"
                         ),
-                        "details": {
-                            "manifest_tenant": manifest_tenant,
-                            "credential_tenant": credential.tenant_id,
-                        },
+                        "details": {"credential_class": credential.kind.value},
                     }
                 },
             )
@@ -526,6 +603,9 @@ def build_router(
                 manifest_hash=manifest.manifest_hash,
                 required_capabilities=_derive_required_capabilities(body.manifest),
                 requires_real_execution=bool(body.manifest.get("requires_real_execution")),
+                # The runner — for an account-run public starter this is the only
+                # link back to the researcher; for a tenant owner it's their account.
+                submitted_by_account_id=credential.account_id,
             )
         except DuplicateExperimentLabelError as e:
             raise HTTPException(
@@ -560,11 +640,7 @@ def build_router(
             # §6.7: a gate-certified starter runs at its CERTIFIED floor. DEFENSIVE only —
             # registered tenants floor at T1 (already 2), so this bites only a hypothetical
             # T0 (anonymous) submitter; not load-bearing for real newcomer-tenants.
-            cert = (
-                certified_match(body.manifest, certified_profile_repository)
-                if certified_profile_repository is not None
-                else None
-            )
+            # `cert` was computed once in the authorization gate above (reused).
             _target, _floor, _policy = resolve_replication(
                 requested_target=int(body.manifest.get("replication_factor", 1) or 1),
                 requested_floor=body.manifest.get("replication_floor"),
@@ -631,6 +707,7 @@ def build_router(
             _to_response(experiment),
             credential,
             resource_tenant_id=experiment.tenant_id,
+            resource_account_id=experiment.submitted_by_account_id,
         )
 
     @router.get(
@@ -653,6 +730,11 @@ def build_router(
             experiments = experiment_repository.list_all(assessment_decision=assessment)
         elif credential.is_researcher() and credential.tenant_id is not None:
             experiments = experiment_repository.list_all(tenant_id=credential.tenant_id)
+        elif credential.is_account() and credential.account_id is not None:
+            # Tier-1: a connected account's OWN runs (under public tenants).
+            experiments = experiment_repository.list_all(
+                submitted_by_account_id=credential.account_id
+            )
         else:
             experiments = []
         filtered = [
@@ -660,6 +742,7 @@ def build_router(
                 _to_response(e),
                 credential,
                 resource_tenant_id=e.tenant_id,
+                resource_account_id=e.submitted_by_account_id,
             )
             for e in experiments
         ]
@@ -684,6 +767,7 @@ def build_router(
             _to_response(experiment),
             credential,
             resource_tenant_id=experiment.tenant_id,
+            resource_account_id=experiment.submitted_by_account_id,
         )
 
     @router.post(

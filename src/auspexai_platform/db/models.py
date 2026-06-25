@@ -193,6 +193,12 @@ class Experiment(BaseModel):
     manifest_hash: str
     status: ExperimentStatus
     submitted_at: datetime
+    # The account that SUBMITTED this run. Tier-1: a connected researcher running
+    # a public tenant's certified starter — the experiment's tenant_id is the
+    # public tenant, this is the runner (so they list/view their own runs, and
+    # citation attributes to them). For a tenant-owner submit it is the tenant's
+    # own account. None for pre-0049 rows.
+    submitted_by_account_id: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     revision: int = 1

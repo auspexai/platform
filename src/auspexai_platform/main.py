@@ -249,6 +249,7 @@ def create_app(
             signing_key=receipt_signing_key,
             attestation_repository=attestation_repository,
             certified_profile_repository=certified_profile_repository,
+            account_repository=account_repository,  # Tier-1 account-run gate
             tenant_tier=_tenant_tier,  # §9 #48 class-by-tier auto-approval
             tenant_research_standing=_tenant_research_standing,  # D9 Phase 4 BYOT gate
             approved_classes=_approved_classes,

@@ -87,6 +87,7 @@ class ExperimentRepository:
         manifest_hash: str,
         required_capabilities: dict[str, list[str]] | None = None,
         requires_real_execution: bool = False,
+        submitted_by_account_id: str | None = None,
     ) -> Experiment:
         """Insert a new experiment in `submitted` state. Raises
         DuplicateExperimentLabelError if (tenant_id, label) already exists.
@@ -105,8 +106,9 @@ class ExperimentRepository:
                 INSERT INTO experiments (
                     experiment_id, tenant_id, tenant_experiment_label,
                     manifest_hash, status, submitted_at, revision,
-                    required_capabilities_json, requires_real_execution
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    required_capabilities_json, requires_real_execution,
+                    submitted_by_account_id
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     experiment_id,
@@ -117,6 +119,7 @@ class ExperimentRepository:
                     submitted_at,
                     caps_json,
                     int(requires_real_execution),
+                    submitted_by_account_id,
                 ),
             )
         except sqlite3.IntegrityError as e:
@@ -412,12 +415,18 @@ class ExperimentRepository:
         tenant_id: str | None = None,
         status: ExperimentStatus | None = None,
         assessment_decision: str | None = None,
+        submitted_by_account_id: str | None = None,
     ) -> list[Experiment]:
         clauses: list[str] = []
         params: list[object] = []
         if tenant_id is not None:
             clauses.append("tenant_id = ?")
             params.append(tenant_id)
+        if submitted_by_account_id is not None:
+            # Tier-1: a connected account's OWN runs (it ran under a public
+            # tenant, so tenant_id scoping would not find them).
+            clauses.append("submitted_by_account_id = ?")
+            params.append(submitted_by_account_id)
         if status is not None:
             clauses.append("status = ?")
             params.append(status.value)
@@ -443,6 +452,7 @@ class ExperimentRepository:
             manifest_hash=row["manifest_hash"],
             status=ExperimentStatus(row["status"]),
             submitted_at=datetime.fromisoformat(row["submitted_at"]),
+            submitted_by_account_id=_col(row, "submitted_by_account_id"),
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
             completed_at=(
                 datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None
