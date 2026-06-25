@@ -36,7 +36,7 @@ annotations as real objects sidesteps that. See CI-red postmortem 2026-05-30.
 
 import os
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -64,6 +64,7 @@ from auspexai_platform.oauth import (
 )
 from auspexai_platform.oauth.orcid import OrcidOAuthClient
 from auspexai_platform.rate_limit import limiter
+from auspexai_platform.worker_status import derive_worker_status
 
 # Where the ORCID callback bounces the researcher's browser when done. It's
 # their OWN local dashboard (127.0.0.1 resolves to each researcher's machine),
@@ -208,6 +209,27 @@ def _tier_name(tier: int) -> str:
     return names.get(tier, f"T{tier}")
 
 
+class AccountWorker(BaseModel):
+    """One worker CURRENTLY bound to the caller's account, with derived liveness,
+    for the dashboard Overview "Your workers" panel. Account-scoped by
+    construction — the route resolves the account from credential.account_id and
+    only returns that account's workers, so no third-party identity can appear."""
+
+    worker_id: str
+    pubkey_hex: str
+    trust_tier: int
+    status: str  # active | offline | quarantined | retired (derive_worker_status)
+    quarantine_reason: str | None = None
+    last_heartbeat_at: datetime | None = None
+    # Lifetime corroborated results this worker earned while bound to this account
+    # (the account_id_at_issue snapshot); 0 for a freshly-bound worker.
+    result_count: int = 0
+
+
+class AccountWorkersResponse(BaseModel):
+    workers: list[AccountWorker]
+
+
 def build_router(
     credential_dep,
     account_repository: AccountRepository,
@@ -226,6 +248,47 @@ def build_router(
 
     router = APIRouter()
     orcid_oauth_client = orcid_oauth_client or OrcidOAuthClient()
+
+    @router.get(
+        "/accounts/me/workers",
+        response_model=AccountWorkersResponse,
+        response_model_exclude_none=True,
+        status_code=status.HTTP_200_OK,
+    )
+    async def my_workers(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> AccountWorkersResponse:
+        """The caller's OWN-account workers + derived liveness, for the dashboard
+        Overview "Your workers" panel.
+
+        Account-scoped by construction: resolves the account from the caller's
+        credential and only returns workers CURRENTLY bound to it (live
+        workers.account_id). A logged-out worker drops off — the right "is my
+        compute connected now?" signal (the per-experiment activity view keeps
+        showing past contributors via the issuance snapshot). Returns an empty
+        list for a caller with no account (anonymous / unbound key)."""
+        if worker_repository is None or credential.account_id is None:
+            return AccountWorkersResponse(workers=[])
+        now = datetime.now(UTC)
+        counts = (
+            receipt_index_repository.receipt_counts_for_account(credential.account_id)
+            if receipt_index_repository is not None
+            else {}
+        )
+        workers = [
+            AccountWorker(
+                worker_id=w.worker_id,
+                pubkey_hex=w.pubkey_hex,
+                trust_tier=int(w.trust_tier),
+                status=derive_worker_status(w, now).value,
+                quarantine_reason=w.quarantine_reason,
+                last_heartbeat_at=w.last_heartbeat_at,
+                result_count=int(counts.get(w.worker_id, 0)),
+            )
+            for w in worker_repository.list_for_account(credential.account_id)
+        ]
+        workers.sort(key=lambda x: x.worker_id)
+        return AccountWorkersResponse(workers=workers)
 
     @router.post(
         "/accounts/oauth/exchange",

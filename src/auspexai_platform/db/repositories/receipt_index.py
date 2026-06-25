@@ -230,6 +230,23 @@ class ReceiptIndexRepository:
             return (0, 0)
         return (int(rows[0]["total"]), int(rows[0]["tenants"]))
 
+    def receipt_counts_for_account(self, account_id: str) -> dict[str, int]:
+        """Per-worker receipt counts for one account, by the `account_id_at_issue`
+        snapshot (0041) — how many corroborated results each worker earned while
+        bound to this account. Powers the Overview "Your workers" lifetime-results
+        column. Keyed by worker_id; a worker with no receipts for this account is
+        absent from the map (callers default to 0)."""
+        rows = self.db.execute(
+            """
+            SELECT worker_id, COUNT(*) AS n
+            FROM receipt_index
+            WHERE account_id_at_issue = ?
+            GROUP BY worker_id
+            """,
+            (account_id,),
+        )
+        return {r["worker_id"]: int(r["n"]) for r in rows}
+
     def account_corroboration_summary(
         self, account_id: str, *, equal_trust_enabled: bool = False
     ) -> tuple[int, int]:

@@ -82,6 +82,19 @@ class WhoamiResponse(BaseModel):
     orcid_id: Annotated[str | None, ExposureTag.ACCOUNT_SCOPED] = Field(
         default=None, description="Account holder only: the linked ORCID iD (D8), if any."
     )
+    # The account-identity root surfaced to the holder so the dashboard Identity
+    # card can render the GitHub identity alongside ORCID. `display_name` is the
+    # OAuth-verified handle (the GitHub login for a github-rooted account — the
+    # same value used for public citation); `idp` is which provider the account
+    # is rooted on ('github' | 'orcid'). Both account-scoped: never third-party.
+    display_name: Annotated[str | None, ExposureTag.ACCOUNT_SCOPED] = Field(
+        default=None,
+        description="Account holder only: the verified display name (GitHub login for a github root).",
+    )
+    idp: Annotated[str | None, ExposureTag.ACCOUNT_SCOPED] = Field(
+        default=None,
+        description="Account holder only: the identity-provider root ('github' | 'orcid').",
+    )
 
 
 def build_router(credential_dep, account_repository: AccountRepository | None = None) -> APIRouter:
@@ -107,12 +120,16 @@ def build_router(credential_dep, account_repository: AccountRepository | None = 
         rs_threshold = None
         rs_eligible = None
         orcid_id = None
+        display_name = None
+        idp = None
         if account_repository is not None and credential.account_id is not None:
             account = account_repository.get_by_id(credential.account_id)
             if account is not None:
                 suspended_at = account.suspended_at
                 suspension_reason = account.suspension_reason
                 orcid_id = account.orcid_id
+                display_name = account.display_name
+                idp = account.idp.value if account.idp is not None else None
                 rs = account_repository.research_standing_summary(credential.account_id)
                 research_standing = int(rs.current)
                 rs_distinct = rs.distinct_clean_completed_verified
@@ -130,6 +147,8 @@ def build_router(credential_dep, account_repository: AccountRepository | None = 
             research_standing_threshold=rs_threshold,
             research_standing_eligible_for_r2=rs_eligible,
             orcid_id=orcid_id,
+            display_name=display_name,
+            idp=idp,
         )
         return filter_for_credential(
             payload,

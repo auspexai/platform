@@ -149,6 +149,45 @@ def test_whoami_unsuspended_account_clears_suspension_fields(
     assert "suspension_reason" not in body
 
 
+def test_whoami_account_holder_sees_github_identity_root(
+    client: TestClient,
+    account_repository: AccountRepository,
+    tenant_repository: TenantRepository,
+    tenant_keypair: tuple[Ed25519PrivateKey, str],
+) -> None:
+    """The account holder sees their identity root on whoami: display_name (the
+    OAuth-verified GitHub login) + idp ('github'), so the dashboard Identity card
+    can render the GitHub identity beside ORCID. Account-scoped."""
+    priv, pubkey_hex = tenant_keypair
+    account_repository.create(
+        account_id="acct-gh01",
+        idp=IdentityProvider.GITHUB,
+        idp_sub="gh-12345",
+        display_name="jasongagne-git",
+    )
+    tenant_repository.register(
+        tenant_id="t-gh01", maintainer_pubkey=pubkey_hex, account_id="acct-gh01"
+    )
+    headers = sign_request(
+        privkey=priv,
+        pubkey_hex=pubkey_hex,
+        method="GET",
+        path="/api/v0/auth/whoami",
+        authority="testserver",
+        body=b"",
+    )
+    body = client.get("/api/v0/auth/whoami", headers=headers).json()
+    assert body["display_name"] == "jasongagne-git"
+    assert body["idp"] == "github"
+
+
+def test_whoami_anonymous_does_not_see_account_identity(client: TestClient) -> None:
+    """display_name + idp are ACCOUNT_SCOPED — they never leak to a third party."""
+    body = client.get("/api/v0/auth/whoami").json()
+    assert "display_name" not in body
+    assert "idp" not in body
+
+
 def test_invalid_bearer_token_returns_401(client: TestClient) -> None:
     response = client.get(
         "/api/v0/auth/whoami",
