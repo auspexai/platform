@@ -51,6 +51,7 @@ from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.api import trust_model_policy as trust_model_policy_routes
 from auspexai_platform.api import work_units as work_unit_routes
 from auspexai_platform.api import workers as worker_routes
+from auspexai_platform.auth.account_key_registry import AccountKeyRegistry
 from auspexai_platform.auth.bearer import TokenStore
 from auspexai_platform.auth.credential import Credential
 from auspexai_platform.auth.dependency import make_credential_dependency, require_maintainer
@@ -136,7 +137,8 @@ def create_app(
     # auth path reads from the DB on every request.
     tenant_registry = tenant_registry or TenantRegistry(tenant_repository)
     worker_registry = WorkerRegistry(worker_repository)
-    credential_resolver = CredentialResolver(tenant_registry, worker_registry)
+    account_key_registry = AccountKeyRegistry(account_repository)
+    credential_resolver = CredentialResolver(tenant_registry, worker_registry, account_key_registry)
 
     scheduler = Scheduler(
         experiment_repository,

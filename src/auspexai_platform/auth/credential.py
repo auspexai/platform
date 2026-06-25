@@ -21,8 +21,9 @@ class CredentialClass(StrEnum):
     driven actions like auto-complete; never bound to an HTTP request,
     appears only in audit_log entries).
 
-    ACCOUNT lands Phase 2-3 once accounts authenticate directly rather
-    than via a worker they are bound to.
+    ACCOUNT is a connected researcher whose dashboard key is bound directly to
+    an account (Tier-1 onboarding) with NO tenant yet — they can run certified
+    public starters, but not a tenant of their own until they create one.
     """
 
     MAINTAINER = "maintainer"
@@ -93,6 +94,16 @@ class Credential:
             trust_tier=trust_tier,
         )
 
+    @classmethod
+    def account(cls, *, account_id: str, pubkey_hex: str) -> Credential:
+        """A connected researcher: dashboard key bound to an account, no tenant
+        (Tier-1). Routes look up trust_tier / research_standing from account_id."""
+        return cls(
+            kind=CredentialClass.ACCOUNT,
+            account_id=account_id,
+            pubkey_hex=pubkey_hex,
+        )
+
     def is_maintainer(self) -> bool:
         return self.kind is CredentialClass.MAINTAINER
 
@@ -104,3 +115,6 @@ class Credential:
 
     def is_worker(self) -> bool:
         return self.kind is CredentialClass.WORKER
+
+    def is_account(self) -> bool:
+        return self.kind is CredentialClass.ACCOUNT

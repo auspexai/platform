@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.dependency import enforce_worker_active
+from auspexai_platform.auth.self_signed import verify_self_signed_request
 from auspexai_platform.db.models import (
     IdentityProvider,
     IdentityVerificationMethod,
@@ -95,6 +96,16 @@ class OAuthExchangeResponse(BaseModel):
     account_id: Annotated[str | None, ExposureTag.PUBLIC] = None
     binding_token: Annotated[str | None, ExposureTag.PUBLIC] = None
     expires_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
+    is_new_account: Annotated[bool | None, ExposureTag.PUBLIC] = None
+
+
+class AccountBindResponse(BaseModel):
+    """Wire shape for a Tier-1 account-key bind. PUBLIC — the calling key proved
+    possession but isn't a registered credential at bind time."""
+
+    account_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    idp: Annotated[str | None, ExposureTag.PUBLIC] = None
+    display_name: Annotated[str | None, ExposureTag.PUBLIC] = None
     is_new_account: Annotated[bool | None, ExposureTag.PUBLIC] = None
 
 
@@ -309,6 +320,96 @@ def build_router(
                 is_new_account=is_new,
             ),
             credential,
+        )
+
+    @router.post(
+        "/accounts/bind",
+        response_model=AccountBindResponse,
+        response_model_exclude_none=True,
+        status_code=status.HTTP_200_OK,
+    )
+    @limiter.limit("30/hour")
+    async def account_bind(
+        request: Request,
+        body: OAuthExchangeRequest,
+    ) -> AccountBindResponse:
+        """Tier-1 onboarding: bind the caller's dashboard key DIRECTLY to an
+        account — no tenant, no approval (like a worker connecting GitHub). The
+        request is RFC 9421-signed by the binding key (proof of possession); the
+        body carries the verified IdP token (GitHub or ORCID). The bound key then
+        resolves to a CredentialClass.ACCOUNT and can run certified public
+        starters. Re-binding (even via a different IdP) rebinds to the current
+        account (upsert)."""
+        pubkey_hex = await verify_self_signed_request(request)
+        try:
+            claim = identity_verifier.verify(body.idp, body.access_token)
+        except UnknownIdentityProviderError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": {
+                        "code": "unsupported_idp",
+                        "message": f"identity provider {body.idp.value!r} not enabled",
+                        "details": {"idp": body.idp.value},
+                    }
+                },
+            ) from e
+        except InvalidAccessTokenError as e:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "error": {
+                        "code": "invalid_access_token",
+                        "message": "the IdP did not accept the supplied access token",
+                        "details": {"reason": str(e)},
+                    }
+                },
+            ) from e
+
+        # Find or create the account (same volunteer-enrollment pattern + create race).
+        existing = account_repository.get_by_idp_subject(claim.idp, claim.idp_sub)
+        if existing is not None:
+            account = existing
+            is_new = False
+        else:
+            try:
+                account = account_repository.create(
+                    account_id=_generate_account_id(),
+                    idp=claim.idp,
+                    idp_sub=claim.idp_sub,
+                    display_name=claim.display_name,
+                    email=claim.email,
+                )
+                is_new = True
+            except DuplicateAccountError:
+                reread = account_repository.get_by_idp_subject(claim.idp, claim.idp_sub)
+                if reread is None:  # pragma: no cover — defensive
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail={
+                            "error": {
+                                "code": "account_create_race",
+                                "message": "account create raced and reread failed",
+                            }
+                        },
+                    ) from None
+                account = reread
+                is_new = False
+
+        account_repository.bind_key(account.account_id, pubkey_hex)
+        audit_repository.append(
+            actor_class=CredentialClass.ACCOUNT,
+            actor_identifier=account.display_name or account.account_id,
+            action="account.key_bound",
+            resource_type="account",
+            resource_id=account.account_id,
+            payload={"idp": claim.idp.value, "is_new_account": is_new},
+        )
+        return AccountBindResponse(
+            account_id=account.account_id,
+            idp=claim.idp.value,
+            display_name=account.display_name,
+            is_new_account=is_new,
         )
 
     # ---- account list (maintainer-only) ------------------------------------

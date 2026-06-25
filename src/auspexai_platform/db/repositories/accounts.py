@@ -115,6 +115,29 @@ class AccountRepository:
         assert got is not None
         return got
 
+    # ---- account-key binding (Tier-1 connect) ----
+
+    def bind_key(self, account_id: str, pubkey_hex: str) -> None:
+        """Bind a researcher's dashboard/SDK key to an account (Tier-1 connect).
+        Upsert — the latest connect wins, so re-connecting (even via a different
+        IdP) rebinds the key to the now-current account."""
+        self.db.execute(
+            """
+            INSERT OR REPLACE INTO account_keys (pubkey_hex, account_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (pubkey_hex.lower(), account_id, datetime.now(UTC).isoformat()),
+        )
+
+    def get_account_id_for_key(self, pubkey_hex: str) -> str | None:
+        """The account a dashboard key is bound to, or None — the account-key
+        registry the resolver consults after tenants + workers."""
+        rows = self.db.execute(
+            "SELECT account_id FROM account_keys WHERE pubkey_hex = ?",
+            (pubkey_hex.lower(),),
+        )
+        return rows[0]["account_id"] if rows else None
+
     # ---- trust escalation (§6.2.3) ----
 
     def promote(
