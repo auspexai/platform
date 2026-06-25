@@ -206,7 +206,7 @@ class World:
                         continue
                     offered = True
                     u = body["work_unit"]["unit_id"]
-                    self.signed(
+                    rr = self.signed(
                         "POST",
                         f"/api/v0/workers/{w['id']}/assignments/{u}/result",
                         privkey=w["priv"],
@@ -217,10 +217,25 @@ class World:
                             "completed_at": "2026-06-11T12:00:00+00:00",
                             "exit_code": 0,
                             "payload": {"answer": u},
-                            "worker_signature": "ZmFrZS1zaWc=",
+                            # #13a verifies worker_signature at submit — the soak's
+                            # drained results must carry a REAL signature (a fake one
+                            # bounces, leaving units IN_PROGRESS in an APPROVED
+                            # experiment, which the scheduler then offers → the soak's
+                            # "never offers soak units" invariant breaks).
+                            "worker_signature": sign_result_body(
+                                w["priv"],
+                                w["pub"],
+                                unit_id=u,
+                                completed_at="2026-06-11T12:00:00+00:00",
+                                exit_code=0,
+                                payload={"answer": u},
+                            ),
                             "assignment_id": body["assignment_id"],
                         },
                     )
+                    # Fail loudly if a future submit-contract change rejects these
+                    # again, instead of silently leaving an offerable unit behind.
+                    assert rr.status_code == 201, rr.text
                 if not offered:
                     return
 
