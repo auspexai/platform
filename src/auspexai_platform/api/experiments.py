@@ -663,7 +663,10 @@ def build_router(
             experiment = experiment_repository.get_by_id(experiment.experiment_id)
 
         audit_repository.append(
-            actor_class=CredentialClass.RESEARCHER,
+            # AUD-10 (A9 audit): attribute by the credential's actual class — an
+            # account-run public starter is ACCOUNT, not RESEARCHER (tenant_id None) —
+            # and record the runner account so the submit is attributable.
+            actor_class=credential.kind,
             actor_identifier=credential.pubkey_hex,
             actor_tenant_id=credential.tenant_id,
             action="experiment.submit",
@@ -672,6 +675,7 @@ def build_router(
             payload={
                 "tenant_experiment_label": experiment.tenant_experiment_label,
                 "manifest_hash": experiment.manifest_hash,
+                "submitted_by_account_id": experiment.submitted_by_account_id,
                 "integrity_policy": experiment.integrity_policy.value
                 if experiment.integrity_policy
                 else None,
