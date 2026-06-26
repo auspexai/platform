@@ -418,9 +418,18 @@ class AccountRepository:
             JOIN tenants t ON e.tenant_id = t.tenant_id
             JOIN attestations a
               ON a.experiment_id = e.experiment_id AND a.partial = 0
-            WHERE t.account_id = ? AND e.status = 'completed'
+            WHERE (
+                      -- AUD-6 (A9 audit): R-standing accrues to the RUNNER
+                      -- (submitted_by_account_id), so a connected Tier-1 researcher's
+                      -- runs under a PUBLIC tenant credit them, not the tenant owner.
+                      e.submitted_by_account_id = ?
+                      -- Backward-compat: pre-0049 rows have a NULL submitter → fall
+                      -- back to tenant ownership (preserves accrued Tier-2-owner evidence).
+                      OR (e.submitted_by_account_id IS NULL AND t.account_id = ?)
+                  )
+              AND e.status = 'completed'
             """,
-            (account_id,),
+            (account_id, account_id),
         )
         count = int(rows[0]["n"]) if rows else 0
         acct = self.get_by_id(account_id)
@@ -449,10 +458,16 @@ class AccountRepository:
             JOIN tenants t ON e.tenant_id = t.tenant_id
             JOIN attestations a
               ON a.experiment_id = e.experiment_id AND a.partial = 0
-            WHERE t.account_id = ? AND e.status = 'completed'
+            WHERE (
+                      -- AUD-6: dossier follows the RUNNER (submitted_by_account_id),
+                      -- with a NULL-submitter fallback to tenant ownership for pre-0049 rows.
+                      e.submitted_by_account_id = ?
+                      OR (e.submitted_by_account_id IS NULL AND t.account_id = ?)
+                  )
+              AND e.status = 'completed'
             ORDER BY e.completed_at DESC
             """,
-            (account_id,),
+            (account_id, account_id),
         )
         return [
             {

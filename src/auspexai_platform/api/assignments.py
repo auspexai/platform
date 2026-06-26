@@ -243,14 +243,19 @@ def _result_account_opted_in(worker_repository, account_repository, result) -> b
 
 
 def _result_ran_strict(worker_repository, result) -> bool:
-    """Firewall #1 (A2): did this RESULT run under STRICT containment? Prefers the
-    worker-SIGNED `ran_under` (v2 result, #32 — accountable, covered by the
-    signature verified at submit); falls back to the worker's reported
-    `sandbox_policy` capability for a pre-v2 result during the fleet roll."""
+    """Firewall #1 (A2): did this RESULT run under STRICT containment? Counts ONLY
+    the worker-SIGNED `ran_under` (a v2 result, #32 — accountable, covered by the
+    signature verified at submit).
+
+    AUD-3 (A9 audit): the pre-v2 fallback to the worker's self-reported
+    `sandbox_policy` capability was REMOVED — it was spoofable (a v1 worker could
+    heartbeat `sandbox_policy='strict'`, actually run permissive, and still earn
+    STRICT-contained trust). A missing/legacy signed claim now earns NO STRICT
+    trust (fail-closed); the fleet is v2 (worker 0.2.38), so no live impact.
+    `worker_repository` is retained in the signature for call-site compatibility."""
     policy = getattr(result, "ran_under", None)
     if policy is None:
-        w = worker_repository.get_by_id(result.worker_id)
-        policy = w.capabilities.get("sandbox_policy") if w is not None else None
+        return False
     return containment_rank(policy) >= containment_rank(CONTAINMENT_STRICT)
 
 

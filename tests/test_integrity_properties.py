@@ -473,9 +473,17 @@ class ResultAcceptanceMachine(RuleBasedStateMachine):
     @precondition(lambda self: any(not a["submitted"] for a in self.assignments))
     @rule(data=st.data())
     def submit_result_legacy_wire(self, data) -> None:
-        """Pre-v0.2.2 worker: no assignment_id on the wire. Only exercised when
-        the (unit, worker) pair is unambiguous among NON-TERMINAL experiments —
-        the ambiguous case is pinned by its own targeted test below."""
+        """Pre-v0.2.2 worker: no assignment_id on the wire. Only exercised when the
+        (unit, worker) pair is unambiguous across ALL experiments (terminal included)
+        — i.e. `a` is the sole assignment for that pair, so the bare-unit_id scan
+        resolves deterministically to it. The ambiguous/collision case (incl. an
+        aborted + active sibling, where the scan correctly lands the result in the
+        ACTIVE one — not 404) is pinned by its own targeted test below.
+
+        NB: the prior guard counted only NON-TERMINAL siblings (`<= 1`), which let an
+        aborted `a` through when an active sibling existed; `_submit` then demanded 404
+        while the route correctly accepted into the active sibling (201) — a
+        false-positive. Production is correct per the targeted test; the guard wasn't."""
         open_unambiguous = [
             a
             for a in self.assignments
@@ -483,11 +491,9 @@ class ResultAcceptanceMachine(RuleBasedStateMachine):
             and sum(
                 1
                 for b in self.assignments
-                if b["unit_id"] == a["unit_id"]
-                and b["worker"]["id"] == a["worker"]["id"]
-                and self.exps[b["exp_id"]]["status"] not in ("aborted", "archived")
+                if b["unit_id"] == a["unit_id"] and b["worker"]["id"] == a["worker"]["id"]
             )
-            <= 1
+            == 1
         ]
         if not open_unambiguous:
             return

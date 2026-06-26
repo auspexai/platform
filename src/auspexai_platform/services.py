@@ -235,6 +235,9 @@ def build_coordinator_services(
             },
             entries=entries,
             diverged_units=diverged_units,
+            # AUD-5: sign the experiment's ACTUAL (target, floor), not the coarse policy map.
+            replication_target=experiment.replication_target,
+            replication_floor=experiment.replication_floor,
         )
 
     def _promotion_auto_t1_t2() -> bool:

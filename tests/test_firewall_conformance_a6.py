@@ -144,3 +144,43 @@ def test_f1c_agreement_and_divergence_earn_identical_trust_under_flip(db):
     agree = receipts.account_corroboration_summary("agree", equal_trust_enabled=True)[0]
     diverge = receipts.account_corroboration_summary("diverge", equal_trust_enabled=True)[0]
     assert agree == diverge == 1, "F1-c: agreement and divergence must earn identical trust"
+
+
+def test_f1b_divergence_does_not_auto_demote(db):
+    """F1-b (full form — AUD-4): a worker whose unit DIVERGED is never auto-demoted for
+    diverging. There is no system/auto demote path (demotion is maintainer-only), so
+    recording a STRICT divergence leaves the account's tier untouched — and the
+    divergence still earns equal trust (cf. F1-c). Backs the previously comment-only
+    'no auto-demote path exists' half of F1-b with a concrete assertion."""
+    accounts = AccountRepository(db)
+    tenants = TenantRepository(db)
+    workers = WorkerRepository(db)
+    experiments = ExperimentRepository(db)
+    manifests = ManifestRepository(db)
+    receipts = ReceiptIndexRepository(db)
+
+    tenants.register(tenant_id="t", maintainer_pubkey="aa" * 32)
+    m = manifests.insert(
+        tenant_id="t",
+        manifest_json={"tenant_id": "t", "experiment_id": "e", "models": []},
+        signature_json={"maintainer_pubkey_hex": "00" * 32, "signature_b64": "dGVzdA=="},
+    )
+    exp = experiments.create(
+        tenant_id="t", tenant_experiment_label="e", manifest_hash=m.manifest_hash
+    )
+    accounts.create(account_id="acct-d", idp=IdentityProvider.GITHUB, idp_sub="9")  # T1 by default
+    workers.enroll(worker_id="w-d", pubkey_hex="22" * 32)
+    workers.bind_account("w-d", account_id="acct-d", trust_tier=TrustTier.T1_AUTHENTICATED)
+
+    before = accounts.get_by_id("acct-d").trust_tier
+    receipts.record_divergence(
+        experiment_id=exp.experiment_id,
+        worker_id="w-d",
+        worker_pubkey="22" * 32,
+        unit_id="u",
+        ran_under_strict=True,
+    )
+    after = accounts.get_by_id("acct-d").trust_tier
+    assert before == after == TrustTier.T1_AUTHENTICATED, "divergence must never auto-demote (F1-b)"
+    # The divergence is still RECOGNIZED as trust (equal, cf. F1-c) — not penalized.
+    assert receipts.account_corroboration_summary("acct-d", equal_trust_enabled=True)[0] == 1

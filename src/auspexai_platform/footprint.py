@@ -73,15 +73,33 @@ def integrity_basis_counts(entries, diverged_units) -> dict[str, int]:
 
 
 def replication_footprint(
-    integrity_policy: IntegrityPolicy | str, tenant_tier: TrustTier | int
+    integrity_policy: IntegrityPolicy | str,
+    tenant_tier: TrustTier | int,
+    *,
+    replication_target: int | None = None,
+    replication_floor: int | None = None,
 ) -> dict[str, Any]:
     """The replication policy in force + its firewall-#4 provenance: `tier_floored`
     (the policy sits exactly at the tenant tier's floor — A') and `sub_floor` (the
-    policy is below the floor, only reachable via an audited force override)."""
+    policy is below the floor, only reachable via an audited force override).
+
+    AUD-5 (A9 audit): the signed `replication_target`/`replication_floor` now report
+    the experiment's ACTUAL values (C14 migration 0040 — the decoupled source of
+    truth), not the coarse `INTEGRITY_POLICY_REPLICATION` map (which signed e.g. 3
+    for a repl-2 experiment). `integrity_policy` stays the descriptive label;
+    `replication_factor` is kept as a back-compat alias = the real target. The
+    policy-map is the fallback only when a target wasn't supplied (legacy callers)."""
     policy = IntegrityPolicy(integrity_policy)
+    target = (
+        replication_target
+        if replication_target is not None
+        else INTEGRITY_POLICY_REPLICATION.get(policy)
+    )
     return {
         "integrity_policy": policy.value,
-        "replication_factor": INTEGRITY_POLICY_REPLICATION.get(policy),
+        "replication_target": target,
+        "replication_floor": replication_floor,
+        "replication_factor": target,  # back-compat alias; now the real target, not the map
         "tier_floored": policy == policy_floor_for_tier(tenant_tier),
         "sub_floor": is_sub_floor_policy(policy, tenant_tier),
     }
@@ -175,6 +193,8 @@ def assemble_governance_footprint(
     containment: dict[str, Any],
     entries,
     diverged_units,
+    replication_target: int | None = None,  # AUD-5: the real C14 (target, floor)
+    replication_floor: int | None = None,
 ) -> dict[str, Any]:
     """Assemble the full `governance_footprint` dict (firewall #2 §4). Pure: the
     caller resolves the asserted inputs from the DBs; the recomputable
@@ -182,7 +202,12 @@ def assemble_governance_footprint(
     return {
         "schema_version": FOOTPRINT_SCHEMA_VERSION,
         "tenant": {"tier": tier_label(tenant_tier), "identity_gate": identity_gate},
-        "replication": replication_footprint(integrity_policy, tenant_tier),
+        "replication": replication_footprint(
+            integrity_policy,
+            tenant_tier,
+            replication_target=replication_target,
+            replication_floor=replication_floor,
+        ),
         "approval": {
             "experiment": approval_experiment,  # "auto" | "human"
             "assessment": assessment,  # {research_class, tier, envelope} | None

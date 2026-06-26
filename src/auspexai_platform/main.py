@@ -45,6 +45,7 @@ from auspexai_platform.api import receipts as receipt_routes
 from auspexai_platform.api import releases as release_routes
 from auspexai_platform.api import results as results_routes
 from auspexai_platform.api import scheduler as scheduler_routes
+from auspexai_platform.api import self_observation as self_observation_routes
 from auspexai_platform.api import software_requests as software_request_routes
 from auspexai_platform.api import tenant_applications as tenant_application_routes
 from auspexai_platform.api import tenants as tenant_routes
@@ -398,6 +399,7 @@ def create_app(
             vouch_repository=vouch_repository,
             experiment_repository=experiment_repository,
             audit_repository=audit_repository,
+            trust_model_policy_repository=trust_model_policy_repository,  # AUD-2
         ),
         prefix="/api/v0",
         tags=["receipts"],
@@ -422,6 +424,13 @@ def create_app(
         audit_routes.build_router(credential_dep, audit_repository),
         prefix="/api/v0",
         tags=["audit"],
+    )
+    # AUD-1 (A9 audit): wire firewall #5 self-observation so the equal-trust
+    # flip is observable live (signals.py previously had no production caller).
+    app.include_router(
+        self_observation_routes.build_router(credential_dep, db),
+        prefix="/api/v0",
+        tags=["maintainer"],
     )
     app.include_router(
         model_request_routes.build_router(

@@ -139,9 +139,10 @@ def test_v2_strict_on_strict_required_is_compliant(
 
 
 def test_result_ran_strict_prefers_signed_over_capability(db):
-    """The trust resolver reads the SIGNED ran_under first; the worker's heartbeat
-    capability is only a pre-v2 fallback. So a worker REPORTING strict can't make a
-    permissive-SIGNED result count as strict — the signed (accountable) claim wins."""
+    """The trust resolver counts ONLY the SIGNED ran_under. A worker REPORTING strict
+    can't make a permissive-SIGNED result count as strict (the signed claim wins), and
+    AUD-3 (A9 audit): a v1 result with NO signed claim earns no STRICT trust even if the
+    worker heartbeats strict — the spoofable capability fallback was removed (fail-closed)."""
     import types
 
     from auspexai_platform.api.assignments import _result_ran_strict
@@ -156,5 +157,6 @@ def test_result_ran_strict_prefers_signed_over_capability(db):
     assert not _result_ran_strict(
         workers, types.SimpleNamespace(ran_under="permissive", worker_id="w1")
     )
-    # Pre-v2 (no signed value) → falls back to the reported capability (strict).
-    assert _result_ran_strict(workers, types.SimpleNamespace(ran_under=None, worker_id="w1"))
+    # AUD-3: a v1 result (no signed value) earns NO strict trust — even though the
+    # worker heartbeats sandbox_policy='strict'. The spoofable fallback is gone.
+    assert not _result_ran_strict(workers, types.SimpleNamespace(ran_under=None, worker_id="w1"))

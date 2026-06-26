@@ -112,6 +112,7 @@ class AccountBindResponse(BaseModel):
 
 class PromoteRequest(BaseModel):
     target_tier: int = Field(ge=1, le=3)
+    reason: str  # AUD-7: mandatory — every trust action carries a recorded reason (matches demote)
     verification_method: IdentityVerificationMethod | None = None
     verification_note: str | None = None
 
@@ -122,7 +123,9 @@ class DemoteRequest(BaseModel):
 
 
 class SuspendRequest(BaseModel):
-    reason: str | None = None
+    reason: (
+        str  # AUD-12: mandatory — the charter promises every suspension carries a recorded reason
+    )
 
 
 class AccountTrustResponse(BaseModel):
@@ -495,8 +498,18 @@ def build_router(
                 return None
             from auspexai_platform.eligibility import compute_t2_eligibility
 
-            receipt_count, distinct_tenants = receipt_index_repository.account_receipt_summary(
-                account.account_id
+            # AUD-2: the readiness/"earned green" must consult the firewall-aligned
+            # corroboration metric (account-dedup'd + STRICT-only when the flip is on),
+            # not the raw, account-farmable account_receipt_summary COUNT(*).
+            _equal_trust = (
+                trust_model_policy_repository.get().equal_trust_enabled
+                if trust_model_policy_repository is not None
+                else False
+            )
+            receipt_count, distinct_tenants = (
+                receipt_index_repository.account_corroboration_summary(
+                    account.account_id, equal_trust_enabled=_equal_trust
+                )
             )
             active_vouches = (
                 vouch_repository.list_for_target(account.account_id) if vouch_repository else []
@@ -604,8 +617,16 @@ def build_router(
             active_vouches = (
                 vouch_repository.list_for_target(account_id) if vouch_repository else []
             )
+            # AUD-2: gate-warning math uses the firewall-aligned corroboration metric.
+            _equal_trust = (
+                trust_model_policy_repository.get().equal_trust_enabled
+                if trust_model_policy_repository is not None
+                else False
+            )
             _rc, _dt = (
-                receipt_index_repository.account_receipt_summary(account_id)
+                receipt_index_repository.account_corroboration_summary(
+                    account_id, equal_trust_enabled=_equal_trust
+                )
                 if receipt_index_repository
                 else (0, 0)
             )
@@ -669,6 +690,7 @@ def build_router(
             payload={
                 "old_tier": int(current),
                 "new_tier": int(target),
+                "reason": body.reason,  # AUD-7: the console-collected reason is now persisted
                 "verification_method": body.verification_method.value
                 if body.verification_method
                 else None,

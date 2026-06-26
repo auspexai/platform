@@ -342,6 +342,7 @@ def build_router(
     vouch_repository=None,
     experiment_repository: ExperimentRepository | None = None,
     audit_repository: AuditRepository | None = None,
+    trust_model_policy_repository=None,  # firewall #1 (A2) flip toggle; OFF when unwired (AUD-2)
 ) -> APIRouter:
     """Build the receipts router.
 
@@ -941,6 +942,11 @@ def build_router(
                 thresholds=eligibility_thresholds,
                 account=account,
                 active_vouches=active_vouches,
+                equal_trust_enabled=(  # AUD-2: firewall-aligned corroboration metric
+                    trust_model_policy_repository.get().equal_trust_enabled
+                    if trust_model_policy_repository is not None
+                    else False
+                ),
             )
             return ReceiptStatsResponse(
                 account_id=stats.account_id,

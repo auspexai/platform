@@ -202,6 +202,7 @@ def compute_receipt_stats(
     thresholds: EligibilityThresholds,
     account: Account | None = None,
     active_vouches: list[Vouch] | None = None,
+    equal_trust_enabled: bool = False,
 ) -> ReceiptStats:
     """Aggregate one account's receipt history + render the eligibility readout
     for every future tier (currently just T2; T3 lands when T3-bound vetting
@@ -209,9 +210,17 @@ def compute_receipt_stats(
     """
     entries = receipt_index_repository.list_for_account(account_id)
     distinct_experiment_ids = {e.experiment_id for e in entries}
-    # Firewall #3 (inc-2): the AUTHORITATIVE distinct-tenant count (receipt_index ⨝
-    # workers ⨝ experiments), replacing the old experiments-as-upper-bound placeholder.
-    _total, distinct_tenant_count = receipt_index_repository.account_receipt_summary(account_id)
+    # AUD-2 (A9 audit): the AUTHORITATIVE trust metric is the firewall #3 (A4) +
+    # firewall #1 (A2) corroboration summary — DISTINCT corroborated UNITS (dedup'd
+    # per account, so N workers under one account corroborating one unit earn ONE,
+    # not N) and STRICT-only agreement-plus-divergence when the equal-trust flip is on.
+    # This replaces the raw `account_receipt_summary` COUNT(*), which is
+    # account-farmable + agreement-only and bypassed both firewalls.
+    corroborated_units, distinct_tenant_count = (
+        receipt_index_repository.account_corroboration_summary(
+            account_id, equal_trust_enabled=equal_trust_enabled
+        )
+    )
 
     first_at = entries[-1].issued_at.isoformat() if entries else None
     last_at = entries[0].issued_at.isoformat() if entries else None
@@ -220,7 +229,7 @@ def compute_receipt_stats(
     if current_tier < int(TrustTier.T2_TRUSTED):
         eligibility_by_tier.append(
             compute_t2_eligibility(
-                receipt_count=len(entries),
+                receipt_count=corroborated_units,
                 distinct_tenants=distinct_tenant_count,
                 thresholds=thresholds,
                 account=account,
