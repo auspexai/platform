@@ -24,7 +24,11 @@ prerelease, unknown repo, duplicate) so GitHub doesn't queue redeliveries
 for events we deliberately skip.
 """
 
-from __future__ import annotations
+# NOTE: deliberately NO `from __future__ import annotations` here — this route
+# carries slowapi's `@limiter.limit`, and stringized annotations under the
+# limiter wrapper break FastAPI's signature resolution (see the CI-red postmortem
+# 2026-05-30 + the matching notes in api/receipts.py / api/accounts.py). All
+# annotations in this module are runtime-safe on 3.11/3.12 without it.
 
 import hashlib
 import hmac
@@ -42,6 +46,7 @@ from auspexai_platform.db.repositories import (
     SoftwareRequestRepository,
 )
 from auspexai_platform.events import EventBus
+from auspexai_platform.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +92,7 @@ def build_router(
     router = APIRouter()
 
     @router.post("/webhooks/github/releases")
+    @limiter.limit("30/minute")
     async def github_release_webhook(request: Request) -> JSONResponse:
         if not webhook_secret:
             return JSONResponse(

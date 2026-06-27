@@ -34,6 +34,7 @@ mis-classifies it as a Query param (every POST-body route then 422s). Keeping
 annotations as real objects sidesteps that. See CI-red postmortem 2026-05-30.
 """
 
+import logging
 import os
 import secrets
 from datetime import UTC, datetime
@@ -65,6 +66,8 @@ from auspexai_platform.oauth import (
 from auspexai_platform.oauth.orcid import OrcidOAuthClient
 from auspexai_platform.rate_limit import limiter
 from auspexai_platform.worker_status import derive_worker_status
+
+logger = logging.getLogger(__name__)
 
 # Where the ORCID callback bounces the researcher's browser when done. It's
 # their OWN local dashboard (127.0.0.1 resolves to each researcher's machine),
@@ -342,13 +345,13 @@ def build_router(
                 },
             ) from e
         except InvalidAccessTokenError as e:
+            logger.warning("IdP %s rejected the supplied access token: %s", body.idp.value, e)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={
                     "error": {
                         "code": "invalid_access_token",
                         "message": "the IdP did not accept the supplied access token",
-                        "details": {"reason": str(e)},
                     }
                 },
             ) from e
@@ -442,13 +445,13 @@ def build_router(
                 },
             ) from e
         except InvalidAccessTokenError as e:
+            logger.warning("IdP %s rejected the supplied access token: %s", body.idp.value, e)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={
                     "error": {
                         "code": "invalid_access_token",
                         "message": "the IdP did not accept the supplied access token",
-                        "details": {"reason": str(e)},
                     }
                 },
             ) from e
@@ -981,13 +984,13 @@ def build_router(
                 detail="ORCID identity provider is not enabled",
             ) from e
         except InvalidAccessTokenError as e:
+            logger.warning("ORCID rejected access token for account %s: %s", account_id, e)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={
                     "error": {
                         "code": "invalid_access_token",
                         "message": "ORCID did not accept the supplied access token",
-                        "details": {"reason": str(e)},
                     }
                 },
             ) from e

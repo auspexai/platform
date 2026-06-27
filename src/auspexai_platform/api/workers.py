@@ -32,6 +32,7 @@ resolution for the `body:` param (FastAPI mis-classifies it as Query → 422).
 See the CI-red postmortem 2026-05-30 and the matching note in api/accounts.py.
 """
 
+import logging
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any
@@ -66,6 +67,8 @@ from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.rate_limit import limiter
 from auspexai_platform.scheduler.capacity import experiments_collapsed_by_removing
 from auspexai_platform.worker_status import derive_worker_status, heartbeat_cutoff
+
+logger = logging.getLogger(__name__)
 
 
 def _publish_worker_status(event_bus: EventBus | None, worker, *, trigger: str) -> None:
@@ -357,13 +360,13 @@ def build_router(
                 capabilities=body.capabilities,
             )
         except DuplicateWorkerError as e:
+            logger.warning("worker enroll conflict for pubkey %s: %s", pubkey_hex, e)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
                     "error": {
                         "code": "pubkey_already_enrolled",
                         "message": "this pubkey is already registered as a worker",
-                        "details": {"db_error": str(e)},
                     }
                 },
             ) from e

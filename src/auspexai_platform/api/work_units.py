@@ -26,6 +26,7 @@ return 404 if no per-job DB exists yet (no submissions ever).
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -42,6 +43,8 @@ from auspexai_platform.db.repositories import (
 )
 from auspexai_platform.db.repositories.work_units import DuplicateWorkUnitError
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
+
+logger = logging.getLogger(__name__)
 
 # ---- request / response models --------------------------------------------
 
@@ -349,6 +352,7 @@ def build_router(
                 replication_target=replication_target,
             )
         except DuplicateWorkUnitError as e:
+            logger.warning("duplicate work-unit in batch for experiment %s: %s", experiment_id, e)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
@@ -358,7 +362,6 @@ def build_router(
                             "one or more unit_ids in this batch were already "
                             "submitted for this experiment"
                         ),
-                        "details": {"db_error": str(e)},
                     }
                 },
             ) from e

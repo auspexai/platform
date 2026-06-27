@@ -18,6 +18,7 @@ Field-exposure:
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Annotated
 
@@ -34,6 +35,8 @@ from auspexai_platform.db.repositories import (
 )
 from auspexai_platform.db.repositories.tenants import DuplicateTenantError
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
+
+logger = logging.getLogger(__name__)
 
 # ---- response models -------------------------------------------------------
 
@@ -194,13 +197,13 @@ def build_router(
                 account_id=body.account_id,
             )
         except DuplicateTenantError as e:
+            logger.warning("tenant register conflict for %s: %s", body.tenant_id, e)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
                     "error": {
                         "code": "duplicate_tenant",
                         "message": "tenant_id or maintainer_pubkey already registered",
-                        "details": {"db_error": str(e)},
                     }
                 },
             ) from e

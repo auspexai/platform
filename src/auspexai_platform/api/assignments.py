@@ -44,6 +44,7 @@ proof; receipt issuance re-anchors the same body hash for external verifiers.
 
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any
@@ -97,6 +98,8 @@ from auspexai_platform.scheduler import (
 from auspexai_platform.scheduler.conductor import plan_prestage_for_worker
 from auspexai_platform.weights import served_weights_verdict
 from auspexai_platform.worker_status import heartbeat_cutoff
+
+logger = logging.getLogger(__name__)
 
 # ---- response models ------------------------------------------------------
 
@@ -861,12 +864,15 @@ def build_router(
                 reason=body.reason,
             )
         except AssignmentAlreadyResolvedError as exc:
+            logger.warning(
+                "refuse on already-resolved assignment %s: %s", assignment.assignment_id, exc
+            )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
                     "error": {
                         "code": "assignment_already_resolved",
-                        "message": str(exc),
+                        "message": "this assignment has already been resolved",
                         "details": {
                             "assignment_id": assignment.assignment_id,
                             "has_result": assignment.result_id is not None,

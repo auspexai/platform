@@ -43,6 +43,7 @@ the `body:` param against the wrong globals and mis-classifies it as a Query
 param (the route then 422s). See CI-red postmortem 2026-05-30.
 """
 
+import logging
 import secrets
 from datetime import datetime
 
@@ -71,6 +72,8 @@ from auspexai_platform.oauth import (
     UnknownIdentityProviderError,
 )
 from auspexai_platform.rate_limit import limiter
+
+logger = logging.getLogger(__name__)
 
 # ---- research-class taxonomy --------------------------------------------------
 
@@ -358,13 +361,13 @@ def build_router(
                 },
             ) from e
         except InvalidAccessTokenError as e:
+            logger.warning("IdP %s rejected the tenant-application access token: %s", idp.value, e)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={
                     "error": {
                         "code": "invalid_access_token",
                         "message": "the IdP did not accept the supplied access token",
-                        "details": {"reason": str(e)},
                     }
                 },
             ) from e

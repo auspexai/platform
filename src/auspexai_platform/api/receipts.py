@@ -499,7 +499,9 @@ def build_router(
         "/experiments/{experiment_id}/citation",
         response_model=ExperimentCitationResponse,
     )
+    @limiter.limit("60/minute")
     async def experiment_citation(
+        request: Request,
         experiment_id: str,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ExperimentCitationResponse:
@@ -558,7 +560,8 @@ def build_router(
         response_model=ReceiptFetchResponse,
         response_model_exclude_none=True,
     )
-    async def get_receipt(receipt_id: str) -> ReceiptFetchResponse:
+    @limiter.limit("60/minute")
+    async def get_receipt(request: Request, receipt_id: str) -> ReceiptFetchResponse:
         """Anonymous-public. Fetch a receipt by its ID.
 
         Per §6.8.1 DOI-analogue framing: receipts are cite-by-ID artifacts.

@@ -27,6 +27,7 @@ Manifest submission flow:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import datetime
 from typing import Annotated, Any
@@ -71,6 +72,8 @@ from auspexai_platform.scheduler import (
     required_containment_for_tier,
     resolve_replication,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---- response models -------------------------------------------------------
 
@@ -586,13 +589,13 @@ def build_router(
                 signature_json=body.signature,
             )
         except DuplicateManifestError as e:
+            logger.warning("duplicate manifest for tenant %s: %s", manifest_tenant, e)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
                     "error": {
                         "code": "duplicate_manifest",
                         "message": "an identical manifest is already stored",
-                        "details": {"db_error": str(e)},
                     }
                 },
             ) from e
