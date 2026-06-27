@@ -1,8 +1,10 @@
 """Citation/contributor ledger (System B) — the aggregation behind
-GET /experiments/{id}/citation. NON-RETROACTIVE consent: an account is named only if
-it was opted in AT CONTRIBUTION (the receipt's `public_attribution_at_issue` snapshot)
-AND is still opted in now. The snapshot blocks retroactive opt-IN; the current flag
-preserves reversible opt-OUT. Unlinked (T0) workers aren't contributor accounts.
+GET /experiments/{id}/citation. DURABLE PER-CONTRIBUTION consent (revised 2026-06-26):
+an account is named for a contribution iff it was opted in AT CONTRIBUTION (the
+receipt's `public_attribution_at_issue` snapshot). Work done while public stays
+citable; work done while anonymous stays anonymous — a later opt-out does NOT un-cite
+past public work (it only affects future contributions). Unlinked (T0) workers aren't
+contributor accounts.
 """
 
 from __future__ import annotations
@@ -68,7 +70,9 @@ class _AcctRepo:
         # at_issue=T, now=T → NAMED as the verified display_name "ada" (the GitHub
         # login); the attribution_name "Ada Lovelace" is IGNORED (hardened — no fake names).
         "a_named": _Account(True, "Ada Lovelace", "ada"),
-        "a_optout": _Account(False, None, "bob"),  # at_issue=T, now=F → anon (opt-out)
+        "a_optout": _Account(
+            False, None, "bob"
+        ),  # at_issue=T, now=F → STILL NAMED (durable; opt-out only affects future)
         "a_late": _Account(True, "Grace", "grace"),  # at_issue=F, now=T → anon (non-retroactive)
     }
 
@@ -76,16 +80,17 @@ class _AcctRepo:
         return self._map.get(aid)
 
 
-def test_contributors_non_retroactive_and_reversible() -> None:
+def test_contributors_durable_per_contribution() -> None:
     named, anonymous, total = _experiment_contributors(
         "exp-x", _ReceiptIndex(), _WorkerRepo(), _AcctRepo()
     )
-    # Only a_named: opted in at contribution AND still opted in. Credit = the verified
-    # display_name ("ada"), NOT the now-ignored attribution_name ("Ada Lovelace").
-    assert named == ["ada"]
-    # a_optout (withdrew consent) + a_late (opted in only AFTER contributing) both anonymous.
-    assert anonymous == 2
-    # 3 contributor accounts; w_t0 has no account → not counted.
+    # DURABLE per-contribution consent: a_named AND a_optout were BOTH opted in AT
+    # contribution, so both stay NAMED — a later opt-out does NOT un-cite past public
+    # work. Credit = the verified display_name ("ada"/"bob"), NOT attribution_name.
+    assert named == ["ada", "bob"]
+    # Only a_late is anonymous: opted in AFTER contributing (at_issue=F → still non-retroactive).
+    assert anonymous == 1
+    # 3 contributor accounts; w_t0 + w_relogged have no account snapshot → not counted.
     assert total == 3
 
 

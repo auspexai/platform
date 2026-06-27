@@ -181,11 +181,22 @@ def _experiment_contributors(
     experiment_id: str, receipt_index_repository, worker_repository, account_repository
 ) -> tuple[list[str], int, int]:
     """Resolve a completed experiment's distinct contributing accounts →
-    (opted-in display names sorted, anonymous count, total accounts). NON-RETROACTIVE:
-    an account is NAMED only if it was opted in AT CONTRIBUTION (the receipt's
-    `public_attribution_at_issue` snapshot) AND is still opted in now. The snapshot
-    blocks retroactive opt-IN (opting in later can't credit past anonymous runs); the
-    current flag preserves reversible opt-OUT (withdrawing consent while live)."""
+    (opted-in display names sorted, anonymous count, total accounts).
+
+    DURABLE PER-CONTRIBUTION CONSENT (revised 2026-06-26): an account is NAMED for a
+    contribution iff it was opted in AT CONTRIBUTION — the receipt's
+    `public_attribution_at_issue` snapshot. Work done while public stays citable; work
+    done while anonymous stays anonymous. Each contribution's citability is fixed when
+    the work was done and does NOT change when the account later toggles its opt-in: the
+    current `public_attribution` flag governs only the snapshot stamped on FUTURE
+    contributions, not past ones.
+
+    This drops the earlier `at_issue AND current` rule. The snapshot alone already gives
+    the non-retroactive property (opting in later can't credit past anonymous runs); the
+    extra `current` term was a retroactive opt-OUT that silently un-cited a volunteer's
+    *past public* work whenever a routine re-login reset the flag (the login citation
+    prompt defaults to anonymous). A volunteer who wants their name removed from already-
+    public contributions does so via an explicit erasure request, not the routine toggle."""
     # Receipts are issued one per agreeing worker, so receipt_index for an experiment IS its
     # consensus-set contributors (divergence goes to divergence_index). The account is the
     # receipt's `account_id_at_issue` SNAPSHOT (0041): a contribution stays credited to the
@@ -208,7 +219,7 @@ def _experiment_contributors(
     anonymous = 0
     for account_id, at_issue in opted_in_at_issue.items():
         acct = account_repository.get_by_id(account_id)
-        if at_issue and acct is not None and acct.public_attribution:
+        if at_issue and acct is not None:
             # Credit ALWAYS uses the verified identity (display_name = the GitHub login
             # captured at OAuth), never a self-set attribution_name — citation is only
             # meaningful with real credentials. attribution_name is vestigial (the PUT
