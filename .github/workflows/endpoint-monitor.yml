@@ -1,0 +1,76 @@
+name: Public-endpoint monitor
+
+# Scheduled health + integrity probe of the open-beta public surface: the
+# coordinator, the install one-liners (getworker / getresearcher), and the
+# marketing site. Catches an OUTAGE and a TAMPERED install proxy in one pass —
+# the served install.sh must byte-match the repo's main HEAD, so a compromised
+# Cloudflare Worker / CDN that swaps the script is detected without pinning the
+# script to a tag (no re-pin per release). A red run is a real problem; the
+# Actions scheduled-failure notification reaches the Maintainer.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # every 30 minutes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: endpoint-monitor
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Probe availability + install-script integrity
+        run: |
+          set -uo pipefail
+          fail=0
+          err() { echo "::error::$*"; echo "- ❌ $*" >> "$GITHUB_STEP_SUMMARY"; fail=1; }
+          ok()  { echo "- ✅ $*" >> "$GITHUB_STEP_SUMMARY"; }
+
+          echo "## Endpoint monitor — $(date -u +'%F %T UTC')" >> "$GITHUB_STEP_SUMMARY"
+
+          # 1) Availability — site + install one-liners. No -f: capture the code
+          #    even on 4xx/5xx so we report the status, not just "unreachable".
+          probe() { # url  name
+            local code
+            code=$(curl -sSL -o /tmp/body -w '%{http_code}' --max-time 25 "$1" 2>/dev/null) \
+              || { err "$2 unreachable ($1)"; return; }
+            [ "$code" = "200" ] || { err "$2 returned HTTP $code"; return; }
+            [ -s /tmp/body ]    || { err "$2 returned an empty body"; return; }
+            ok "$2 → 200"
+          }
+          probe https://auspexai.network                "website"
+          probe https://getworker.auspexai.network      "getworker install one-liner"
+          probe https://getresearcher.auspexai.network  "getresearcher install one-liner"
+
+          # Coordinator liveness (public, unauthenticated).
+          if curl -fsSL --max-time 25 https://coord.auspexai.network/api/v0/health/public 2>/dev/null | grep -q '{'; then
+            ok "coordinator /api/v0/health/public → 200 (JSON)"
+          else
+            err "coordinator /api/v0/health/public unreachable or non-JSON"
+          fi
+
+          # 2) Install-script integrity — the served one-liner MUST byte-match the
+          #    repo's main HEAD (catches a tampered/compromised proxy or CDN) and
+          #    must still parse as bash.
+          check_installer() { # served-url  raw-url  name
+            curl -fsSL --max-time 25 "$1" > /tmp/served 2>/dev/null || { err "$3: served script unreachable"; return; }
+            curl -fsSL --max-time 25 "$2" > /tmp/raw    2>/dev/null || { err "$3: GitHub raw unreachable"; return; }
+            bash -n /tmp/served 2>/dev/null || err "$3: served install.sh does NOT parse as bash"
+            if cmp -s /tmp/served /tmp/raw; then
+              ok "$3: served install.sh == GitHub main ($(wc -c < /tmp/served) bytes)"
+            else
+              err "$3: served install.sh DIFFERS from GitHub main — possible proxy/CDN tamper"
+            fi
+          }
+          check_installer https://getworker.auspexai.network \
+            https://raw.githubusercontent.com/auspexai/worker/main/packaging/install.sh "worker"
+          check_installer https://getresearcher.auspexai.network \
+            https://raw.githubusercontent.com/auspexai/researcher-dashboard/main/install.sh "researcher"
+
+          exit "$fail"
