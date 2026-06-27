@@ -561,7 +561,7 @@ _ROOT_HTML = f"""<!doctype html>
 </head>
 <body>
   <h1>AuspexAI Coordinator <span class="version">v{__version__}</span></h1>
-  <p>Coordinator daemon for the <a href="https://github.com/auspexai">AuspexAI</a> volunteer compute network. Phase 2 closed-beta.</p>
+  <p>Coordinator daemon for the <a href="https://github.com/auspexai">AuspexAI</a> volunteer compute network. Phase 2 open beta.</p>
   <p>Public endpoints:</p>
   <code class="endpoint"><a href="/api/v0/health/public">GET /api/v0/health/public</a></code>
   <code class="endpoint">POST /api/v0/receipts/verify — <a href="https://auspexai.network/verify.html">web verifier</a></code>
@@ -595,7 +595,7 @@ def _install_root_and_docs(app: FastAPI, credential_dep) -> None:
             content={
                 "name": "AuspexAI Coordinator",
                 "version": __version__,
-                "phase": "Phase 2 closed-beta",
+                "phase": "Phase 2 open beta",
                 "public_endpoints": {
                     "health": "GET /api/v0/health/public",
                     "receipts_verify": "POST /api/v0/receipts/verify",

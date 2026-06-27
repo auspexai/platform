@@ -1,6 +1,6 @@
 """Rate-limiting for anonymous-public endpoints on the coordinator.
 
-Phase 2 closed-beta posture: minimal defense-in-depth for the routes any
+Phase 2 open-beta posture: minimal defense-in-depth for the routes any
 internet visitor can hit. The three endpoints decorated below are the
 ones that create coordinator state (`/workers/enroll` → durable worker
 row; `/accounts/oauth/exchange` → talks to GitHub on caller's behalf,
