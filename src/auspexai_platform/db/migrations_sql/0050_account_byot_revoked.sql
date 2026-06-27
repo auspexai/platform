@@ -1,0 +1,15 @@
+-- 0050_account_byot_revoked.sql — AUD-13: make "revoke own-code (BYOT) eligibility"
+-- a real, enforceable, contestable action.
+--
+-- GOVERNANCE.md §11 and RESEARCH_ETHICS_POLICY.md §5.4 name BYOT-revocation as its OWN
+-- contestable adverse action, distinct from a research-standing demotion. But BYOT
+-- (bring-your-own-tenant: running own/uncertified experiment code, gated at R2+) was
+-- DERIVED solely from research_standing, so there was no mechanism to revoke it short of
+-- a full standing demotion — the appeal guarantee attached to an action that couldn't be
+-- taken.
+--
+-- This flag IS that mechanism: a maintainer can withdraw own-code eligibility (with a
+-- recorded reason) WITHOUT demoting the researcher's standing, and restore it later
+-- (every adverse action is reversible + contestable). The assessment gate consults it:
+--   byot_ok = research_standing >= R2  AND NOT byot_revoked
+ALTER TABLE accounts ADD COLUMN byot_revoked INTEGER NOT NULL DEFAULT 0;

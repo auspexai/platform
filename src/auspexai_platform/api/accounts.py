@@ -144,12 +144,33 @@ class PromoteResearchStandingRequest(BaseModel):
     reason: str  # mandatory — every trust action carries a recorded reason
 
 
+class DemoteResearchStandingRequest(BaseModel):
+    # AUD-13: demote to a LOWER standing (R3→R2/R1, R2→R1). R1 is the bound floor; you
+    # can't demote to R0 (the no-account state). The handler validates target < current.
+    target: int = Field(ge=1, le=2)
+    reason: str  # mandatory — adverse action, recorded reason (GOVERNANCE §11)
+
+
+class ByotRevocationRequest(BaseModel):
+    # AUD-13: revoke / restore own-code (BYOT) eligibility. Reason mandatory either way
+    # (every trust action is recorded; a restore is the reversal of an adverse action).
+    reason: str
+
+
 class ResearchStandingResponse(BaseModel):
     account_id: str
     research_standing: int
     research_standing_name: str
     gate_override: bool = False
     gate_warnings: list[str] = Field(default_factory=list)
+
+
+class ByotEligibilityResponse(BaseModel):
+    account_id: str
+    research_standing: int
+    byot_revoked: bool
+    # The effective BYOT state the assessment gate enforces: standing>=R2 AND NOT revoked.
+    byot_eligible: bool
 
 
 class ResearchDossierResponse(BaseModel):
@@ -783,6 +804,146 @@ def build_router(
             research_standing_name=target.name,
             gate_override=bool(gate_warnings),
             gate_warnings=gate_warnings,
+        )
+
+    @router.post(
+        "/accounts/{account_id}/actions/demote-research-standing",
+        response_model=ResearchStandingResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def demote_research_standing(
+        account_id: str,
+        body: DemoteResearchStandingRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ResearchStandingResponse:
+        """Demote an account's research-standing to a lower tier (R3→R2/R1, R2→R1) — an
+        ADVERSE action contestable under GOVERNANCE §11. Maintainer-only; reason
+        mandatory. Per §11's standard, standing is reduced only for provable misconduct,
+        never for a divergent/dissenting result — recorded in the reason, not enforced
+        mechanically. Demoting below R2 also withdraws BYOT (BYOT is derived from
+        standing); use revoke-byot to withdraw own-code eligibility WITHOUT a demotion."""
+        _require_maintainer(credential)
+        account = account_repository.get_by_id(account_id)
+        if account is None or account.retired_at is not None:
+            raise HTTPException(status_code=404, detail="account not found")
+        if account.suspended_at is not None:
+            raise HTTPException(status_code=409, detail="account is suspended")
+
+        current = account.research_standing
+        target = ResearchStanding(body.target)
+        if int(target) >= int(current):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"target must be a lower standing: current={int(current)}, "
+                    f"requested={int(target)}"
+                ),
+            )
+
+        account = account_repository.set_research_standing(account_id, new_standing=target)
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=credential.maintainer_login,
+            action="account.demote_research_standing",
+            resource_type="account",
+            resource_id=account_id,
+            payload={
+                "old_standing": int(current),
+                "new_standing": int(target),
+                "reason": body.reason,
+            },
+        )
+        return ResearchStandingResponse(
+            account_id=account_id,
+            research_standing=int(target),
+            research_standing_name=target.name,
+        )
+
+    @router.post(
+        "/accounts/{account_id}/actions/revoke-byot",
+        response_model=ByotEligibilityResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def revoke_byot(
+        account_id: str,
+        body: ByotRevocationRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ByotEligibilityResponse:
+        """Revoke own-code ("BYOT") eligibility WITHOUT demoting research-standing — an
+        ADVERSE action contestable under GOVERNANCE §11; maintainer-only, reason
+        mandatory. Reversible via restore-byot. Enforced in the assessment gate
+        (byot_ok = standing>=R2 AND NOT byot_revoked); certified starter runs are
+        unaffected."""
+        _require_maintainer(credential)
+        account = account_repository.get_by_id(account_id)
+        if account is None or account.retired_at is not None:
+            raise HTTPException(status_code=404, detail="account not found")
+        if account.suspended_at is not None:
+            raise HTTPException(status_code=409, detail="account is suspended")
+        was_revoked = account.byot_revoked
+        account = account_repository.set_byot_revoked(account_id, revoked=True)
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=credential.maintainer_login,
+            action="account.revoke_byot",
+            resource_type="account",
+            resource_id=account_id,
+            payload={
+                "byot_revoked": True,
+                "previous_byot_revoked": was_revoked,
+                "reason": body.reason,
+            },
+        )
+        return ByotEligibilityResponse(
+            account_id=account_id,
+            research_standing=int(account.research_standing),
+            byot_revoked=account.byot_revoked,
+            byot_eligible=(
+                int(account.research_standing) >= int(ResearchStanding.R2_ESTABLISHED)
+                and not account.byot_revoked
+            ),
+        )
+
+    @router.post(
+        "/accounts/{account_id}/actions/restore-byot",
+        response_model=ByotEligibilityResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def restore_byot(
+        account_id: str,
+        body: ByotRevocationRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ByotEligibilityResponse:
+        """Restore own-code ("BYOT") eligibility — the reversal of revoke-byot (e.g. on a
+        successful contest). Maintainer-only; reason mandatory."""
+        _require_maintainer(credential)
+        account = account_repository.get_by_id(account_id)
+        if account is None or account.retired_at is not None:
+            raise HTTPException(status_code=404, detail="account not found")
+        if account.suspended_at is not None:
+            raise HTTPException(status_code=409, detail="account is suspended")
+        was_revoked = account.byot_revoked
+        account = account_repository.set_byot_revoked(account_id, revoked=False)
+        audit_repository.append(
+            actor_class=CredentialClass.MAINTAINER,
+            actor_identifier=credential.maintainer_login,
+            action="account.restore_byot",
+            resource_type="account",
+            resource_id=account_id,
+            payload={
+                "byot_revoked": False,
+                "previous_byot_revoked": was_revoked,
+                "reason": body.reason,
+            },
+        )
+        return ByotEligibilityResponse(
+            account_id=account_id,
+            research_standing=int(account.research_standing),
+            byot_revoked=account.byot_revoked,
+            byot_eligible=(
+                int(account.research_standing) >= int(ResearchStanding.R2_ESTABLISHED)
+                and not account.byot_revoked
+            ),
         )
 
     @router.post(

@@ -500,6 +500,26 @@ class AccountRepository:
         assert got is not None
         return got
 
+    def set_byot_revoked(self, account_id: str, *, revoked: bool) -> Account:
+        """Revoke (or restore) own-code ("BYOT") eligibility — a HUMAN adverse action
+        (revoke) or its reversal (restore). ORTHOGONAL to research_standing: a researcher
+        keeps their standing/recognition but loses (or regains) the privilege to run
+        uncertified code. The caller (API endpoint) records the mandatory reason + audit.
+        Raises AccountNotFoundError if unknown / retired / suspended."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE accounts SET byot_revoked = ?
+                WHERE account_id = ? AND retired_at IS NULL AND suspended_at IS NULL
+                """,
+                (1 if revoked else 0, account_id),
+            )
+            if cur.rowcount == 0:
+                raise AccountNotFoundError(account_id)
+        got = self.get_by_id(account_id)
+        assert got is not None
+        return got
+
     # ---- binding-token writes ----
 
     def issue_binding(
@@ -617,6 +637,7 @@ class AccountRepository:
             attribution_name=(
                 row["attribution_name"] if "attribution_name" in row.keys() else None
             ),
+            byot_revoked=bool(row["byot_revoked"] if "byot_revoked" in row.keys() else 0),
         )
 
     @staticmethod

@@ -178,6 +178,10 @@ def decide(
     # D9 Phase 4 (§2). Default R2 so this stays policy-neutral for unit tests; the
     # real caller passes the submitting account's research_standing.
     research_standing: int = int(ResearchStanding.R2_ESTABLISHED),
+    # AUD-13: an explicit revocation of own-code (BYOT) eligibility, orthogonal to
+    # research_standing. When set, BYOT is withdrawn even at R2+ (the account keeps its
+    # standing). Default False keeps this pure function policy-neutral for unit tests.
+    byot_revoked: bool = False,
 ) -> AssessmentDecision:
     """The authoritative admission decision. `auto` requires every envelope check
     to pass, AND one of two INDEPENDENT paths:
@@ -209,7 +213,7 @@ def decide(
     # approves per-experiment). The CERTIFIED path is EXEMPT — a certified starter
     # auto-clears for any R1+. R-standing is "necessary, never sufficient": it gates
     # auto-approval; the §6 review still decides.
-    byot_ok = int(research_standing) >= int(ResearchStanding.R2_ESTABLISHED)
+    byot_ok = int(research_standing) >= int(ResearchStanding.R2_ESTABLISHED) and not byot_revoked
     routine_auto = auto_approval_enabled and track == "routine" and tier_ok and byot_ok
     auto = envelope.passed and (certified or routine_auto)
 
@@ -226,11 +230,18 @@ def decide(
     elif not tier_ok:
         rationale = f"tenant tier T{tenant_tier} below T{int(auto_tier)} → human review"
     elif not byot_ok:
-        rationale = (
-            f"research-standing R{research_standing} below R2 → bringing own "
-            "(uncertified) code is BYOT (R2+); routed to human review (promote to R2, "
-            "or approve per-experiment)"
-        )
+        if byot_revoked:
+            rationale = (
+                "own-code (BYOT) eligibility has been revoked for this account → "
+                "uncertified code routed to human review (restore BYOT, or approve "
+                "per-experiment); certified starter runs are unaffected"
+            )
+        else:
+            rationale = (
+                f"research-standing R{research_standing} below R2 → bringing own "
+                "(uncertified) code is BYOT (R2+); routed to human review (promote to R2, "
+                "or approve per-experiment)"
+            )
     else:
         rationale = (
             f"{research_class} routine + tier T{tenant_tier} >= T{int(auto_tier)} + envelope pass "

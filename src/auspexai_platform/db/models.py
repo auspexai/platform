@@ -302,6 +302,11 @@ class Account(BaseModel):
     # defaults to R1 (OAuth-verified); R2/R3 are reached only by HUMAN promotion
     # (ethics review / maintainer vetting). See research_standing_summary + §1 design.
     research_standing: ResearchStanding = ResearchStanding.R1_VERIFIED
+    # AUD-13: an explicit, reversible revocation of own-code ("BYOT") eligibility,
+    # ORTHOGONAL to research_standing. R2+ confers BYOT; this flag withdraws it WITHOUT
+    # demoting standing (GOVERNANCE §11 names BYOT-revocation as its own contestable
+    # action). Enforced in assessment.decide: byot_ok = standing>=R2 AND NOT byot_revoked.
+    byot_revoked: bool = False
     created_at: datetime
     retired_at: datetime | None = None
     identity_verified_at: datetime | None = None

@@ -132,6 +132,38 @@ def test_byot_below_r2_routes_to_review(
     assert experiment_repository.get_by_id(exp.experiment_id).status != ExperimentStatus.APPROVED
 
 
+def test_byot_revoked_routes_to_review_even_at_r2(
+    client: TestClient,
+    maintainer_token,
+    account_repository,
+    tenant_repository,
+    manifest_repository,
+    experiment_repository,
+):
+    """AUD-13: a T2-compute, R2-research tenant is normally BYOT-eligible (its uncertified
+    routine work auto-approves) — but an explicit BYOT revocation holds it back to REVIEW.
+    Proves the byot_revoked flag is CONSULTED at the assessment gate, not merely stored
+    (the declarative-enforcement guard); standing stays R2 throughout."""
+    _t2_tenant(account_repository, tenant_repository, "revoked-lab")  # T2 compute + R2 research
+    account_repository.set_byot_revoked("acct-revoked-lab", revoked=True)
+    exp = _submit_exp(
+        manifest_repository,
+        experiment_repository,
+        tenant_id="revoked-lab",
+        label="rev-1",
+        research_class="behavioral_drift",
+    )
+    r = _assess(client, exp.experiment_id, maintainer_token)
+    assert r.status_code == 200, r.text
+    assert r.json()["decision"] == "review"  # would be "auto" without the revocation
+    assert experiment_repository.get_by_id(exp.experiment_id).status != ExperimentStatus.APPROVED
+    # the revocation did NOT touch research-standing
+    assert (
+        account_repository.get_by_id("acct-revoked-lab").research_standing
+        == ResearchStanding.R2_ESTABLISHED
+    )
+
+
 def test_elevated_never_auto_even_at_t2(
     client: TestClient,
     maintainer_token,

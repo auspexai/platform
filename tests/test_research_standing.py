@@ -247,3 +247,164 @@ class TestResearchStandingRoute:
         account_id, _ = acct_tenant
         r = client.get(f"/api/v0/accounts/{account_id}/research-standing")  # no auth
         assert r.status_code in (401, 403)
+
+
+def _set_standing(db, account_id, standing) -> None:
+    with db.transaction() as cur:
+        cur.execute(
+            "UPDATE accounts SET research_standing = ? WHERE account_id = ?",
+            (int(standing), account_id),
+        )
+
+
+def _mh(maintainer_token) -> dict[str, str]:
+    return {"Authorization": f"Bearer {maintainer_token}"}
+
+
+class TestResearchStandingDemotion:
+    """AUD-13: research-standing demotion — a reason-mandatory, audited ADVERSE action
+    (GOVERNANCE §11), the missing counterpart to promotion. R-standing was monotonic-up,
+    so the contestation guarantee attached to an action no endpoint could take."""
+
+    def test_demote_one_step(self, client, maintainer_token, account_repository, db, acct_tenant):
+        account_id, _ = acct_tenant
+        _set_standing(db, account_id, ResearchStanding.R2_ESTABLISHED)
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/demote-research-standing",
+            headers=_mh(maintainer_token),
+            json={"target": 1, "reason": "served-weights mismatch on exp-x"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["research_standing"] == 1
+        assert (
+            account_repository.get_by_id(account_id).research_standing
+            == ResearchStanding.R1_VERIFIED
+        )
+
+    def test_demote_multi_step_r3_to_r1(
+        self, client, maintainer_token, account_repository, db, acct_tenant
+    ):
+        account_id, _ = acct_tenant
+        _set_standing(db, account_id, ResearchStanding.R3_TRUSTED)
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/demote-research-standing",
+            headers=_mh(maintainer_token),
+            json={"target": 1, "reason": "provable misconduct — full revocation"},
+        )
+        assert r.status_code == 200, r.text
+        assert (
+            account_repository.get_by_id(account_id).research_standing
+            == ResearchStanding.R1_VERIFIED
+        )
+
+    def test_demote_target_must_be_lower(self, client, maintainer_token, db, acct_tenant):
+        account_id, _ = acct_tenant
+        _set_standing(db, account_id, ResearchStanding.R2_ESTABLISHED)
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/demote-research-standing",
+            headers=_mh(maintainer_token),
+            json={"target": 2, "reason": "noop"},  # == current, not lower
+        )
+        assert r.status_code == 422
+
+    def test_demote_requires_reason(self, client, maintainer_token, db, acct_tenant):
+        account_id, _ = acct_tenant
+        _set_standing(db, account_id, ResearchStanding.R2_ESTABLISHED)
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/demote-research-standing",
+            headers=_mh(maintainer_token),
+            json={"target": 1},  # missing mandatory reason
+        )
+        assert r.status_code == 422
+
+    def test_demote_requires_maintainer(self, client, acct_tenant):
+        account_id, _ = acct_tenant
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/demote-research-standing",
+            json={"target": 1, "reason": "x"},  # no auth
+        )
+        assert r.status_code in (401, 403)
+
+    def test_demote_records_reason_in_audit(
+        self, client, maintainer_token, audit_repository, db, acct_tenant
+    ):
+        account_id, _ = acct_tenant
+        _set_standing(db, account_id, ResearchStanding.R2_ESTABLISHED)
+        client.post(
+            f"/api/v0/accounts/{account_id}/actions/demote-research-standing",
+            headers=_mh(maintainer_token),
+            json={"target": 1, "reason": "containment mismatch — appealable"},
+        )
+        entries, total = audit_repository.list(action="account.demote_research_standing")
+        assert total >= 1
+        assert entries[0].payload["reason"] == "containment mismatch — appealable"
+
+
+class TestByotRevocation:
+    """AUD-13: revoke own-code (BYOT) eligibility WITHOUT demoting standing — its own
+    reason-mandatory, audited, REVERSIBLE contestable action (GOVERNANCE §11). BYOT was
+    derived from standing, so there was no way to revoke it short of a full demotion."""
+
+    def test_revoke_keeps_standing_but_drops_eligibility(
+        self, client, maintainer_token, account_repository, db, acct_tenant
+    ):
+        account_id, _ = acct_tenant
+        _set_standing(db, account_id, ResearchStanding.R2_ESTABLISHED)
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/revoke-byot",
+            headers=_mh(maintainer_token),
+            json={"reason": "uncertified-code incident on exp-y"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["byot_revoked"] is True
+        assert body["byot_eligible"] is False  # revoked, even at R2
+        assert body["research_standing"] == 2  # standing UNCHANGED
+        assert account_repository.get_by_id(account_id).byot_revoked is True
+
+    def test_restore_reenables_eligibility(
+        self, client, maintainer_token, account_repository, db, acct_tenant
+    ):
+        account_id, _ = acct_tenant
+        _set_standing(db, account_id, ResearchStanding.R2_ESTABLISHED)
+        account_repository.set_byot_revoked(account_id, revoked=True)
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/restore-byot",
+            headers=_mh(maintainer_token),
+            json={"reason": "contest upheld — eligibility restored"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["byot_revoked"] is False
+        assert body["byot_eligible"] is True  # R2 + restored
+        assert account_repository.get_by_id(account_id).byot_revoked is False
+
+    def test_revoke_requires_reason(self, client, maintainer_token, acct_tenant):
+        account_id, _ = acct_tenant
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/revoke-byot",
+            headers=_mh(maintainer_token),
+            json={},  # missing mandatory reason
+        )
+        assert r.status_code == 422
+
+    def test_revoke_requires_maintainer(self, client, acct_tenant):
+        account_id, _ = acct_tenant
+        r = client.post(
+            f"/api/v0/accounts/{account_id}/actions/revoke-byot",
+            json={"reason": "x"},  # no auth
+        )
+        assert r.status_code in (401, 403)
+
+    def test_revoke_records_reason_in_audit(
+        self, client, maintainer_token, audit_repository, acct_tenant
+    ):
+        account_id, _ = acct_tenant
+        client.post(
+            f"/api/v0/accounts/{account_id}/actions/revoke-byot",
+            headers=_mh(maintainer_token),
+            json={"reason": "BYOT incident — appealable"},
+        )
+        entries, total = audit_repository.list(action="account.revoke_byot")
+        assert total >= 1
+        assert entries[0].payload["reason"] == "BYOT incident — appealable"

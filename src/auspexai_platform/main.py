@@ -129,6 +129,7 @@ def create_app(
     _account_suspended_for_tenant = svc.account_suspended_for_tenant
     _tenant_tier = svc.tenant_tier
     _tenant_research_standing = svc.tenant_research_standing
+    _tenant_byot_revoked = svc.tenant_byot_revoked
     _approved_classes = svc.approved_classes
     _auto_approval_gate = svc.auto_approval_gate
     _governance_footprint_for = svc.governance_footprint_for
@@ -253,6 +254,7 @@ def create_app(
             account_repository=account_repository,  # Tier-1 account-run gate
             tenant_tier=_tenant_tier,  # §9 #48 class-by-tier auto-approval
             tenant_research_standing=_tenant_research_standing,  # D9 Phase 4 BYOT gate
+            tenant_byot_revoked=_tenant_byot_revoked,  # AUD-13 explicit BYOT revocation
             approved_classes=_approved_classes,
             auto_approval_gate=_auto_approval_gate,  # §9 #48 inc-4 runtime gate
             containment_strict_below_tier=config.containment_strict_below_tier,  # §41 floor

@@ -84,6 +84,7 @@ class CoordinatorServices:
     account_suspended_for_tenant: Callable[[str], bool]
     tenant_tier: Callable[[str], int]
     tenant_research_standing: Callable[[str], int]  # D9 Phase 4: the BYOT gate input
+    tenant_byot_revoked: Callable[[str], bool]  # AUD-13: explicit BYOT revocation override
     approved_classes: Callable[[str], list[str] | None]
     auto_approval_gate: Callable[[], tuple[bool, int]]
     governance_footprint_for: Callable
@@ -166,6 +167,16 @@ def build_coordinator_services(
             if account is not None
             else int(ResearchStanding.R1_VERIFIED)
         )
+
+    def _tenant_byot_revoked(tenant_id: str) -> bool:
+        # AUD-13: tenant → account → byot_revoked. An explicit, reversible withdrawal of
+        # own-code (BYOT) eligibility, orthogonal to research_standing. A tenant without an
+        # account (legacy) is never BYOT-revoked (it floors at R1 — below R2 — anyway).
+        tenant = tenant_repository.get_by_id(tenant_id)
+        if tenant is None or tenant.account_id is None:
+            return False
+        account = account_repository.get_by_id(tenant.account_id)
+        return bool(account.byot_revoked) if account is not None else False
 
     def _approved_classes(tenant_id: str) -> list[str] | None:
         # §9 #48 envelope scope check: the classes the tenant was approved for.
@@ -282,6 +293,7 @@ def build_coordinator_services(
         account_suspended_for_tenant=_account_suspended_for_tenant,
         tenant_tier=_tenant_tier,
         tenant_research_standing=_tenant_research_standing,
+        tenant_byot_revoked=_tenant_byot_revoked,
         approved_classes=_approved_classes,
         auto_approval_gate=_auto_approval_gate,
         governance_footprint_for=_governance_footprint_for,

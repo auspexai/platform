@@ -420,6 +420,7 @@ def build_router(
     # D9 Phase 4 (§2): tenant → research_standing (R0-R3), the BYOT gate input. None
     # in tests / unwired → the gate is a no-op (no frontier submission is rejected).
     tenant_research_standing: Callable[[str], int] | None = None,
+    tenant_byot_revoked: Callable[[str], bool] | None = None,
     approved_classes: Callable[[str], list[str] | None] | None = None,
     served_model_ids: Callable[[], set[str] | None] | None = None,
     # §9 #48 inc-4: the runtime auto-approval gate, read server-authoritatively
@@ -923,6 +924,9 @@ def build_router(
             if tenant_research_standing is not None
             else int(ResearchStanding.R2_ESTABLISHED)
         )
+        byot_revoked = (
+            tenant_byot_revoked(experiment.tenant_id) if tenant_byot_revoked is not None else False
+        )
         approved = approved_classes(experiment.tenant_id) if approved_classes is not None else None
         served = served_model_ids() if served_model_ids is not None else None
 
@@ -954,6 +958,7 @@ def build_router(
             auto_approval_enabled=gate_enabled,
             certified=cert is not None,
             research_standing=r_standing,
+            byot_revoked=byot_revoked,
         )
         assessed_by = credential.maintainer_login or "maintainer"
         # Denormalize the certification provenance onto the experiment's rationale so
