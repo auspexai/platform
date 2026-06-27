@@ -759,3 +759,169 @@ def test_legacy_submit_with_ambiguous_unit_lands_in_exactly_one_active_experimen
         )
     finally:
         w.close()
+
+
+def _legacy_result_body(worker: dict, unit_id: str) -> dict:
+    """A pre-v0.2.2 (no `assignment_id`) result body, validly signed."""
+    return {
+        "unit_id": unit_id,
+        "worker_pubkey": worker["pub"],
+        "completed_at": "2026-06-11T12:00:00+00:00",
+        "exit_code": 0,
+        "payload": {"answer": unit_id},
+        "worker_signature": sign_result_body(
+            worker["priv"],
+            worker["pub"],
+            unit_id=unit_id,
+            completed_at="2026-06-11T12:00:00+00:00",
+            exit_code=0,
+            payload={"answer": unit_id},
+        ),
+    }
+
+
+def _submit_one_unit(w: World, exp_id: str, label: str, manifest_hash: str, unit_id: str) -> None:
+    r = w.researcher(
+        "POST",
+        f"/api/v0/experiments/{exp_id}/work-units",
+        json_body={
+            "work_units": [
+                {
+                    "schema_version": "0.1",
+                    "unit_id": unit_id,
+                    "tenant_id": "prop-tenant",
+                    "experiment_id": label,
+                    "manifest_sha256": manifest_hash,
+                    "created_at": "2026-06-11T00:00:00Z",
+                    "payload": {"q": 1},
+                    "replication_target": 1,
+                }
+            ]
+        },
+    )
+    assert r.status_code == 201, r.text
+
+
+def test_legacy_submit_into_lone_terminal_assignment_refuses_404():
+    """I4, legacy (no `assignment_id`) wire: when the (unit, worker) pair resolves
+    to a SINGLE assignment whose experiment is terminal (aborted), the bare-unit_id
+    scan must refuse with 404 — never accept (201), never 5xx, and no result row may
+    land in the terminal experiment.
+
+    This deterministically pins the legacy terminal-refusal path. The state-machine's
+    `submit_result_legacy_wire` only fires this case when the pair is unambiguous
+    across ALL experiments (count==1), which — under the soaked multi-experiment
+    nightly — is a vanishingly rare state, so it gave the legacy terminal path almost
+    no coverage. (Its sibling test above pins the *ambiguous → land-in-active 201*
+    case; this pins the *lone-terminal → 404* case.)"""
+    w = World()
+    try:
+        exp, h = w.create_approved_experiment("lone-term")
+        assert (
+            w.client.post(
+                f"/api/v0/experiments/{exp}/actions/set-integrity-policy",
+                headers=w.maintainer_headers,
+                json={"integrity_policy": "trusted", "reason": "I4 pin: N=1", "force": True},
+            ).status_code
+            == 200
+        )
+        _submit_one_unit(w, exp, "lone-term", h, "u-lone")
+        worker = w.enroll_worker()
+        body = w.signed(
+            "GET",
+            f"/api/v0/workers/{worker['id']}/assignments",
+            privkey=worker["priv"],
+            pubkey_hex=worker["pub"],
+        ).json()
+        assert body.get("work_unit"), f"expected the unit to be offered: {body}"
+        r = w.client.post(f"/api/v0/experiments/{exp}/actions/abort", headers=w.maintainer_headers)
+        assert r.status_code == 200, r.text
+        # legacy submit: NO assignment_id on the wire
+        r = w.signed(
+            "POST",
+            f"/api/v0/workers/{worker['id']}/assignments/u-lone/result",
+            privkey=worker["priv"],
+            pubkey_hex=worker["pub"],
+            json_body=_legacy_result_body(worker, "u-lone"),
+        )
+        assert r.status_code == 404, (
+            f"I4 violated: legacy result accepted into terminal experiment: {r.status_code} {r.text}"
+        )
+        rows = w.per_job_rows(exp, "SELECT COUNT(*) AS n FROM results")[0]["n"]
+        assert rows == 0, f"I4 violated: {rows} result row(s) landed in the aborted experiment"
+    finally:
+        w.close()
+
+
+def test_legacy_submit_terminal_with_unheld_active_sibling_refuses_404():
+    """I4, legacy wire, three-way: the worker holds the colliding unit ONLY in the
+    aborted experiment; a second, ACTIVE experiment carries the same unit_id but never
+    offered it to this worker (no assignment row there). The scan skips the terminal
+    experiment and finds no live (unit, worker) assignment → 404, and no result lands
+    in either experiment. Guards the bare-unit_id collision class against resolving
+    into an active experiment the worker has no assignment in."""
+    w = World()
+    try:
+        # Stand up the LIVE sibling first and have a different worker hold its only
+        # replica (replication_target=1 → no further offers), so the unit is no longer
+        # offerable to anyone else. THEN stand up the to-be-aborted experiment carrying
+        # the same unit_id — our worker can only acquire it there.
+        exp_live, hl = w.create_approved_experiment("live-sib")
+        assert (
+            w.client.post(
+                f"/api/v0/experiments/{exp_live}/actions/set-integrity-policy",
+                headers=w.maintainer_headers,
+                json={"integrity_policy": "trusted", "reason": "I4 pin", "force": True},
+            ).status_code
+            == 200
+        )
+        _submit_one_unit(w, exp_live, "live-sib", hl, "u-collide")
+        drainer = w.enroll_worker()
+        db = w.signed(
+            "GET",
+            f"/api/v0/workers/{drainer['id']}/assignments",
+            privkey=drainer["priv"],
+            pubkey_hex=drainer["pub"],
+        ).json()
+        assert db.get("work_unit") and db["work_unit"]["experiment_id"] == "live-sib", db
+
+        exp_term, ht = w.create_approved_experiment("term-only")
+        assert (
+            w.client.post(
+                f"/api/v0/experiments/{exp_term}/actions/set-integrity-policy",
+                headers=w.maintainer_headers,
+                json={"integrity_policy": "trusted", "reason": "I4 pin", "force": True},
+            ).status_code
+            == 200
+        )
+        _submit_one_unit(w, exp_term, "term-only", ht, "u-collide")
+        # our worker acquires the unit from the terminal-to-be experiment only
+        worker = w.enroll_worker()
+        body = w.signed(
+            "GET",
+            f"/api/v0/workers/{worker['id']}/assignments",
+            privkey=worker["priv"],
+            pubkey_hex=worker["pub"],
+        ).json()
+        assert body.get("work_unit") and body["work_unit"]["experiment_id"] == "term-only", body
+        r = w.client.post(
+            f"/api/v0/experiments/{exp_term}/actions/abort", headers=w.maintainer_headers
+        )
+        assert r.status_code == 200, r.text
+        r = w.signed(
+            "POST",
+            f"/api/v0/workers/{worker['id']}/assignments/u-collide/result",
+            privkey=worker["priv"],
+            pubkey_hex=worker["pub"],
+            json_body=_legacy_result_body(worker, "u-collide"),
+        )
+        assert r.status_code == 404, (
+            f"I4 violated: legacy result accepted despite only-terminal assignment: "
+            f"{r.status_code} {r.text}"
+        )
+        rows_term = w.per_job_rows(
+            exp_term, "SELECT COUNT(*) AS n FROM results WHERE worker_id = ?", (worker["id"],)
+        )[0]["n"]
+        assert rows_term == 0, f"I4 violated: result landed in aborted experiment ({rows_term})"
+    finally:
+        w.close()
