@@ -13,6 +13,7 @@ import json
 from fastapi.testclient import TestClient
 
 from auspexai_platform.auth.signature import sign_request
+from auspexai_platform.db.repositories import SoftwareRequestRepository
 from auspexai_platform.events import GLOBAL
 
 
@@ -53,43 +54,33 @@ _RELEASE = {
 }
 
 
-def _approved_request(client: TestClient, registered_tenant, maintainer_token) -> str:
-    privkey, binding = registered_tenant
-    raw = json.dumps(
-        {
-            "title": "Ollama inference serving",
-            "description": "Local LLM inference served by the worker.",
-            "reason": "drift-probe tenant",
-        }
-    ).encode()
-    headers = sign_request(
-        privkey=privkey,
-        pubkey_hex=binding.pubkey_hex,
-        method="POST",
-        path="/api/v0/software-requests",
-        authority="testserver",
-        body=raw,
+def _approved_request(db, tenant_id: str) -> str:
+    """Seed an APPROVED software-request directly via the repo. The producer router was
+    retired (AUD-18); the release/webhook pipeline still consumes approved requests, so
+    tests seed the consumer's input through the repository, not the removed endpoint."""
+    repo = SoftwareRequestRepository(db)
+    req = repo.create(
+        tenant_id=tenant_id,
+        title="Ollama inference serving",
+        description="Local LLM inference served by the worker.",
+        reason="drift-probe tenant",
     )
-    headers["Content-Type"] = "application/json"
-    r = client.post("/api/v0/software-requests", headers=headers, content=raw)
-    assert r.status_code == 201, r.text
-    rid = r.json()["request_id"]
-    r = client.post(
-        f"/api/v0/software-requests/{rid}/actions/approve",
-        json={"reason": "first inference tenant needs it"},
-        headers=_mtnr(maintainer_token),
+    repo.resolve(
+        req.request_id,
+        status="approved",
+        resolved_by="maintainer",
+        reason="first inference tenant needs it",
     )
-    assert r.status_code == 200, r.text
-    return rid
+    return req.request_id
 
 
 # ---- POST /releases ----------------------------------------------------------
 
 
 def test_record_release_announces_and_fulfils(
-    client: TestClient, registered_tenant, maintainer_token, audit_repository
+    client: TestClient, registered_tenant, maintainer_token, audit_repository, db
 ) -> None:
-    rid = _approved_request(client, registered_tenant, maintainer_token)
+    rid = _approved_request(db, registered_tenant[1].tenant_id)
     bus = client.app.state.event_bus
     with bus.subscribe(GLOBAL) as q:
         r = client.post(
@@ -107,33 +98,24 @@ def test_record_release_announces_and_fulfils(
     assert ev.data["fulfils_request_ids"] == [rid]
 
     # The fulfilled request flipped to released with the version stamped.
-    sr = client.get(f"/api/v0/software-requests/{rid}", headers=_mtnr(maintainer_token)).json()
-    assert sr["status"] == "released"
-    assert sr["release_version"] == "0.2.0"
+    sr = SoftwareRequestRepository(db).get_by_id(rid)
+    assert sr.status == "released"
+    assert sr.release_version == "0.2.0"
 
     entries = [e for e in audit_repository.latest() if e.action == "release.publish"]
     assert entries and entries[0].payload["fulfils_request_ids"] == [rid]
 
 
 def test_record_release_rejects_unapproved_request_with_no_writes(
-    client: TestClient, registered_tenant, maintainer_token
+    client: TestClient, registered_tenant, maintainer_token, db
 ) -> None:
     # A pending (not approved) request cannot be fulfilled — and the failed
     # call must not record the release row either.
-    privkey, binding = registered_tenant
-    raw = json.dumps({"title": "x", "description": "y", "reason": "z"}).encode()
-    headers = sign_request(
-        privkey=privkey,
-        pubkey_hex=binding.pubkey_hex,
-        method="POST",
-        path="/api/v0/software-requests",
-        authority="testserver",
-        body=raw,
+    rid = (
+        SoftwareRequestRepository(db)
+        .create(tenant_id=registered_tenant[1].tenant_id, title="x", description="y", reason="z")
+        .request_id
     )
-    headers["Content-Type"] = "application/json"
-    rid = client.post("/api/v0/software-requests", headers=headers, content=raw).json()[
-        "request_id"
-    ]
 
     r = client.post(
         "/api/v0/releases",

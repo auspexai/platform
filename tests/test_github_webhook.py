@@ -16,6 +16,8 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from auspexai_platform.db.repositories import SoftwareRequestRepository
+
 SECRET = "test-webhook-secret"
 PATH = "/api/v0/webhooks/github/releases"
 
@@ -151,18 +153,18 @@ class TestRelay:
 
 class TestFulfils:
     def test_fulfils_line_links_approved_request(
-        self, client: TestClient, registered_tenant, maintainer_token
+        self, client: TestClient, registered_tenant, maintainer_token, db
     ) -> None:
         from tests.test_releases import _approved_request
 
-        rid = _approved_request(client, registered_tenant, maintainer_token)
+        rid = _approved_request(db, registered_tenant[1].tenant_id)
         body = _release_event(body_text=f"Good stuff for volunteers.\n\nFulfils: {rid}")
         r = _post(client, body)
         assert r.status_code == 201, r.text
         assert r.json()["fulfilled_request_ids"] == [rid]
-        sr = client.get(f"/api/v0/software-requests/{rid}", headers=_mtnr(maintainer_token)).json()
-        assert sr["status"] == "released"
-        assert sr["release_version"] == "0.9.9"
+        sr = SoftwareRequestRepository(db).get_by_id(rid)
+        assert sr.status == "released"
+        assert sr.release_version == "0.9.9"
         # Plumbing line stripped from the volunteer-facing notes.
         listing = client.get("/api/v0/releases", headers=_mtnr(maintainer_token)).json()
         (rel,) = [x for x in listing["releases"] if x["version"] == "0.9.9"]

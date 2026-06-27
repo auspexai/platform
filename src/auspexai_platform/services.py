@@ -28,7 +28,6 @@ from auspexai_platform.db.repositories import (
     ExperimentRepository,
     ManifestRepository,
     ModelPrestageRepository,
-    ModelRequestRepository,
     PromotionPolicyRepository,
     ReceiptIndexRepository,
     ReleaseRepository,
@@ -72,7 +71,6 @@ class CoordinatorServices:
     attestation_repository: AttestationRepository
     certified_profile_repository: CertifiedProfileRepository
     result_transfer_repository: ResultTransferRepository
-    model_request_repository: ModelRequestRepository
     model_prestage_repository: ModelPrestageRepository
     software_request_repository: SoftwareRequestRepository
     tenant_application_repository: TenantApplicationRepository
@@ -121,7 +119,6 @@ def build_coordinator_services(
     attestation_repository = AttestationRepository(db)
     certified_profile_repository = CertifiedProfileRepository(db)
     result_transfer_repository = ResultTransferRepository(db)
-    model_request_repository = ModelRequestRepository(db)
     model_prestage_repository = ModelPrestageRepository(db)
     software_request_repository = SoftwareRequestRepository(db)
     tenant_application_repository = TenantApplicationRepository(db)
@@ -281,7 +278,6 @@ def build_coordinator_services(
         certified_profile_repository=certified_profile_repository,
         attestation_repository=attestation_repository,
         result_transfer_repository=result_transfer_repository,
-        model_request_repository=model_request_repository,
         model_prestage_repository=model_prestage_repository,
         software_request_repository=software_request_repository,
         tenant_application_repository=tenant_application_repository,

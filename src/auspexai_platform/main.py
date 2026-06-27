@@ -38,7 +38,6 @@ from auspexai_platform.api import events as event_routes
 from auspexai_platform.api import experiments as experiment_routes
 from auspexai_platform.api import github_webhook as github_webhook_routes
 from auspexai_platform.api import health
-from auspexai_platform.api import model_requests as model_request_routes
 from auspexai_platform.api import packages as package_routes
 from auspexai_platform.api import promotion_policy as promotion_policy_routes
 from auspexai_platform.api import receipts as receipt_routes
@@ -46,7 +45,6 @@ from auspexai_platform.api import releases as release_routes
 from auspexai_platform.api import results as results_routes
 from auspexai_platform.api import scheduler as scheduler_routes
 from auspexai_platform.api import self_observation as self_observation_routes
-from auspexai_platform.api import software_requests as software_request_routes
 from auspexai_platform.api import tenant_applications as tenant_application_routes
 from auspexai_platform.api import tenants as tenant_routes
 from auspexai_platform.api import trust_model_policy as trust_model_policy_routes
@@ -117,7 +115,6 @@ def create_app(
     attestation_repository = svc.attestation_repository
     certified_profile_repository = svc.certified_profile_repository
     result_transfer_repository = svc.result_transfer_repository
-    model_request_repository = svc.model_request_repository
     model_prestage_repository = svc.model_prestage_repository
     software_request_repository = svc.software_request_repository
     tenant_application_repository = svc.tenant_application_repository
@@ -434,16 +431,6 @@ def create_app(
         prefix="/api/v0",
         tags=["maintainer"],
     )
-    app.include_router(
-        model_request_routes.build_router(
-            credential_dep,
-            model_request_repository,
-            worker_repository,
-            audit_repository,
-        ),
-        prefix="/api/v0",
-        tags=["model-requests"],
-    )
     # §9 #40a executor-package courier: researcher upload (verified +
     # content-addressed) / enrolled-worker fetch. No dispatch changes —
     # workers decide to fetch from the manifest digest they already receive.
@@ -457,16 +444,6 @@ def create_app(
         ),
         prefix="/api/v0",
         tags=["packages"],
-    )
-    app.include_router(
-        software_request_routes.build_router(
-            credential_dep,
-            software_request_repository,
-            audit_repository,
-            event_bus=event_bus,
-        ),
-        prefix="/api/v0",
-        tags=["software-requests"],
     )
     # Researcher onboarding (Option D): GitHub-verified, proof-of-possession-
     # signed tenant applications + the maintainer review queue.

@@ -25,8 +25,10 @@ from auspexai_platform.auth.signature import sign_request
 from auspexai_platform.db.models import IdentityProvider
 from auspexai_platform.db.repositories import AccountRepository, TenantRepository
 
-# A representative signed-researcher surface (researcher or maintainer only).
-RESEARCHER_PATH = "/api/v0/model-requests"
+# A representative suspension-gated signed-researcher surface (the credential dependency
+# raises 403 account_suspended before the route runs, so any researcher route demonstrates
+# the cascade; experiments-list returns an empty 200 for a tenant with no experiments).
+RESEARCHER_PATH = "/api/v0/experiments"
 WHOAMI_PATH = "/api/v0/auth/whoami"
 
 
