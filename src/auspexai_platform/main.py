@@ -66,6 +66,77 @@ from auspexai_platform.rate_limit import limiter
 from auspexai_platform.scheduler import Scheduler
 from auspexai_platform.services import build_coordinator_services
 
+_SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"strict-transport-security", b"max-age=31536000; includeSubDomains"),
+)
+_DEFAULT_MAX_BODY = 2 * 1024 * 1024  # 2 MiB cap for JSON / signed routes
+
+
+class BodyLimitAndSecurityHeaders:
+    """Pure ASGI middleware (SSE-safe — does NOT buffer responses, unlike
+    BaseHTTPMiddleware) for the publicly-reachable origin:
+
+    1. Reject oversized requests by Content-Length BEFORE the route's auth
+       dependency buffers the body — closes the anonymous buffer-before-auth
+       DoS (a bogus Signature-Input forces ``await request.body()`` pre-auth).
+       The /api/v0/packages upload is EXEMPT: it owns a hardened size check
+       (digest recompute + decompressed-size guard) and the CDN caps the edge.
+    2. Add baseline security headers (nosniff / frame-deny / referrer / HSTS)
+       at the origin instead of relying solely on the CDN.
+    """
+
+    def __init__(self, app, *, default_max: int = _DEFAULT_MAX_BODY) -> None:
+        self.app = app
+        self.default_max = default_max
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        for name, value in scope.get("headers") or ():
+            if name == b"content-length":
+                # The upload route owns its own (hardened) size check; everything
+                # else gets the small JSON cap so a bogus Signature-Input can't
+                # buffer a large body before the signature check fails.
+                if not scope.get("path", "").endswith("/packages"):
+                    try:
+                        over = int(value) > self.default_max
+                    except ValueError:
+                        over = False  # malformed → let route validation handle it
+                    if over:
+                        await self._too_large(send, self.default_max)
+                        return
+                break
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                present = {k.lower() for k, _ in headers}
+                headers.extend((k, v) for k, v in _SECURITY_HEADERS if k not in present)
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+    @staticmethod
+    async def _too_large(send, cap: int) -> None:
+        body = b'{"error":"payload_too_large","max_bytes":%d}' % cap
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    *_SECURITY_HEADERS,
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
 
 def create_app(
     config: Config | None = None,
@@ -180,6 +251,10 @@ def create_app(
         allow_methods=["GET", "POST"],
         allow_headers=["Content-Type"],
     )
+
+    # Origin body-size cap (runs before the auth dependency buffers the body —
+    # closes the anonymous buffer-before-auth DoS) + baseline security headers.
+    app.add_middleware(BodyLimitAndSecurityHeaders)
 
     # Per-IP rate limits on anonymous-public endpoints. Decorators are
     # applied inside the routers (api/workers.py, api/accounts.py,
