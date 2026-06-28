@@ -299,6 +299,36 @@ class TestExperimentActivity:
         assert body["run_phase"] == "running"
         assert "queue_position" not in body
 
+    def test_queue_position_excludes_abandoned_experiments(
+        self, client, approved_experiment, per_job_factory, experiment_repository
+    ) -> None:
+        """D15: an approved experiment with no work units (an abandoned orphan)
+        does NOT inflate the queue — queue_depth counts only approved experiments
+        with pending work, in registration order."""
+        from auspexai_platform.db.models import ExperimentStatus
+
+        privkey, binding, experiment, _hash = approved_experiment
+        _seed_queued(per_job_factory, experiment.experiment_id)
+        # A second approved experiment that never submitted units (orphan).
+        other = experiment_repository.create(
+            tenant_id=binding.tenant_id,
+            tenant_experiment_label="abandoned",
+            manifest_hash=_hash,
+        )
+        experiment_repository.update_status(other.experiment_id, ExperimentStatus.APPROVED)
+
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["run_phase"] == "queued"
+        assert body["queue_position"] == 1
+        assert body["queue_depth"] == 1  # the abandoned 0-unit experiment is excluded
+
     def test_clean_run_reports_zero_divergence(
         self, client, approved_experiment, per_job_factory
     ) -> None:

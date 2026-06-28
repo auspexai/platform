@@ -82,6 +82,27 @@ def _busy_worker_ids(experiment_repository, per_job_factory) -> set[str]:
     return busy
 
 
+def _queue_rank(
+    experiment_id: str, experiment_repository, per_job_factory
+) -> tuple[int, int] | tuple[None, None]:
+    """This experiment's 1-based rank + total among the approved experiments that
+    actually have PENDING work, in the scheduler's registration order — the real
+    contention set for workers (D15). Abandoned/empty (0-unit) and fully-drained
+    approved experiments are excluded so they don't inflate 'N in line'. Mirrors
+    the scheduler's first-fit over list_all(status=APPROVED). Bare ints — never
+    other tenants' identities."""
+    queue_ids: list[str] = []
+    for e in experiment_repository.list_all(status=ExperimentStatus.APPROVED):
+        pj = per_job_factory.get(e.experiment_id)
+        if pj is None:
+            continue  # no units ever submitted → not competing for workers
+        if WorkUnitRepository(pj).count_by_status().get("pending", 0) > 0:
+            queue_ids.append(e.experiment_id)
+    if experiment_id in queue_ids:
+        return queue_ids.index(experiment_id) + 1, len(queue_ids)
+    return None, None
+
+
 def _run_phase(
     experiment,
     *,
@@ -487,17 +508,9 @@ def build_router(
         downloading = download_progress is not None
         queue_position = queue_depth = None
         if run_phase == "queued":
-            # Mirror the scheduler's first-fit registration order exactly
-            # (scheduler picks over list_all(status=APPROVED) in this order), so
-            # the surfaced rank matches the real dispatch order. Bare integers
-            # only — never other tenants' identities.
-            approved_ids = [
-                e.experiment_id
-                for e in experiment_repository.list_all(status=ExperimentStatus.APPROVED)
-            ]
-            if experiment_id in approved_ids:
-                queue_position = approved_ids.index(experiment_id) + 1
-                queue_depth = len(approved_ids)
+            queue_position, queue_depth = _queue_rank(
+                experiment_id, experiment_repository, per_job_factory
+            )
 
         own_workers, account_id = _own_workers(experiment, per_job_db, now)
 
