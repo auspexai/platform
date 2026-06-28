@@ -75,6 +75,44 @@ def test_create_duplicate_unit_and_worker_raises(
         )
 
 
+def test_active_worker_ids_excludes_refused_and_completed(
+    work_units_repo: WorkUnitRepository,
+    assignments_repo: AssignmentRepository,
+    results_repo: ResultRepository,
+) -> None:
+    """D12 busy/idle: active_worker_ids = workers with an OFFERED, unresolved
+    assignment — excludes refused offers and result-attached (completed) ones."""
+    work_units_repo.submit_batch([{"unit_id": f"u{i}", "payload": {}} for i in range(1, 5)])
+    assignments_repo.create(
+        assignment_id="a-a", unit_id="u1", worker_id="wkr-a", worker_pubkey_hex="a" * 64
+    )
+    assignments_repo.create(
+        assignment_id="a-b", unit_id="u2", worker_id="wkr-b", worker_pubkey_hex="b" * 64
+    )
+    # refused → not active
+    assignments_repo.create(
+        assignment_id="a-c", unit_id="u3", worker_id="wkr-c", worker_pubkey_hex="c" * 64
+    )
+    assignments_repo.mark_refused(assignment_id="a-c", kind="busy", reason="test")
+    # result attached → not active
+    assignments_repo.create(
+        assignment_id="a-d", unit_id="u4", worker_id="wkr-d", worker_pubkey_hex="d" * 64
+    )
+    results_repo.insert(
+        result_id="r-d",
+        unit_id="u4",
+        worker_id="wkr-d",
+        worker_pubkey_hex="d" * 64,
+        exit_code=0,
+        payload={},
+        worker_signature="s",
+        completed_at=datetime(2026, 5, 30, tzinfo=UTC),
+    )
+    assignments_repo.attach_result("a-d", "r-d")
+
+    assert assignments_repo.active_worker_ids() == {"wkr-a", "wkr-b"}
+
+
 def test_two_workers_can_share_one_unit(
     seeded_unit, assignments_repo: AssignmentRepository
 ) -> None:

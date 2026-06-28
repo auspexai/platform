@@ -210,6 +210,17 @@ class AssignmentRepository:
         )
         return int(rows[0]["n"]) if rows else 0
 
+    def active_worker_ids(self) -> set[str]:
+        """Distinct workers holding an ACTIVE assignment (offered, not refused, no
+        result yet) in this per-job DB — i.e. currently working this experiment.
+        Unioned across experiments to derive the network 'busy worker' set (D12
+        busy/idle index)."""
+        rows = self.db.execute(
+            "SELECT DISTINCT worker_id FROM assignments "
+            "WHERE refused_at IS NULL AND result_id IS NULL",
+        )
+        return {r["worker_id"] for r in rows}
+
     def already_assigned(self, unit_id: str, worker_id: str) -> bool:
         return self.get_for_unit_and_worker(unit_id, worker_id) is not None
 

@@ -109,6 +109,27 @@ def test_bind_account_retired_worker_raises(
         )
 
 
+# ---- list_capable_ids (D12 busy/idle) ------------------------------------
+
+
+def test_list_capable_ids_filters_by_model_and_freshness(
+    worker_repository: WorkerRepository,
+) -> None:
+    """D12 busy/idle: list_capable_ids returns the active worker_ids whose
+    declared inventory holds every required model — the id-returning sibling of
+    count_capable, used to intersect with the busy set."""
+    from datetime import UTC, datetime, timedelta
+
+    worker_repository.enroll(worker_id="wkr-has", pubkey_hex="a" * 64, capabilities={})
+    worker_repository.record_heartbeat("wkr-has", capabilities={"models": ["m1", "m2"]})
+    worker_repository.enroll(worker_id="wkr-lacks", pubkey_hex="b" * 64, capabilities={})
+    worker_repository.record_heartbeat("wkr-lacks", capabilities={"models": ["m2"]})
+
+    cutoff = datetime.now(UTC) - timedelta(minutes=3)
+    ids = worker_repository.list_capable_ids(required_models=["m1"], heartbeat_cutoff=cutoff)
+    assert ids == ["wkr-has"]
+
+
 # ---- record_heartbeat -----------------------------------------------------
 
 

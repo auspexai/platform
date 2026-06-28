@@ -384,6 +384,30 @@ class WorkerRepository:
                 n += 1
         return n
 
+    def list_capable_ids(
+        self, *, required_models: list[str], heartbeat_cutoff: datetime
+    ) -> list[str]:
+        """The worker_ids behind `count_capable` — active workers whose declared
+        inventory holds every required model. Used to intersect with the
+        currently-busy set (active-assignment holders) for the D12 'X of Y
+        eligible workers busy' capacity signal."""
+        need = set(required_models)
+        rows = self.db.execute(
+            "SELECT worker_id, capabilities_json FROM workers "
+            "WHERE retired_at IS NULL AND quarantined_at IS NULL AND paused_at IS NULL "
+            "AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?",
+            (heartbeat_cutoff.isoformat(),),
+        )
+        if not need:
+            return [r["worker_id"] for r in rows]
+        out: list[str] = []
+        for r in rows:
+            caps = json.loads(r["capabilities_json"] or "{}")
+            have = caps.get("models", [])
+            if isinstance(have, list) and need <= set(have):
+                out.append(r["worker_id"])
+        return out
+
     def count_auto_acquire(self, *, heartbeat_cutoff: datetime) -> int:
         """Count active workers that have opted into M3 lazy auto-acquire — they
         can run ANY model whose manifest carries hf coords by pulling it in-line

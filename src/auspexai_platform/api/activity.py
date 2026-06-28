@@ -67,6 +67,21 @@ def _experiment_eligibility_reason(worker, required: dict, requires_real_executi
     return "not eligible for this experiment"
 
 
+def _busy_worker_ids(experiment_repository, per_job_factory) -> set[str]:
+    """Workers currently holding an active assignment anywhere — unioned across
+    APPROVED experiments' per-job DBs (assignments live only per-job; there is no
+    control-DB mirror). Bounded to APPROVED, the only experiments with live
+    assignments. O(approved experiments) per call — fine at current fleet scale;
+    a candidate for a periodic cache if the experiment count grows large. (D12.)"""
+    busy: set[str] = set()
+    for exp in experiment_repository.list_all(status=ExperimentStatus.APPROVED):
+        per_job_db = per_job_factory.get(exp.experiment_id)
+        if per_job_db is None:
+            continue
+        busy |= AssignmentRepository(per_job_db).active_worker_ids()
+    return busy
+
+
 def _run_phase(
     experiment,
     *,
@@ -107,6 +122,7 @@ def _liveness_note(
     run_phase: str | None,
     capable_worker_count: int | None,
     downloading: bool = False,
+    capable_busy_count: int | None = None,
 ) -> str | None:
     """D8/D12: a plain-language explanation of the run's current state for the
     watching researcher, so a paused/stalled/queued experiment self-explains
@@ -152,9 +168,19 @@ def _liveness_note(
                 "Approved and queued — a volunteer is downloading the model your "
                 "experiment needs. It starts once the download completes."
             )
+        if (
+            capable_worker_count
+            and capable_busy_count is not None
+            and capable_busy_count >= capable_worker_count
+        ):
+            return (
+                f"Approved and queued — all {capable_worker_count} eligible "
+                "worker(s) are busy with other runs right now. Yours starts as "
+                "soon as one frees up."
+            )
         return (
-            "Approved and queued — eligible workers are online but busy with other "
-            "runs right now. Yours starts as soon as one frees up."
+            "Approved and queued — waiting for an eligible worker to pick it up. "
+            "It starts automatically as soon as one is free."
         )
 
     if (
@@ -225,6 +251,11 @@ class ExperimentActivityResponse(BaseModel):
     # feeding #32 / the M2 demand-board). Omitted when there's no requirement.
     required_capabilities: Annotated[dict[str, list[str]] | None, ExposureTag.TENANT_SCOPED] = None
     capable_worker_count: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
+    # D12 busy/idle index: of the eligible (capable) workers, how many are
+    # currently busy holding an active assignment on some run. 'X of Y eligible
+    # busy' tells a queued researcher whether the eligible fleet is saturated vs
+    # merely sparse. TENANT_SCOPED, paired with capable_worker_count.
+    capable_busy_count: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     # R-D3 own-worker enrichment: the tenant's OWN-account workers, listed
     # non-anonymously. ACCOUNT_SCOPED — visible only to a credential whose
     # account_id matches the experiment's tenant's account (or the maintainer).
@@ -395,6 +426,17 @@ def build_router(
             else None
         )
 
+        # D12 busy/idle: of the eligible workers, how many are currently busy on
+        # some run (active-assignment holders across approved experiments) — the
+        # 'X of Y eligible busy' saturation signal for a queued researcher.
+        capable_busy_count = None
+        if capable_worker_count:
+            busy_ids = _busy_worker_ids(experiment_repository, per_job_factory)
+            capable_ids = worker_repository.list_capable_ids(
+                required_models=required_models, heartbeat_cutoff=heartbeat_cutoff(now)
+            )
+            capable_busy_count = len(set(capable_ids) & busy_ids)
+
         per_job_db = per_job_factory.get(experiment_id)
         if per_job_db is None:
             # No work units ever submitted for this experiment → empty rollup.
@@ -409,6 +451,7 @@ def build_router(
                 network_active_workers=network_active,
                 required_capabilities=required_caps or None,
                 capable_worker_count=capable_worker_count,
+                capable_busy_count=capable_busy_count,
                 run_phase=_run_phase(
                     experiment, in_flight_count=0, pending_count=0, completions_total=0
                 ),
@@ -472,6 +515,7 @@ def build_router(
             network_active_workers=network_active,
             required_capabilities=required_caps or None,
             capable_worker_count=capable_worker_count,
+            capable_busy_count=capable_busy_count,
             own_workers=(own_workers or None) if show_own else None,
             run_phase=run_phase,
             queue_position=queue_position,
@@ -481,6 +525,7 @@ def build_router(
                 run_phase=run_phase,
                 capable_worker_count=capable_worker_count,
                 downloading=downloading,
+                capable_busy_count=capable_busy_count,
             ),
             # Richer D8: live corroboration health — completed units whose
             # replicas diverged (no agreement, no receipt). 0 == cross-check clean.
