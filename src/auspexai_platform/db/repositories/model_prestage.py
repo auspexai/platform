@@ -38,6 +38,10 @@ class PrestageDirective:
     requested_at: datetime
     acquired_at: datetime | None
     status: str  # requested | acquired | abandoned
+    # D12 5c: latest in-flight download sample (worker-reported via heartbeat).
+    # total may be None when HF metadata was unavailable → bytes-only, no %.
+    download_bytes: int | None = None
+    download_total_bytes: int | None = None
 
 
 class ModelPrestageRepository:
@@ -126,6 +130,51 @@ class ModelPrestageRepository:
         )
         return [self._row(r) for r in rows]
 
+    def update_progress(
+        self,
+        *,
+        model_id: str,
+        worker_id: str,
+        download_bytes: int,
+        download_total_bytes: int | None,
+    ) -> None:
+        """Record the latest in-flight download sample (D12 5c) on the worker's
+        OPEN (requested) directive for `model_id`. No-op when there's no open row
+        (e.g. a stray report after the model was already acquired)."""
+        self.db.execute(
+            "UPDATE model_prestage SET download_bytes = ?, download_total_bytes = ? "
+            "WHERE model_id = ? AND worker_id = ? AND status = 'requested'",
+            (download_bytes, download_total_bytes, model_id, worker_id),
+        )
+
+    def progress_for_models(self, model_ids: list[str]) -> dict | None:
+        """The furthest-along in-flight (requested) download among `model_ids` —
+        `{model_id, bytes_downloaded, total_bytes, pct}` — or None if none is
+        open. Powers the D12 download-% surfaced to a queued researcher; `pct` is
+        None until a sample with a known total lands."""
+        if not model_ids:
+            return None
+        placeholders = ",".join("?" for _ in model_ids)
+        rows = self.db.execute(
+            f"SELECT model_id, download_bytes, download_total_bytes FROM model_prestage "
+            f"WHERE status = 'requested' AND model_id IN ({placeholders})",
+            tuple(model_ids),
+        )
+        best: dict | None = None
+        for r in rows:
+            b = r["download_bytes"]
+            t = r["download_total_bytes"]
+            pct = round(b / t * 100, 1) if (b is not None and t) else None
+            cand = {
+                "model_id": r["model_id"],
+                "bytes_downloaded": b,
+                "total_bytes": t,
+                "pct": pct,
+            }
+            if best is None or (cand["pct"] or -1) > (best["pct"] or -1):
+                best = cand
+        return best
+
     @staticmethod
     def _row(row) -> PrestageDirective:
         return PrestageDirective(
@@ -141,4 +190,6 @@ class ModelPrestageRepository:
                 datetime.fromisoformat(row["acquired_at"]) if row["acquired_at"] else None
             ),
             status=row["status"],
+            download_bytes=row["download_bytes"],
+            download_total_bytes=row["download_total_bytes"],
         )

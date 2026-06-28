@@ -403,6 +403,7 @@ def create_app(
             per_job_factory,
             event_bus=event_bus,
             release_repository=release_repository,
+            prestage_repository=model_prestage_repository,
         ),
         prefix="/api/v0",
         tags=["workers"],

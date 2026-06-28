@@ -211,6 +211,14 @@ class WorkerHeartbeatRequest(BaseModel):
             "Optional capabilities update. When omitted, only last_heartbeat_at advances."
         ),
     )
+    model_downloads: dict[str, dict[str, int | None]] | None = Field(
+        default=None,
+        description=(
+            "D12 5c: in-flight model-pull progress, {model_id: {bytes_downloaded, "
+            "total_bytes}}. Recorded on the open prestage row so a queued "
+            "researcher sees a download %."
+        ),
+    )
 
 
 class WorkerQuarantineRequest(BaseModel):
@@ -294,6 +302,7 @@ def build_router(
     *,
     event_bus: EventBus | None = None,
     release_repository=None,
+    prestage_repository=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -526,6 +535,16 @@ def build_router(
                     }
                 },
             ) from e
+        # D12 5c: record any in-flight model-download progress on the worker's
+        # open prestage rows so a queued researcher sees a download %.
+        if body.model_downloads and prestage_repository is not None:
+            for model_id, prog in body.model_downloads.items():
+                prestage_repository.update_progress(
+                    model_id=model_id,
+                    worker_id=worker_id,
+                    download_bytes=int(prog.get("bytes_downloaded") or 0),
+                    download_total_bytes=prog.get("total_bytes"),
+                )
         response = _worker_to_response(worker)
         # §9 #46: relay the latest announced release for the worker channel.
         # The volunteer's election is the install decision — this is informational.

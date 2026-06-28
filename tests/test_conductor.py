@@ -147,6 +147,37 @@ def test_conductor_marks_acquired_when_model_appears(
     assert repo.count_open_for_model("m-x") == 0
 
 
+def test_prestage_progress_update_and_read(db, worker_repository):
+    """D12 5c: update_progress records the latest sample on the OPEN row;
+    progress_for_models returns the furthest-along open download with a computed
+    pct, and nothing once the model is acquired."""
+    repo = ModelPrestageRepository(db)
+    _enroll(worker_repository, worker_id="wkr-dl", caps={"os": "linux"})
+    repo.create(
+        model_id="m-dl",
+        hf_repo="org/repo",
+        hf_filename="m.gguf",
+        worker_id="wkr-dl",
+        requested_by="conductor",
+    )
+    # Open download, no sample yet → present but pct is None.
+    p0 = repo.progress_for_models(["m-dl"])
+    assert p0 is not None
+    assert p0["model_id"] == "m-dl"
+    assert p0["pct"] is None
+    # A sample with a known total → pct computed.
+    repo.update_progress(
+        model_id="m-dl", worker_id="wkr-dl", download_bytes=250, download_total_bytes=1000
+    )
+    p1 = repo.progress_for_models(["m-dl"])
+    assert p1["bytes_downloaded"] == 250
+    assert p1["total_bytes"] == 1000
+    assert p1["pct"] == 25.0
+    # Once acquired it's no longer an in-flight download.
+    repo.mark_acquired(model_id="m-dl", worker_id="wkr-dl")
+    assert repo.progress_for_models(["m-dl"]) is None
+
+
 def test_conductor_bounds_fanout_by_supply(
     db, manifest_repository, experiment_repository, worker_repository, registered_tenant
 ):

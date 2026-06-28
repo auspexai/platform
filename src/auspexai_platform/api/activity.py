@@ -123,6 +123,7 @@ def _liveness_note(
     capable_worker_count: int | None,
     downloading: bool = False,
     capable_busy_count: int | None = None,
+    download_pct: float | None = None,
 ) -> str | None:
     """D8/D12: a plain-language explanation of the run's current state for the
     watching researcher, so a paused/stalled/queued experiment self-explains
@@ -164,9 +165,10 @@ def _liveness_note(
                 "yet. It starts automatically as soon as one joins."
             )
         if downloading:
+            suffix = f" ({download_pct:.0f}% done)" if download_pct is not None else ""
             return (
                 "Approved and queued — a volunteer is downloading the model your "
-                "experiment needs. It starts once the download completes."
+                f"experiment needs{suffix}. It starts once the download completes."
             )
         if (
             capable_worker_count
@@ -256,6 +258,10 @@ class ExperimentActivityResponse(BaseModel):
     # busy' tells a queued researcher whether the eligible fleet is saturated vs
     # merely sparse. TENANT_SCOPED, paired with capable_worker_count.
     capable_busy_count: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
+    # D12 5c: in-flight model-download progress for a queued experiment whose
+    # required model a volunteer is pulling — {model_id, bytes_downloaded,
+    # total_bytes, pct}. pct is None until a sample with a known total lands.
+    download_progress: Annotated[dict | None, ExposureTag.TENANT_SCOPED] = None
     # R-D3 own-worker enrichment: the tenant's OWN-account workers, listed
     # non-anonymously. ACCOUNT_SCOPED — visible only to a credential whose
     # account_id matches the experiment's tenant's account (or the maintainer).
@@ -473,9 +479,12 @@ def build_router(
             pending_count=counts.get("pending", 0),
             completions_total=completions_total,
         )
-        downloading = run_phase == "queued" and any(
-            prestage_repository.count_open_for_model(m) > 0 for m in required_models
+        download_progress = (
+            prestage_repository.progress_for_models(required_models)
+            if run_phase == "queued"
+            else None
         )
+        downloading = download_progress is not None
         queue_position = queue_depth = None
         if run_phase == "queued":
             # Mirror the scheduler's first-fit registration order exactly
@@ -516,6 +525,7 @@ def build_router(
             required_capabilities=required_caps or None,
             capable_worker_count=capable_worker_count,
             capable_busy_count=capable_busy_count,
+            download_progress=download_progress,
             own_workers=(own_workers or None) if show_own else None,
             run_phase=run_phase,
             queue_position=queue_position,
@@ -526,6 +536,7 @@ def build_router(
                 capable_worker_count=capable_worker_count,
                 downloading=downloading,
                 capable_busy_count=capable_busy_count,
+                download_pct=(download_progress or {}).get("pct"),
             ),
             # Richer D8: live corroboration health — completed units whose
             # replicas diverged (no agreement, no receipt). 0 == cross-check clean.
