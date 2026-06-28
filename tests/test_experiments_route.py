@@ -807,3 +807,38 @@ def test_stuck_experiments_ignores_runs_with_units(
     future = datetime.now(UTC) + timedelta(hours=1)
     stuck = _stuck_experiments(experiment_repository, per_job_factory, future)
     assert experiment.experiment_id not in [e.experiment_id for e, _ in stuck]
+
+
+def test_experiment_phase_distinguishes_approved_states(
+    approved_experiment, per_job_factory, experiment_repository
+) -> None:
+    """E15: run_phase splits the overloaded APPROVED into provisioning/inert/queued."""
+    from datetime import UTC, datetime, timedelta
+
+    from auspexai_platform.api.experiments import _experiment_phase
+    from auspexai_platform.db.repositories.work_units import WorkUnitRepository
+
+    _privkey, _binding, experiment, _hash = approved_experiment
+    now = datetime.now(UTC)
+    # Approved, no units: fresh → provisioning; aged past the threshold → inert.
+    assert _experiment_phase(experiment, per_job_factory, now) == "provisioning"
+    assert _experiment_phase(experiment, per_job_factory, now + timedelta(hours=1)) == "inert"
+    # Work pending, nothing started → queued.
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+    assert _experiment_phase(experiment, per_job_factory, now) == "queued"
+
+
+def test_experiment_phase_submitted_awaits_assessment(
+    approved_experiment, per_job_factory, experiment_repository
+) -> None:
+    """E15: a submitted experiment with no assessment decision → awaiting_assessment."""
+    from datetime import UTC, datetime
+
+    from auspexai_platform.api.experiments import _experiment_phase
+
+    _privkey, binding, _experiment, _hash = approved_experiment
+    sub = experiment_repository.create(
+        tenant_id=binding.tenant_id, tenant_experiment_label="sub-phase", manifest_hash=_hash
+    )
+    assert _experiment_phase(sub, per_job_factory, datetime.now(UTC)) == "awaiting_assessment"

@@ -97,6 +97,11 @@ class ExperimentResponse(BaseModel):
     experiment_id: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
     tenant_id: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
     status: Annotated[ExperimentStatus | None, ExposureTag.TENANT_SCOPED] = None
+    # E15: a coarse, presentation-only phase so a bare status (esp. the overloaded
+    # APPROVED) doesn't conflate awaiting-assessment / queued / running / inert.
+    # NOT a new ExperimentStatus — a view-layer refinement; None where the status
+    # already says it.
+    run_phase: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
     submitted_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
     started_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
     completed_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
@@ -187,6 +192,49 @@ def _stuck_experiments(
         if units == 0:
             out.append((e, int((now - submitted).total_seconds() // 60)))
     return out
+
+
+def _experiment_phase(experiment, per_job_factory, now: datetime) -> str | None:
+    """E15: a coarse, presentation-only phase so a bare status — especially the
+    overloaded APPROVED — doesn't read the same whether a run is awaiting
+    assessment, queued behind a busy fleet, actively running, or abandoned. Not a
+    new ExperimentStatus; a view-layer refinement over signals that already exist.
+    None for paused/terminal, where the status string already says it.
+
+      submitted → awaiting_assessment (async auto-assessment hasn't run) | assessed
+      approved  → provisioning (fresh, 0 units) · inert (old, 0 units = E14 stuck)
+                  · queued (work pending, nothing started) · running
+                  · completing (every unit settled; the driver hasn't finalized)
+    """
+    status_val = getattr(experiment.status, "value", experiment.status)
+    if status_val == ExperimentStatus.SUBMITTED.value:
+        decided = getattr(experiment, "assessment_decision", None)
+        return "assessed" if decided else "awaiting_assessment"
+    if status_val != ExperimentStatus.APPROVED.value:
+        return None
+    counts: dict[str, int] = {}
+    pj = per_job_factory.get(experiment.experiment_id) if per_job_factory is not None else None
+    if pj is not None:
+        counts = WorkUnitRepository(pj).count_by_status()
+    in_flight = counts.get("in_progress", 0)
+    pending = counts.get("pending", 0)
+    completed = counts.get("completed", 0)
+    if sum(counts.values()) == 0:
+        submitted = experiment.submitted_at
+        if isinstance(submitted, str):
+            submitted = datetime.fromisoformat(submitted)
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=UTC)
+        return (
+            "inert"
+            if (now - submitted) > timedelta(minutes=ATTENTION_STUCK_MINUTES)
+            else "provisioning"
+        )
+    if in_flight == 0 and pending == 0:
+        return "completing"  # every unit settled; the driver hasn't finalized
+    if in_flight > 0 or completed > 0:
+        return "running"
+    return "queued"  # pending work, nothing started
 
 
 class ExperimentSubmissionRequest(BaseModel):
@@ -792,15 +840,21 @@ def build_router(
             )
         else:
             experiments = []
-        filtered = [
-            filter_for_credential(
-                _to_response(e),
-                credential,
-                resource_tenant_id=e.tenant_id,
-                resource_account_id=e.submitted_by_account_id,
+        now = datetime.now(UTC)
+        filtered = []
+        for e in experiments:
+            resp = _to_response(e)
+            # E15: only APPROVED experiments touch the per-job DB (the helper
+            # early-returns for submitted/terminal), so the list stays cheap.
+            resp.run_phase = _experiment_phase(e, per_job_factory, now)
+            filtered.append(
+                filter_for_credential(
+                    resp,
+                    credential,
+                    resource_tenant_id=e.tenant_id,
+                    resource_account_id=e.submitted_by_account_id,
+                )
             )
-            for e in experiments
-        ]
         return ExperimentListResponse(experiments=filtered)
 
     @router.get(
@@ -842,8 +896,10 @@ def build_router(
         # confirms an experiment id exists.
         if experiment is None or not _can_view(credential, experiment):
             raise _experiment_not_found(experiment_id)
+        resp = _to_response(experiment)
+        resp.run_phase = _experiment_phase(experiment, per_job_factory, datetime.now(UTC))
         return filter_for_credential(
-            _to_response(experiment),
+            resp,
             credential,
             resource_tenant_id=experiment.tenant_id,
             resource_account_id=experiment.submitted_by_account_id,
