@@ -767,3 +767,43 @@ def test_submit_rejects_custom_reducer(
     )
     assert response.status_code == 422, response.text
     assert response.json()["detail"]["error"]["code"] == "custom_reducer_unsupported"
+
+
+def test_stuck_experiments_flags_zero_unit_approved(
+    approved_experiment, per_job_factory, experiment_repository
+) -> None:
+    """E14: an approved experiment that submitted no work units is flagged once it's
+    older than the stuck threshold — and not while it's still fresh."""
+    from datetime import UTC, datetime, timedelta
+
+    from auspexai_platform.api.experiments import _stuck_experiments
+
+    _privkey, _binding, experiment, _hash = approved_experiment
+
+    # Fresh (now): below the threshold → not yet flagged (driver may be starting).
+    fresh = _stuck_experiments(experiment_repository, per_job_factory, datetime.now(UTC))
+    assert experiment.experiment_id not in [e.experiment_id for e, _ in fresh]
+
+    # Evaluate well past the threshold → the zero-unit approved run is flagged.
+    future = datetime.now(UTC) + timedelta(hours=1)
+    stuck = _stuck_experiments(experiment_repository, per_job_factory, future)
+    assert experiment.experiment_id in [e.experiment_id for e, _ in stuck]
+
+
+def test_stuck_experiments_ignores_runs_with_units(
+    approved_experiment, per_job_factory, experiment_repository
+) -> None:
+    """A run that actually submitted work units is never 'stuck', however old."""
+    from datetime import UTC, datetime, timedelta
+
+    from auspexai_platform.api.experiments import _stuck_experiments
+    from auspexai_platform.db.repositories.work_units import WorkUnitRepository
+
+    _privkey, _binding, experiment, _hash = approved_experiment
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    WorkUnitRepository(db).submit_batch(
+        [{"unit_id": "u1", "payload": {"x": 1}}], replication_target=1
+    )
+    future = datetime.now(UTC) + timedelta(hours=1)
+    stuck = _stuck_experiments(experiment_repository, per_job_factory, future)
+    assert experiment.experiment_id not in [e.experiment_id for e, _ in stuck]

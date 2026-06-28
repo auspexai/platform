@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -62,6 +62,7 @@ from auspexai_platform.db.repositories.experiments import (
     InvalidStatusTransitionError,
 )
 from auspexai_platform.db.repositories.manifests import DuplicateManifestError
+from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.maintenance import projected_raw_age_off
@@ -140,6 +141,52 @@ class ExperimentResponse(BaseModel):
 
 class ExperimentListResponse(BaseModel):
     experiments: Annotated[list[ExperimentResponse] | None, ExposureTag.PUBLIC] = None
+
+
+# E14 — operator "needs attention" surfacing. An approved experiment that has
+# submitted ZERO work units for more than this many minutes = the driver never
+# delivered (crash / abandon / Ctrl-C). Surfaced to the maintainer (nav badge)
+# so abandoned runs don't sit invisibly behind the collapsed Accounts tree.
+ATTENTION_STUCK_MINUTES = 10
+
+
+class AttentionExperiment(BaseModel):
+    experiment_id: str
+    tenant_id: str
+    label: str | None = None
+    age_minutes: int
+    reason: str
+
+
+class AttentionResponse(BaseModel):
+    count: int
+    experiments: list[AttentionExperiment]
+
+
+def _stuck_experiments(
+    experiment_repository, per_job_factory, now: datetime
+) -> list[tuple[Any, int]]:
+    """E14: approved experiments with zero work units submitted for more than
+    `ATTENTION_STUCK_MINUTES` — the driver never delivered. Returns (experiment,
+    age_minutes). Per-job iteration over approved experiments only (few); the nav
+    badge polls this, so it stays cheap at current scale."""
+    out: list[tuple[Any, int]] = []
+    if per_job_factory is None:
+        return out
+    cutoff = now - timedelta(minutes=ATTENTION_STUCK_MINUTES)
+    for e in experiment_repository.list_all(status=ExperimentStatus.APPROVED):
+        submitted = e.submitted_at
+        if isinstance(submitted, str):
+            submitted = datetime.fromisoformat(submitted)
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=UTC)
+        if submitted > cutoff:
+            continue  # too fresh — the driver may still be starting up
+        pj = per_job_factory.get(e.experiment_id)
+        units = sum(WorkUnitRepository(pj).count_by_status().values()) if pj is not None else 0
+        if units == 0:
+            out.append((e, int((now - submitted).total_seconds() // 60)))
+    return out
 
 
 class ExperimentSubmissionRequest(BaseModel):
@@ -755,6 +802,30 @@ def build_router(
             for e in experiments
         ]
         return ExperimentListResponse(experiments=filtered)
+
+    @router.get(
+        "/maintainer/experiments/attention",
+        response_model=AttentionResponse,
+    )
+    async def experiments_attention(
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> AttentionResponse:
+        """E14: approved-but-inert experiments (zero work units past the stuck
+        threshold) for the maintainer's needs-attention surface (the nav badge).
+        Maintainer-only — a fleet-wide health view, never tenant-exposed."""
+        require_maintainer(credential)
+        now = datetime.now(UTC)
+        items = [
+            AttentionExperiment(
+                experiment_id=e.experiment_id,
+                tenant_id=e.tenant_id,
+                label=getattr(e, "tenant_experiment_label", None),
+                age_minutes=age,
+                reason="approved with no work units submitted",
+            )
+            for e, age in _stuck_experiments(experiment_repository, per_job_factory, now)
+        ]
+        return AttentionResponse(count=len(items), experiments=items)
 
     @router.get(
         "/experiments/{experiment_id}",
