@@ -425,6 +425,7 @@ def create_app(
             tenant_repository=tenant_repository,
             worker_repository=worker_repository,
             receipt_index_repository=receipt_index_repository,
+            prestage_repository=model_prestage_repository,
         ),
         prefix="/api/v0",
         tags=["activity"],

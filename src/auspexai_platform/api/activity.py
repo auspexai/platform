@@ -38,10 +38,12 @@ from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.db.models import ExperimentStatus
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
+    AssignmentRepository,
     ExperimentRepository,
     TenantRepository,
     WorkerRepository,
 )
+from auspexai_platform.db.repositories.model_prestage import ModelPrestageRepository
 from auspexai_platform.db.repositories.receipt_index import ReceiptIndexRepository
 from auspexai_platform.db.repositories.results import ResultRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
@@ -65,21 +67,58 @@ def _experiment_eligibility_reason(worker, required: dict, requires_real_executi
     return "not eligible for this experiment"
 
 
+def _run_phase(
+    experiment,
+    *,
+    in_flight_count: int,
+    pending_count: int,
+    completions_total: int,
+) -> str | None:
+    """Derived, presentation-only phase that distinguishes an APPROVED experiment
+    that is *queued* (nothing in flight, work still pending) from one actively
+    *running* (D12).
+
+    This is NOT a new ExperimentStatus — the scheduler and the terminal-state
+    guards are untouched. `APPROVED` is overloaded for both "queued behind a busy
+    fleet" and "running"; this is a view-layer refinement over signals that
+    already exist (in-flight assignment count + work-unit counts). Returns None
+    for the other states, where the bare status string already says it.
+    """
+    status_val = getattr(experiment.status, "value", experiment.status)
+    if status_val == ExperimentStatus.PAUSED.value:
+        return "paused"
+    if status_val == ExperimentStatus.APPROVED.value:
+        # Has started → running (an idle gap mid-run is "between beats", not
+        # queued; the heart-monitor narrates that, and a below-floor stall is a
+        # PAUSED state, not this one).
+        if completions_total > 0 or in_flight_count > 0:
+            return "running"
+        # Never started, with work waiting → queued behind capacity (the D12 gap).
+        if pending_count > 0:
+            return "queued"
+        # Approved but no work units yet (transient).
+        return "provisioning"
+    return None
+
+
 def _liveness_note(
     experiment,
     *,
-    work_unit_counts: dict[str, int],
+    run_phase: str | None,
     capable_worker_count: int | None,
+    downloading: bool = False,
 ) -> str | None:
-    """D8: a plain-language explanation of the run's current state for the
-    watching researcher, so a paused/stalled experiment self-explains instead of
-    reading as a silent stall.
+    """D8/D12: a plain-language explanation of the run's current state for the
+    watching researcher, so a paused/stalled/queued experiment self-explains
+    instead of reading as a silent stall.
 
-    The headline case is the C14 regime-3 pause: the coordinator pauses a run
-    when the eligible fleet can no longer meet the unit's corroboration floor,
-    and auto-resumes it once enough eligible workers return. That's a
-    `last_action_by_class == system` pause — not a maintainer action — so the
-    researcher is told it's a self-healing hold, not a fault.
+    Covers three families:
+      - PAUSED: the C14 regime-3 self-healing below-floor hold (a SYSTEM pause,
+        not a maintainer action) vs a maintainer pause.
+      - QUEUED (D12): approved but nothing in flight — auto-approval is not
+        execution, so name *why* it waits (no eligible worker holds the model /
+        a volunteer is downloading the model / eligible workers busy elsewhere).
+      - RUNNING but thin: actively running under a fleet below the floor.
 
     Returns None when there's nothing noteworthy to say (the common healthy
     case), so the dashboard banner only ever appears when it has something to
@@ -102,9 +141,24 @@ def _liveness_note(
             )
         return "Paused by the maintainer."
 
+    if run_phase == "queued":
+        if capable_worker_count == 0:
+            return (
+                "Approved and queued — no eligible worker is online for your model "
+                "yet. It starts automatically as soon as one joins."
+            )
+        if downloading:
+            return (
+                "Approved and queued — a volunteer is downloading the model your "
+                "experiment needs. It starts once the download completes."
+            )
+        return (
+            "Approved and queued — eligible workers are online but busy with other "
+            "runs right now. Yours starts as soon as one frees up."
+        )
+
     if (
-        status_val == ExperimentStatus.APPROVED.value
-        and work_unit_counts.get("in_progress", 0) > 0
+        run_phase == "running"
         and floor
         and capable_worker_count is not None
         and capable_worker_count < floor
@@ -191,6 +245,19 @@ class ExperimentActivityResponse(BaseModel):
     # aggregate count with no per-worker identity → PUBLIC, like the other counts.
     # None on the empty rollup (no per-job DB yet).
     diverged_unit_count: Annotated[int | None, ExposureTag.PUBLIC] = None
+    # D12 run phase: a derived, presentation-only refinement of the overloaded
+    # APPROVED state — "queued" (approved but nothing in flight) vs "running" vs
+    # "provisioning" vs "paused". Lets the dashboard distinguish "in line" from
+    # "in progress" without a new ExperimentStatus. TENANT_SCOPED (owner's run
+    # context), like liveness_note.
+    run_phase: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
+    # D12 queue position: this experiment's 1-based rank and the total depth among
+    # APPROVED experiments in the scheduler's registration order — the "you're in
+    # line, here's where" signal. Set only while queued. Bare integers, no
+    # identities (depth is an aggregate count, like network_active_workers);
+    # TENANT_SCOPED for conservatism on top of the owner-only endpoint gate.
+    queue_position: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
+    queue_depth: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
 
 
 def build_router(
@@ -200,6 +267,7 @@ def build_router(
     tenant_repository: TenantRepository,
     worker_repository: WorkerRepository,
     receipt_index_repository: ReceiptIndexRepository,
+    prestage_repository: ModelPrestageRepository,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -341,6 +409,9 @@ def build_router(
                 network_active_workers=network_active,
                 required_capabilities=required_caps or None,
                 capable_worker_count=capable_worker_count,
+                run_phase=_run_phase(
+                    experiment, in_flight_count=0, pending_count=0, completions_total=0
+                ),
             )
 
         work_units = WorkUnitRepository(per_job_db)
@@ -348,6 +419,34 @@ def build_router(
 
         counts = work_units.count_by_status()
         completions_total, target_total = work_units.replication_totals()
+
+        # D12: distinguish "queued" (approved, nothing in flight, work pending)
+        # from "running", then explain the wait. All derived from existing
+        # signals — no new ExperimentStatus, no scheduler change.
+        in_flight = AssignmentRepository(per_job_db).count_active_for_experiment()
+        run_phase = _run_phase(
+            experiment,
+            in_flight_count=in_flight,
+            pending_count=counts.get("pending", 0),
+            completions_total=completions_total,
+        )
+        downloading = run_phase == "queued" and any(
+            prestage_repository.count_open_for_model(m) > 0 for m in required_models
+        )
+        queue_position = queue_depth = None
+        if run_phase == "queued":
+            # Mirror the scheduler's first-fit registration order exactly
+            # (scheduler picks over list_all(status=APPROVED) in this order), so
+            # the surfaced rank matches the real dispatch order. Bare integers
+            # only — never other tenants' identities.
+            approved_ids = [
+                e.experiment_id
+                for e in experiment_repository.list_all(status=ExperimentStatus.APPROVED)
+            ]
+            if experiment_id in approved_ids:
+                queue_position = approved_ids.index(experiment_id) + 1
+                queue_depth = len(approved_ids)
+
         own_workers, account_id = _own_workers(experiment, per_job_db, now)
 
         # Gate `own_workers` (ACCOUNT_SCOPED) via the same decision function the
@@ -374,10 +473,14 @@ def build_router(
             required_capabilities=required_caps or None,
             capable_worker_count=capable_worker_count,
             own_workers=(own_workers or None) if show_own else None,
+            run_phase=run_phase,
+            queue_position=queue_position,
+            queue_depth=queue_depth,
             liveness_note=_liveness_note(
                 experiment,
-                work_unit_counts=counts,
+                run_phase=run_phase,
                 capable_worker_count=capable_worker_count,
+                downloading=downloading,
             ),
             # Richer D8: live corroboration health — completed units whose
             # replicas diverged (no agreement, no receipt). 0 == cross-check clean.

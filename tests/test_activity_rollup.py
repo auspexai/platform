@@ -108,6 +108,17 @@ def _seed_diverged(per_job_factory: PerJobDatabaseFactory, experiment_id: str) -
         )
 
 
+def _seed_queued(per_job_factory: PerJobDatabaseFactory, experiment_id: str) -> None:
+    """Seed a per-job DB with PENDING work units only — no completions, no
+    results, no assignments. This is the D12 'approved but never started, queued
+    behind capacity' state (run_phase == 'queued')."""
+    db = per_job_factory.get_or_create(experiment_id)
+    WorkUnitRepository(db).submit_batch(
+        [{"unit_id": f"q{i}", "payload": {}} for i in range(2)],
+        replication_target=2,
+    )
+
+
 class TestExperimentActivity:
     def test_owner_gets_anonymized_rollup(
         self, client, approved_experiment, per_job_factory
@@ -247,6 +258,46 @@ class TestExperimentActivity:
         )
         assert resp.status_code == 200, resp.text
         assert "liveness_note" not in resp.json()
+
+    def test_queued_experiment_reports_phase_position_and_note(
+        self, client, approved_experiment, per_job_factory
+    ) -> None:
+        """D12: an approved experiment that has never started (pending units, no
+        completions, nothing in flight) reports run_phase='queued', its 1-based
+        FIFO position among approved experiments, and a plain-language wait note."""
+        privkey, binding, experiment, _hash = approved_experiment
+        _seed_queued(per_job_factory, experiment.experiment_id)
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["run_phase"] == "queued"
+        assert body["queue_position"] == 1
+        assert body["queue_depth"] >= 1
+        assert "queued" in body["liveness_note"].lower()
+
+    def test_running_experiment_reports_running_phase_no_queue(
+        self, client, approved_experiment, per_job_factory
+    ) -> None:
+        """D12: an approved experiment with completions reads as 'running' (an idle
+        gap between rounds is 'between beats', not 'queued') and carries no queue
+        position (the field is omitted when not queued)."""
+        privkey, binding, experiment, _hash = approved_experiment
+        _seed(per_job_factory, experiment.experiment_id)
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["run_phase"] == "running"
+        assert "queue_position" not in body
 
     def test_clean_run_reports_zero_divergence(
         self, client, approved_experiment, per_job_factory
