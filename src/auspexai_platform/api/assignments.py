@@ -877,6 +877,7 @@ def build_router(
                 attestation_repository=attestation_repository,
                 event_bus=event_bus,
                 governance_footprint_builder=governance_footprint_builder,
+                manifest_repository=manifest_repository,
             )
 
         return ResultSubmissionResponse(
@@ -1211,6 +1212,7 @@ def finalize_completed_unit(
     attestation_repository=None,
     event_bus=None,
     governance_footprint_builder=None,
+    manifest_repository=None,  # C7: resolves manifest_json so within_cell_tolerance reads its envelope
 ) -> None:
     """Post-completion processing for a unit that JUST transitioned to `completed`:
     issue receipts (best-effort), promote the consensus result, run the worker
@@ -1227,6 +1229,13 @@ def finalize_completed_unit(
         results = ResultRepository(per_job_db).list_for_unit(unit_id)
         receipt_repo = ReceiptRepository(per_job_db)
         if experiment is not None:
+            # C7: resolve the signed manifest so the reducer dispatch can read a
+            # within_cell_tolerance envelope (None ⇒ the default hash-agreement).
+            manifest_record = (
+                manifest_repository.get(experiment.manifest_hash)
+                if manifest_repository is not None
+                else None
+            )
             issuance_outcome = issue_receipts_for_completed_unit(
                 work_unit=updated_unit,
                 experiment=experiment,
@@ -1238,6 +1247,7 @@ def finalize_completed_unit(
                 attribution_resolver=lambda result: _result_account_opted_in(
                     worker_repository, account_repository, result
                 ),
+                manifest=(manifest_record.manifest_json if manifest_record is not None else None),
             )
             audit_repository.append(
                 actor_class=CredentialClass.SYSTEM,
@@ -1269,12 +1279,12 @@ def finalize_completed_unit(
                         "issued_receipt_ids": issuance_outcome.issued_receipt_ids,
                     },
                 )
-            if issuance_outcome.agreement.agreed and results:
-                # M-Results: promote one agreed result to the durable T-C
-                # consensus copy (all agreeing results are byte-identical;
-                # the rest are T-X replicas that age off first). Deterministic
-                # pick so re-runs are idempotent.
-                consensus_result_id = min(r.result_id for r in results)
+            if issuance_outcome.agreement.agreed and issuance_outcome.agreeing_result_ids:
+                # M-Results: promote one AGREEING result to the durable T-C
+                # consensus copy (hash-agreement: all agreeing are byte-identical;
+                # within_cell_tolerance: an envelope member, never an outlier).
+                # Deterministic pick (min) so re-runs are idempotent.
+                consensus_result_id = min(issuance_outcome.agreeing_result_ids)
                 ResultRepository(per_job_db).promote_consensus(unit_id, consensus_result_id)
                 audit_repository.append(
                     actor_class=CredentialClass.SYSTEM,

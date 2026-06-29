@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 
 from auspexai_platform.db.models import Experiment, Result, WorkUnit
@@ -49,12 +49,14 @@ from auspexai_platform.receipts.models import (
 from auspexai_platform.receipts.rekor import NoOpRekorClient, RekorClient
 from auspexai_platform.receipts.repository import ReceiptRecord, ReceiptRepository
 from auspexai_platform.receipts.signing import SigningKey, cose_sign1_encode
+from auspexai_platform.receipts.tolerance import tolerance_agreement
 from auspexai_platform.result_signature import canonical_result_bytes
 
 logger = logging.getLogger(__name__)
 
 
 HASH_AGREEMENT_METHOD = "builtin_hash_agreement"
+TOLERANCE_METHOD = "builtin_within_cell_tolerance"
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,11 @@ class ReceiptIssuanceOutcome:
 
     issued_receipt_ids: list[str]
     agreement: AgreementOutcome
+    # Result rows that formed the consensus (the agreeing subset). For
+    # hash-agreement that is every result; for within_cell_tolerance only the
+    # workers inside the envelope. The caller promotes one of THESE (never an
+    # outlier) as the durable consensus copy.
+    agreeing_result_ids: list[int] = field(default_factory=list)
 
 
 def _semantic_hash(result: Result) -> str:
@@ -132,6 +139,46 @@ def hash_agreement_reducer(results: list[Result]) -> AgreementOutcome:
     )
 
 
+def _reduce_unit(
+    results: list[Result],
+    *,
+    experiment: Experiment,
+    manifest: dict | None,
+) -> tuple[AgreementOutcome, list[Result], list[Result]]:
+    """Dispatch on the manifest's reducer kind; return the agreement outcome plus
+    the partition (agreeing results that earn receipts, outliers recorded as
+    divergence). `within_cell_tolerance` reads the feature_schema envelope; the
+    default — and any unknown kind, defensively — is exact hash-agreement.
+
+    C7 swaps ONLY the agreement predicate. The C14 count/floor logic that decides
+    WHEN a unit settles is untouched (the floor is read here as the corroboration
+    threshold, not re-implemented)."""
+    reducer = (manifest or {}).get("reducer") or {}
+    if reducer.get("kind") == TOLERANCE_METHOD:
+        part = tolerance_agreement(
+            results,
+            feature_schema=(manifest or {}).get("feature_schema") or {},
+            tolerance_features=reducer.get("tolerance_features"),
+            floor=getattr(experiment, "replication_floor", None) or 1,
+        )
+        outcome = AgreementOutcome(
+            agreed=part.agreed,
+            method=TOLERANCE_METHOD,
+            agreeing_workers=len(part.agreeing_indices) if part.agreed else 0,
+            semantic_hash=part.representative_hash,
+        )
+        if part.agreed:
+            return (
+                outcome,
+                [results[i] for i in part.agreeing_indices],
+                [results[i] for i in part.outlier_indices],
+            )
+        return outcome, [], results
+
+    outcome = hash_agreement_reducer(results)
+    return (outcome, results, []) if outcome.agreed else (outcome, [], results)
+
+
 def _generate_receipt_id() -> str:
     return f"rcpt-{secrets.token_urlsafe(9)}"
 
@@ -147,6 +194,7 @@ def issue_receipts_for_completed_unit(
     rekor_client: RekorClient | NoOpRekorClient | None = None,
     containment_resolver=None,  # Callable[[Result], bool] | None: result -> ran-under-STRICT
     attribution_resolver=None,  # Callable[[Result], bool] | None: result -> account opted-in @ issue
+    manifest: dict | None = None,  # C7: resolved manifest_json — selects the reducer (None ⇒ hash)
 ) -> ReceiptIssuanceOutcome:
     """Build, sign, and persist one receipt per agreeing worker.
 
@@ -181,58 +229,63 @@ def issue_receipts_for_completed_unit(
         deduped.append(r)
     results = deduped
 
-    outcome = hash_agreement_reducer(results)
+    outcome, agreeing, outliers = _reduce_unit(results, experiment=experiment, manifest=manifest)
+
+    # Firewall #1 (A2): index every OUTLIER's honest work in the divergence
+    # trust-index — evidentiary now, counted only once the equal-trust flip is
+    # ON (D7 §11: divergence is NOT a Receipt object). For exact hash-agreement
+    # the outliers are the whole set on disagreement; for within_cell_tolerance
+    # they are the workers OUTSIDE the envelope — the unit can still AGREE on the
+    # floor-many inside it (the C15 fix). Best-effort: never blocks completion.
+    if outliers and receipt_index_repo is not None:
+        for r in outliers:
+            try:
+                receipt_index_repo.record_divergence(
+                    experiment_id=experiment.experiment_id,
+                    worker_id=r.worker_id,
+                    worker_pubkey=r.worker_pubkey_hex,
+                    unit_id=work_unit.unit_id,
+                    ran_under_strict=(
+                        bool(containment_resolver(r)) if containment_resolver else False
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "divergence_index record failed for unit %s worker %s",
+                    work_unit.unit_id,
+                    r.worker_id,
+                )
+
     if not outcome.agreed:
         logger.warning(
-            "unit %s: results did not agree under %s — no receipts issued "
-            "(replication_factor=%d, results_seen=%d)",
+            "unit %s: no consensus under %s — no receipts issued "
+            "(replication_factor=%d, results_seen=%d, agreeing=0)",
             work_unit.unit_id,
             outcome.method,
             work_unit.replication_target,
             len(results),
         )
-        # Firewall #1 (A2): index each diverging worker's honest work in the
-        # divergence trust-index — evidentiary now, counted only once the
-        # equal-trust flip is ON (D7 §11: divergence is NOT a Receipt object).
-        # Best-effort: a failure here never blocks unit completion.
-        if receipt_index_repo is not None:
-            for r in results:
-                try:
-                    receipt_index_repo.record_divergence(
-                        experiment_id=experiment.experiment_id,
-                        worker_id=r.worker_id,
-                        worker_pubkey=r.worker_pubkey_hex,
-                        unit_id=work_unit.unit_id,
-                        ran_under_strict=(
-                            bool(containment_resolver(r)) if containment_resolver else False
-                        ),
-                    )
-                except Exception:
-                    logger.exception(
-                        "divergence_index record failed for unit %s worker %s",
-                        work_unit.unit_id,
-                        r.worker_id,
-                    )
-        return ReceiptIssuanceOutcome(issued_receipt_ids=[], agreement=outcome)
+        return ReceiptIssuanceOutcome(
+            issued_receipt_ids=[], agreement=outcome, agreeing_result_ids=[]
+        )
 
-    # All results have the same semantic hash. Build hash anchors covering
-    # each agreeing result (one per worker). Anchors are identical content
-    # across all receipts in this batch.
+    # Consensus formed. Build hash anchors covering each AGREEING result (one per
+    # worker). Anchors are identical content across all receipts in this batch.
     anchors = [
         ResultHashAnchor(
             rekor_log_index=0,  # placeholder until §5.16 Rekor integration
             rekor_entry_uuid="lab-mode-no-rekor",
             result_sha256=_result_hash(r),
         )
-        for r in results
+        for r in agreeing
     ]
-    time_window_start = min(r.completed_at for r in results)
-    time_window_end = max(r.completed_at for r in results)
+    time_window_start = min(r.completed_at for r in agreeing)
+    time_window_end = max(r.completed_at for r in agreeing)
 
     _rekor = rekor_client or NoOpRekorClient()
 
     issued: list[str] = []
-    for result in results:
+    for result in agreeing:
         receipt_id = _generate_receipt_id()
         receipt = Receipt(
             version="0.1",
@@ -332,4 +385,8 @@ def issue_receipts_for_completed_unit(
             work_unit.replication_target,
         )
 
-    return ReceiptIssuanceOutcome(issued_receipt_ids=issued, agreement=outcome)
+    return ReceiptIssuanceOutcome(
+        issued_receipt_ids=issued,
+        agreement=outcome,
+        agreeing_result_ids=[r.result_id for r in agreeing],
+    )

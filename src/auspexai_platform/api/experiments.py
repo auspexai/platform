@@ -68,6 +68,7 @@ from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.feature_schema import validate_feature_schema
 from auspexai_platform.maintenance import projected_raw_age_off
 from auspexai_platform.receipts.signing import SigningKey
+from auspexai_platform.receipts.tolerance import validate_tolerance_reducer
 from auspexai_platform.scheduler import (
     is_sub_floor_policy,
     policy_floor_for_tier,
@@ -725,6 +726,28 @@ def build_router(
                     }
                 },
             )
+
+        # C7 (Inc 1): a within_cell_tolerance reducer reads its envelope from the
+        # feature_schema, so validate the relationship at submit — there must be a
+        # predicate feature, and any explicit tolerance_features must reference a
+        # declared feature that carries a `comparison`. Rejects a tolerance reducer
+        # that would silently have nothing to compare.
+        if isinstance(reducer, dict) and reducer.get("kind") == "builtin_within_cell_tolerance":
+            tol_errors = validate_tolerance_reducer(reducer, feature_schema)
+            if tol_errors:
+                raise HTTPException(
+                    status_code=422,  # UNPROCESSABLE_CONTENT
+                    detail={
+                        "error": {
+                            "code": "tolerance_reducer_invalid",
+                            "message": (
+                                "the within_cell_tolerance reducer and feature_schema "
+                                "are inconsistent (no agreement predicate)"
+                            ),
+                            "details": {"errors": tol_errors[:20]},
+                        }
+                    },
+                )
 
         # Insert manifest. Duplicate (same canonical hash) means re-submission;
         # treat as 409 — researchers shouldn't blindly re-upload identical
