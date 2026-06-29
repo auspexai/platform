@@ -33,6 +33,7 @@ from auspexai_platform.receipts.intoto import (
     AUSPEXAI_RESULT_SET_PREDICATE_TYPE_V1,
     build_result_set_statement,
 )
+from auspexai_platform.receipts.issuance import HASH_AGREEMENT_METHOD, TOLERANCE_METHOD
 from auspexai_platform.receipts.rekor import NoOpRekorClient, RekorClient
 from auspexai_platform.receipts.signing import SigningKey, cose_sign1_encode
 
@@ -70,14 +71,20 @@ INTEGRITY_BASES = frozenset(
 )
 
 
-def classify_consensus_basis(agreeing_workers: int) -> str:
+def classify_consensus_basis(agreeing_workers: int, method: str = HASH_AGREEMENT_METHOD) -> str:
     """Integrity basis for a CONSENSUS unit (reached agreement, holds a receipt), from its
-    ACHIEVED corroboration: >=2 independent agreeing replicas -> `within_cell_exact`; a single
-    replica has no peer -> `process_only` (firewall #1 D3). Pass the receipt's `agreeing_workers`
-    (the immutable count recorded at issuance) — under C14 regime-2 capacity-aware completion a
-    unit's achieved replicas can be fewer than its `replication_target`, so the target is NOT a
-    faithful corroboration count."""
-    return INTEGRITY_BASIS_EXACT if agreeing_workers >= 2 else INTEGRITY_BASIS_PROCESS_ONLY
+    ACHIEVED corroboration AND the reducer method. A single replica has no peer -> `process_only`
+    (firewall #1 D3), regardless of method. With >=2 agreeing replicas the basis reflects HOW they
+    agreed: byte-exact hash agreement -> `within_cell_exact`; the declared-envelope reducer (C7) ->
+    `within_cell_tolerance` (the replicas agreed WITHIN the envelope, not byte-for-byte — never
+    overclaim exact). Pass the receipt's immutable `agreeing_workers` + `quorum_agreement.method`
+    (recorded at issuance) — under C14 regime-2 capacity-aware completion a unit's achieved replicas
+    can be fewer than its `replication_target`, so the target is NOT a faithful corroboration count."""
+    if agreeing_workers < 2:
+        return INTEGRITY_BASIS_PROCESS_ONLY
+    if method == TOLERANCE_METHOD:
+        return INTEGRITY_BASIS_TOLERANCE
+    return INTEGRITY_BASIS_EXACT
 
 
 @dataclass(frozen=True)
@@ -170,6 +177,27 @@ def _unit_agreeing_workers(per_job_db) -> dict[str, int]:
             continue
         for unit_id in receipt.work_unit_ids:
             out[unit_id] = max(out.get(unit_id, 0), int(receipt.quorum_agreement.agreeing_workers))
+    return out
+
+
+def _unit_consensus_methods(per_job_db) -> dict[str, str]:
+    """{unit_id: reducer method} — the IMMUTABLE `quorum_agreement.method` recorded in each
+    per-job receipt body at issuance (`builtin_hash_agreement` / `builtin_within_cell_tolerance`).
+    Pairs with `_unit_agreeing_workers` so the basis reflects HOW replicas agreed: a tolerance
+    unit with >=2 agreeing replicas is `within_cell_tolerance`, not `within_cell_exact`. A unit's
+    per-worker receipts all carry the same method."""
+    from auspexai_platform.receipts.models import decode_cbor
+
+    out: dict[str, str] = {}
+    for row in per_job_db.execute(
+        "SELECT receipt_body_cbor FROM receipts ORDER BY issued_at, receipt_id"
+    ):
+        try:
+            receipt = decode_cbor(row["receipt_body_cbor"])
+        except Exception:
+            continue
+        for unit_id in receipt.work_unit_ids:
+            out[unit_id] = str(receipt.quorum_agreement.method)
     return out
 
 
@@ -325,6 +353,7 @@ def collect_result_set_entries(
     repo = ResultRepository(per_job_db)
     payload_hashes = _unit_payload_hashes(per_job_db)
     agreeing_workers = _unit_agreeing_workers(per_job_db)
+    consensus_methods = _unit_consensus_methods(per_job_db)
     entries: list[ResultSetEntry] = []
     after_completed_at: str | None = None
     after_result_id: str | None = None
@@ -345,7 +374,10 @@ def collect_result_set_entries(
                     receipt_id=receipt_id,
                     unit_payload_sha256=payload_hashes.get(r.unit_id),
                     environment=r.environment,
-                    integrity_basis=classify_consensus_basis(agreeing_workers.get(r.unit_id, 0)),
+                    integrity_basis=classify_consensus_basis(
+                        agreeing_workers.get(r.unit_id, 0),
+                        consensus_methods.get(r.unit_id, HASH_AGREEMENT_METHOD),
+                    ),
                 )
             )
         if len(rows) < page_size:

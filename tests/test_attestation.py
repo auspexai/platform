@@ -11,6 +11,7 @@ from auspexai_platform.receipts.attestation import (
     INTEGRITY_BASIS_DIVERGED,
     INTEGRITY_BASIS_EXACT,
     INTEGRITY_BASIS_PROCESS_ONLY,
+    INTEGRITY_BASIS_TOLERANCE,
     RESULT_SET_ALGORITHM,
     RESULT_SET_ALGORITHM_V1,
     DivergedUnitEntry,
@@ -99,6 +100,20 @@ def test_classify_consensus_basis():
     assert classify_consensus_basis(2) == INTEGRITY_BASIS_EXACT
     assert classify_consensus_basis(1) == INTEGRITY_BASIS_PROCESS_ONLY
     assert classify_consensus_basis(0) == INTEGRITY_BASIS_PROCESS_ONLY
+
+
+def test_classify_consensus_basis_tolerance():
+    """C7 Inc 2: a tolerance unit with >=2 agreeing replicas is within_cell_tolerance
+    (agreed within the envelope, NOT byte-exact); a single replica is still
+    process_only regardless of method (no peer to corroborate)."""
+    tol = "builtin_within_cell_tolerance"
+    hashm = "builtin_hash_agreement"
+    assert classify_consensus_basis(3, tol) == INTEGRITY_BASIS_TOLERANCE
+    assert classify_consensus_basis(2, tol) == INTEGRITY_BASIS_TOLERANCE
+    assert classify_consensus_basis(1, tol) == INTEGRITY_BASIS_PROCESS_ONLY
+    # exact reducer keeps the exact basis; the default (no method) is exact-or-process
+    assert classify_consensus_basis(2, hashm) == INTEGRITY_BASIS_EXACT
+    assert classify_consensus_basis(2) == INTEGRITY_BASIS_EXACT
 
 
 def test_integrity_basis_rides_predicate_not_leaf(tmp_path: Path):
@@ -302,6 +317,7 @@ def insert_per_job_receipt(
     unit_id: str,
     worker_pubkey_hex: str = "ab" * 32,
     agreeing_workers: int = 1,
+    method: str = "hash-equality",
 ) -> None:
     """Seed the AUTHORITATIVE per-job receipt row. Since the 2026-06-12
     signature-scope fix, attestation/bundle membership is derived from the
@@ -328,7 +344,7 @@ def insert_per_job_receipt(
             quorum_agreement=QuorumAgreement(
                 replication_factor=agreeing_workers,
                 agreeing_workers=agreeing_workers,
-                method="hash-equality",
+                method=method,
             ),
             result_hash_anchors=[
                 ResultHashAnchor(
@@ -355,6 +371,7 @@ def _seed_consensus_unit(
     payload: dict,
     worker_id: str,  # must be an enrolled worker (receipt_index FKs workers)
     replication_target: int = 1,
+    method: str = "hash-equality",
 ) -> tuple[str, str, str]:
     """Completed unit + consensus result + the authoritative per-job receipt
     row + a receipt-index entry. Returns (unit_id, consensus semantic_hash,
@@ -381,7 +398,11 @@ def _seed_consensus_unit(
     repo.promote_consensus(unit_id, result.result_id)
     receipt_id = f"rcpt-{unit_id}"
     insert_per_job_receipt(
-        db, receipt_id=receipt_id, unit_id=unit_id, agreeing_workers=replication_target
+        db,
+        receipt_id=receipt_id,
+        unit_id=unit_id,
+        agreeing_workers=replication_target,
+        method=method,
     )
     receipt_index_repository.record(
         receipt_id=receipt_id,
@@ -572,6 +593,43 @@ class TestAttestationRoute:
         basis = {e.unit_id: e.integrity_basis for e in entries}
         assert basis["u_exact"] == INTEGRITY_BASIS_EXACT
         assert basis["u_solo"] == INTEGRITY_BASIS_PROCESS_ONLY
+
+    def test_collect_classifies_tolerance_basis(
+        self,
+        approved_experiment,
+        enrolled_worker,
+        per_job_factory: PerJobDatabaseFactory,
+        receipt_index_repository,
+    ):
+        """C7 Inc 2: a unit reduced under within_cell_tolerance (>=2 agreeing) attests as
+        within_cell_tolerance, NOT within_cell_exact — the basis reads the receipt's
+        quorum_agreement.method, so the attestation never overclaims byte-exact agreement.
+        A single tolerance replica is still process_only (no peer to corroborate)."""
+        from auspexai_platform.receipts.attestation import (
+            collect_result_set_entries,
+            receipt_map_from_per_job,
+        )
+
+        _, _, experiment, _ = approved_experiment
+        _, worker = enrolled_worker
+        for unit_id, target in (("u_tol", 2), ("u_tol_solo", 1)):
+            _seed_consensus_unit(
+                per_job_factory,
+                receipt_index_repository,
+                experiment.experiment_id,
+                unit_id=unit_id,
+                payload={"v": unit_id},
+                worker_id=worker.worker_id,
+                replication_target=target,
+                method="builtin_within_cell_tolerance",
+            )
+        per_job_db = per_job_factory.get(experiment.experiment_id)
+        entries = collect_result_set_entries(
+            per_job_db, receipt_id_by_result=receipt_map_from_per_job(per_job_db)
+        )
+        basis = {e.unit_id: e.integrity_basis for e in entries}
+        assert basis["u_tol"] == INTEGRITY_BASIS_TOLERANCE
+        assert basis["u_tol_solo"] == INTEGRITY_BASIS_PROCESS_ONLY
 
     def test_governance_footprint_in_signed_predicate(
         self,
