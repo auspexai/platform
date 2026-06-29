@@ -33,6 +33,7 @@ from auspexai_platform.api import assessment_policy as assessment_policy_routes
 from auspexai_platform.api import assignments as assignment_routes
 from auspexai_platform.api import audit as audit_routes
 from auspexai_platform.api import auth as auth_routes
+from auspexai_platform.api import catalog as catalog_routes
 from auspexai_platform.api import certifications as certification_routes
 from auspexai_platform.api import events as event_routes
 from auspexai_platform.api import experiments as experiment_routes
@@ -294,6 +295,11 @@ def create_app(
         health.build_router(credential_dep, worker_repository),
         prefix="/api/v0",
         tags=["system"],
+    )
+    app.include_router(
+        catalog_routes.build_router(credential_dep, worker_repository),
+        prefix="/api/v0",
+        tags=["catalog"],
     )
     app.include_router(
         auth_routes.build_router(credential_dep, account_repository),
