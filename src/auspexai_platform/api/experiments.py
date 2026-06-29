@@ -863,6 +863,43 @@ def build_router(
             },
         )
 
+        # C7 Inc 3: the exact-without-pin footgun. Byte-exact hash agreement on a
+        # BYO / heterogeneous fleet predictably diverges unless the serving stack is
+        # pinned — the C15 incident (Ollama 0.17.7 vs 0.18.2, same weights). If an
+        # inference run (one that declares an inference_determinism profile) selects
+        # the exact reducer WITHOUT a serving_version_pin, record an advisory:
+        # within_cell_tolerance is the default for such runs. Non-fatal — the run is
+        # allowed (the maintainer/researcher decides), the advisory is the nudge.
+        determinism = body.manifest.get("inference_determinism")
+        reducer_kind = reducer.get("kind") if isinstance(reducer, dict) else None
+        if (
+            reducer_kind == "builtin_hash_agreement"
+            and isinstance(determinism, dict)
+            and determinism
+            and not determinism.get("serving_version_pin")
+        ):
+            logger.warning(
+                "experiment %s: exact (builtin_hash_agreement) inference run without a "
+                "serving_version_pin — predictably diverges on a heterogeneous fleet (C15); "
+                "prefer builtin_within_cell_tolerance, or pin the serving version",
+                experiment.experiment_id,
+            )
+            audit_repository.append(
+                actor_class=CredentialClass.SYSTEM,
+                actor_identifier="coordinator",
+                action="experiment.exact_without_pin",
+                resource_type="experiment",
+                resource_id=experiment.experiment_id,
+                payload={
+                    "advisory": (
+                        "exact hash-agreement inference run without a serving_version_pin; "
+                        "version skew predictably diverges (C15) — prefer "
+                        "within_cell_tolerance, or pin the serving version"
+                    ),
+                    "reducer_kind": reducer_kind,
+                },
+            )
+
         # M6: a newly-submitted experiment enters the approval queue. The bus
         # otherwise emits `experiment.status` only on *transitions* — never on
         # creation — so without this the operator console can't surface a pending

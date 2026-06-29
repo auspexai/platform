@@ -99,6 +99,55 @@ def test_submit_creates_experiment(
     assert body["manifest_hash"]
 
 
+def test_submit_warns_exact_without_serving_pin(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """C7 Inc 3: an exact (hash-agreement) inference run that declares a determinism
+    profile but NO serving_version_pin records an exact_without_pin advisory — the C15
+    footgun (byte-exact on a heterogeneous fleet predictably diverges). Non-fatal (201)."""
+    privkey, binding = registered_tenant
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "exact-no-pin-001",
+            reducer={"kind": "builtin_hash_agreement"},
+            inference_determinism={"temperature": 0, "seed": 7},  # no serving_version_pin
+        ),
+    )
+    assert response.status_code == 201, response.text
+    actions = [a.action for a in client.app.state.audit_repository.latest(limit=20)]
+    assert "experiment.exact_without_pin" in actions
+
+
+def test_submit_no_warn_exact_with_serving_pin(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """A pinned deterministic cell (serving_version_pin set) is the legitimate exact
+    path — no advisory."""
+    privkey, binding = registered_tenant
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "exact-pinned-001",
+            reducer={"kind": "builtin_hash_agreement"},
+            inference_determinism={
+                "temperature": 0,
+                "seed": 7,
+                "serving_version_pin": "ollama/0.17.7",
+            },
+        ),
+    )
+    assert response.status_code == 201, response.text
+    actions = [a.action for a in client.app.state.audit_repository.latest(limit=20)]
+    assert "experiment.exact_without_pin" not in actions
+
+
 def test_submit_publishes_experiment_submitted_event(
     client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
 ) -> None:
