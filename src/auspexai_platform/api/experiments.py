@@ -65,6 +65,7 @@ from auspexai_platform.db.repositories.manifests import DuplicateManifestError
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
+from auspexai_platform.feature_schema import validate_feature_schema
 from auspexai_platform.maintenance import projected_raw_age_off
 from auspexai_platform.receipts.signing import SigningKey
 from auspexai_platform.scheduler import (
@@ -674,6 +675,57 @@ def build_router(
                 },
             )
 
+        # D16.1 (Inc 2): validate the self-describing feature schema BEFORE the
+        # manifest is stored, so a malformed / non-§7-safe declaration never
+        # reaches storage or the ingest enforcer. The manifest stays opaque to v0
+        # otherwise — this validates ONLY the feature_schema member, via a mirror
+        # validator (the coordinator does not import the SDK). The declared schema
+        # IS the entire interpretability surface under §7 (raw outputs are never
+        # retained), so it must be well-formed and contained at submit.
+        feature_schema = body.manifest.get("feature_schema")
+        if feature_schema is not None:
+            if str(body.manifest.get("schema_version")) != "0.3":
+                raise HTTPException(
+                    status_code=422,  # UNPROCESSABLE_CONTENT
+                    detail={
+                        "error": {
+                            "code": "feature_schema_requires_v0_3",
+                            "message": (
+                                "a manifest declaring feature_schema must set "
+                                'schema_version "0.3" (D16.1)'
+                            ),
+                        }
+                    },
+                )
+            fs_errors = validate_feature_schema(feature_schema)
+            if fs_errors:
+                raise HTTPException(
+                    status_code=422,  # UNPROCESSABLE_CONTENT
+                    detail={
+                        "error": {
+                            "code": "feature_schema_invalid",
+                            "message": "the declared feature_schema is malformed or not §7-safe",
+                            "details": {"errors": fs_errors[:20]},
+                        }
+                    },
+                )
+        # §10 Q6: a CERTIFIED / citable experiment MUST declare a feature_schema
+        # (certification vouches for the code; the feature schema vouches for the
+        # interpretability of the claim). BYOT may omit it during onboarding.
+        if cert is not None and not feature_schema:
+            raise HTTPException(
+                status_code=422,  # UNPROCESSABLE_CONTENT
+                detail={
+                    "error": {
+                        "code": "certified_requires_feature_schema",
+                        "message": (
+                            "a certified/citable experiment must declare a feature_schema "
+                            "(D16.1 §10 Q6)"
+                        ),
+                    }
+                },
+            )
+
         # Insert manifest. Duplicate (same canonical hash) means re-submission;
         # treat as 409 — researchers shouldn't blindly re-upload identical
         # manifests; the receipt audit chain wants distinct submission events.
@@ -723,6 +775,13 @@ def build_router(
                     }
                 },
             ) from e
+
+        # D16.1: record whether this ran a CERTIFIED starter at submit (cert
+        # resolved in the authorization gate above). Drives the §7 reject-vs-flag
+        # decision at result ingest. Captured at submit because certification
+        # vouches for the CODE — a submit-time property that a later cert
+        # revocation must not retroactively change for a running experiment.
+        experiment = experiment_repository.set_certified(experiment.experiment_id, cert is not None)
 
         # A' (§9): seed the integrity policy from the researcher's requested
         # replication (manifest.replication_factor), FLOORED by the tenant's trust
@@ -864,9 +923,10 @@ def build_router(
     async def experiments_attention(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> AttentionResponse:
-        """E14: approved-but-inert experiments (zero work units past the stuck
-        threshold) for the maintainer's needs-attention surface (the nav badge).
-        Maintainer-only — a fleet-wide health view, never tenant-exposed."""
+        """E14: experiments needing the maintainer's attention — approved-but-inert
+        (zero work units past the stuck threshold) and (D16.1 §7) experiments with
+        CERTIFIED results rejected for feature_schema violations. Surfaced on the
+        nav badge. Maintainer-only — a fleet-wide health view, never tenant-exposed."""
         require_maintainer(credential)
         now = datetime.now(UTC)
         items = [
@@ -879,6 +939,30 @@ def build_router(
             )
             for e, age in _stuck_experiments(experiment_repository, per_job_factory, now)
         ]
+        # D16.1 §7: a CERTIFIED result rejected for a feature_schema violation is a
+        # §7 leak or executor/schema mismatch — the unit goes terminal, so the
+        # experiment stalls until a human acts (abort / re-certify). BYOT flags
+        # (certified=0) are the researcher's own onboarding feedback, not a fleet
+        # alert, so they are excluded here.
+        if receipt_index_repository is not None:
+            for exp_id, n in receipt_index_repository.certified_schema_rejection_counts().items():
+                e = experiment_repository.get_by_id(exp_id)
+                if e is None:
+                    continue
+                submitted = e.submitted_at
+                if isinstance(submitted, str):
+                    submitted = datetime.fromisoformat(submitted)
+                if submitted.tzinfo is None:
+                    submitted = submitted.replace(tzinfo=UTC)
+                items.append(
+                    AttentionExperiment(
+                        experiment_id=exp_id,
+                        tenant_id=e.tenant_id,
+                        label=getattr(e, "tenant_experiment_label", None),
+                        age_minutes=int((now - submitted).total_seconds() // 60),
+                        reason=f"{n} certified result(s) rejected for feature_schema violations (§7)",
+                    )
+                )
         return AttentionResponse(count=len(items), experiments=items)
 
     @router.get(

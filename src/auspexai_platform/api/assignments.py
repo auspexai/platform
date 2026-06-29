@@ -75,6 +75,7 @@ from auspexai_platform.db.repositories.experiments import (
     InvalidStatusTransitionError,
 )
 from auspexai_platform.exposure import ExposureTag
+from auspexai_platform.feature_schema import check_payload_conformance
 from auspexai_platform.receipts import (
     ReceiptRepository,
     SigningKey,
@@ -723,6 +724,74 @@ def build_router(
                         }
                     },
                 )
+
+        # D16.1 §7 (Inc 4): enforce the manifest's declared feature_schema on the
+        # emitted payload. Under §7 the declared feature set is the ENTIRE
+        # interpretability surface (raw outputs are never retained), so an
+        # undeclared / out-of-bounds field is either a §7 leak or an
+        # executor/schema mismatch. A CERTIFIED experiment REJECTS it (terminal
+        # for the UNIT — the executor is the same certified code for every worker,
+        # so re-offering would just rerun the fault; the maintainer is alerted via
+        # the E14 needs-attention surface). A BYOT experiment FLAGS it (records +
+        # accepts) so a new tenant sees mismatches without their run hard-failing.
+        # Integrity gate → reject immediately, never debounce.
+        exp_fs = experiment_repository.get_by_id(experiment_id)
+        manifest_fs = (
+            manifest_repository.get(exp_fs.manifest_hash)
+            if manifest_repository is not None and exp_fs is not None
+            else None
+        )
+        feature_schema = (
+            manifest_fs.manifest_json.get("feature_schema") if manifest_fs is not None else None
+        )
+        if feature_schema:
+            violations = check_payload_conformance(feature_schema, body.payload)
+            if violations:
+                certified = bool(getattr(exp_fs, "certified", False))
+                if receipt_index_repository is not None:
+                    receipt_index_repository.record_schema_rejection(
+                        experiment_id=experiment_id,
+                        worker_id=worker_id,
+                        worker_pubkey=body.worker_pubkey,
+                        unit_id=unit_id,
+                        certified=certified,
+                        violations=violations,
+                    )
+                audit_repository.append(
+                    actor_class=CredentialClass.WORKER,
+                    actor_identifier=worker_id,
+                    action="result.schema_violation",
+                    resource_type="work_unit",
+                    resource_id=unit_id,
+                    payload={
+                        "experiment_id": experiment_id,
+                        "certified": certified,
+                        "violations": violations[:20],
+                    },
+                )
+                if certified:
+                    assignments_repo.mark_refused(
+                        assignment_id=assignment.assignment_id,
+                        kind="schema_violation",
+                        reason="; ".join(violations[:5]),
+                    )
+                    # Terminal for the UNIT, not just this worker (a code fault is
+                    # systematic — every worker runs the same certified executor).
+                    work_units_repo.mark_failed(unit_id)
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail={
+                            "error": {
+                                "code": "schema_violation",
+                                "message": (
+                                    "result rejected: the emitted payload does not conform to "
+                                    "the manifest's declared feature_schema (D16.1 §7)"
+                                ),
+                                "details": {"violations": violations[:20]},
+                            }
+                        },
+                    )
+                # BYOT: flagged + recorded above; fall through and accept the row.
 
         result = results_repo.insert(
             result_id=_generate_result_id(),

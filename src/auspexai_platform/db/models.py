@@ -199,6 +199,12 @@ class Experiment(BaseModel):
     # citation attributes to them). For a tenant-owner submit it is the tenant's
     # own account. None for pre-0049 rows.
     submitted_by_account_id: str | None = None
+    # D16.1 (0052): was this experiment running a CERTIFIED starter at SUBMIT
+    # (cert resolved via certified_match)? Captured at submit because
+    # certification vouches for the CODE — a submit-time property. Governs the §7
+    # feature-schema enforcement at result ingest: certified ⇒ REJECT a
+    # non-conforming result (terminal-for-unit); BYOT ⇒ FLAG + accept.
+    certified: bool = False
     started_at: datetime | None = None
     completed_at: datetime | None = None
     revision: int = 1

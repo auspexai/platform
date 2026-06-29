@@ -35,6 +35,19 @@ def _starter_manifest(**over):
         "expected_duration_hours": 1.0,
         "executor": {"package_sha256": PKG},
         "reducer": {"kind": "builtin_hash_agreement"},
+        # D16.1 §10 Q6: a certified/citable experiment must declare a
+        # feature_schema (the executor package digest, hence the certification
+        # match, is unaffected — feature_schema is a manifest field, not code).
+        "schema_version": "0.3",
+        "feature_schema": {
+            "response_sha256": {
+                "meaning": "output hash",
+                "kind": "hash",
+                "role": "anchor",
+                "algorithm": "sha256",
+                "change_means": "output bytes differed",
+            }
+        },
     }
     m.update(over)
     return m

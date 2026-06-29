@@ -141,6 +141,26 @@ class WorkUnitRepository:
         assert got is not None
         return got, just_completed
 
+    def mark_failed(self, unit_id: str) -> tuple[WorkUnit | None, bool]:
+        """D16.1 §7: take a unit TERMINAL (→ 'failed') — the scheduler offers only
+        PENDING/IN_PROGRESS, so a failed unit is never re-offered. Used when a
+        CERTIFIED experiment's result violates its declared feature_schema: the
+        executor is the same certified code for every worker, so a schema
+        violation is a CODE fault, not worker-specific — re-offering would just
+        run the same broken executor. The unit escalates (recorded + surfaced on
+        the maintainer needs-attention banner) instead. Never overrides a unit
+        that already reached 'completed' (good replicas already settled it).
+        Race-safe + idempotent via the status guard; returns (unit,
+        just_failed)."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                "UPDATE work_units SET status = 'failed' "
+                "WHERE unit_id = ? AND status != 'completed' AND status != 'failed'",
+                (unit_id,),
+            )
+            just_failed = cur.rowcount == 1
+        return self.get_by_unit_id(unit_id), just_failed
+
     # ---- reads ----
 
     def get_by_unit_id(self, unit_id: str) -> WorkUnit | None:

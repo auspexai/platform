@@ -353,6 +353,19 @@ class ExperimentRepository:
             integrity_policy=policy,
         )
 
+    def set_certified(self, experiment_id: str, certified: bool) -> Experiment:
+        """D16.1 (0052): record whether this experiment ran a CERTIFIED starter at
+        submit (cert resolved via certified_match). Set once at submit; drives the
+        §7 reject-vs-flag decision at result ingest."""
+        self.db.execute(
+            "UPDATE experiments SET certified = ? WHERE experiment_id = ?",
+            (1 if certified else 0, experiment_id),
+        )
+        got = self.get_by_id(experiment_id)
+        if got is None:
+            raise ExperimentNotFoundError(experiment_id)
+        return got
+
     def set_required_containment(self, experiment_id: str, level: str) -> Experiment:
         """§41 containment floor: set the minimum sandbox isolation this
         experiment's units must run under. Seeded at submit from the tenant tier."""
@@ -453,6 +466,8 @@ class ExperimentRepository:
             status=ExperimentStatus(row["status"]),
             submitted_at=datetime.fromisoformat(row["submitted_at"]),
             submitted_by_account_id=_col(row, "submitted_by_account_id"),
+            # D16.1 (0052). Defensive: pre-0052 rows default to BYOT (not certified).
+            certified=bool(_col(row, "certified") or 0),
             started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
             completed_at=(
                 datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None

@@ -9,6 +9,7 @@ denormalizes worker_id + worker_pubkey for fast filtering.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -154,7 +155,80 @@ class ReceiptIndexRepository:
             ),
         )
 
+    def record_schema_rejection(
+        self,
+        *,
+        experiment_id: str,
+        worker_id: str,
+        worker_pubkey: str,
+        unit_id: str,
+        certified: bool,
+        violations: list[str],
+    ) -> None:
+        """Index one result whose emitted payload violated the manifest's declared
+        feature_schema (D16.1 §7, migration 0052). The parallel index for the
+        rejection class — like record_divergence, NOT minted as a Receipt (a
+        violation is a fault, not corroboration). Recorded for BOTH certified
+        (rejected, terminal-for-unit) and BYOT (flagged, accepted) so the
+        maintainer needs-attention surface (E14) can alert on certified
+        rejections — a §7 leak or executor/schema mismatch — and a researcher can
+        later see their BYOT flags. Idempotent (INSERT OR IGNORE on the
+        (worker_id, unit_id) unique key) so a retry/re-sweep is a no-op."""
+        self.db.execute(
+            """
+            INSERT OR IGNORE INTO schema_rejection_index
+              (experiment_id, worker_id, worker_pubkey, unit_id, certified, violations_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                experiment_id,
+                worker_id,
+                worker_pubkey.lower(),
+                unit_id,
+                1 if certified else 0,
+                json.dumps(violations),
+            ),
+        )
+
     # ---- reads ----
+
+    def certified_schema_rejection_counts(self) -> dict[str, int]:
+        """{experiment_id: count} of CERTIFIED schema rejections, for the E14
+        maintainer needs-attention surface. BYOT flags (certified=0) are excluded
+        — those are the researcher's onboarding feedback, not a fleet alert."""
+        rows = self.db.execute(
+            """
+            SELECT experiment_id, COUNT(*) AS n
+            FROM schema_rejection_index
+            WHERE certified = 1
+            GROUP BY experiment_id
+            """
+        )
+        return {r["experiment_id"]: int(r["n"]) for r in rows}
+
+    def list_schema_rejections_for_experiment(self, experiment_id: str) -> list[dict]:
+        """Schema rejections for one experiment, newest first — the detail behind
+        the E14 alert / a researcher's BYOT flags."""
+        rows = self.db.execute(
+            """
+            SELECT worker_id, worker_pubkey, unit_id, certified, violations_json, recorded_at
+            FROM schema_rejection_index
+            WHERE experiment_id = ?
+            ORDER BY recorded_at DESC
+            """,
+            (experiment_id,),
+        )
+        return [
+            {
+                "worker_id": r["worker_id"],
+                "worker_pubkey": r["worker_pubkey"],
+                "unit_id": r["unit_id"],
+                "certified": bool(r["certified"]),
+                "violations": json.loads(r["violations_json"]),
+                "recorded_at": r["recorded_at"],
+            }
+            for r in rows
+        ]
 
     def get_by_id(self, receipt_id: str) -> ReceiptIndexEntry | None:
         rows = self.db.execute(
