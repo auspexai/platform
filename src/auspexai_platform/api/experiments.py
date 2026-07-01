@@ -46,6 +46,7 @@ from auspexai_platform.db.models import (
     IntegrityPolicy,
     ResearchStanding,
     TrustTier,
+    WorkUnitStatus,
 )
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
@@ -57,6 +58,7 @@ from auspexai_platform.db.repositories import (
     ManifestRepository,
     ReceiptIndexRepository,
 )
+from auspexai_platform.db.repositories.assignments import AssignmentRepository
 from auspexai_platform.db.repositories.experiments import (
     DuplicateExperimentLabelError,
     InvalidStatusTransitionError,
@@ -155,6 +157,11 @@ class ExperimentListResponse(BaseModel):
 # delivered (crash / abandon / Ctrl-C). Surfaced to the maintainer (nav badge)
 # so abandoned runs don't sit invisibly behind the collapsed Accounts tree.
 ATTENTION_STUCK_MINUTES = 10
+# C16: must exceed the scheduler's ASSIGNMENT_REDELIVERY_LEASE_SECONDS (600 s) —
+# soft-lease re-delivery gets first shot at self-healing a lost offer; anything
+# still stale past THIS threshold means re-delivery didn't fire (attempt cap /
+# worker gone) and a human should look. See _stalled_unit_experiments.
+STALLED_UNIT_MINUTES = 15
 
 
 class AttentionExperiment(BaseModel):
@@ -193,6 +200,51 @@ def _stuck_experiments(
         units = sum(WorkUnitRepository(pj).count_by_status().values()) if pj is not None else 0
         if units == 0:
             out.append((e, int((now - submitted).total_seconds() // 60)))
+    return out
+
+
+def _stalled_unit_experiments(
+    experiment_repository, per_job_factory, now: datetime
+) -> list[tuple[Any, int, int]]:
+    """C16: approved experiments holding an in_progress unit whose missing
+    replicas sit on ACTIVE assignments (no result, no refusal) older than
+    `STALLED_UNIT_MINUTES` — the lost-delivery wedge signature. E14's original
+    detector only sees approved-with-ZERO-units; a mid-run stall with a dead
+    driver returned count:0 live on 2026-07-01 (exp-9WLGijaO). Returns
+    (experiment, stalled_unit_count, oldest_age_minutes).
+
+    Threshold ordering is load-bearing: STALLED_UNIT_MINUTES must exceed the
+    scheduler's ASSIGNMENT_REDELIVERY_LEASE_SECONDS — re-delivery is the
+    self-heal (a re-armed row gets a fresh assigned_at and drops back below
+    the threshold); this surface is the backstop for when re-delivery can't
+    fire (attempt cap exhausted, worker stopped polling) or hasn't worked."""
+    out: list[tuple[Any, int, int]] = []
+    if per_job_factory is None:
+        return out
+    cutoff = now - timedelta(minutes=STALLED_UNIT_MINUTES)
+    for e in experiment_repository.list_all(status=ExperimentStatus.APPROVED):
+        pj = per_job_factory.get(e.experiment_id)
+        if pj is None:
+            continue
+        wu_repo = WorkUnitRepository(pj)
+        asg_repo = AssignmentRepository(pj)
+        stalled = 0
+        oldest_minutes = 0
+        for unit in wu_repo.list_all(status=WorkUnitStatus.IN_PROGRESS):
+            for a in asg_repo.list_for_unit(unit.unit_id):
+                if a.result_id is not None or a.refused_at is not None:
+                    continue
+                assigned_at = a.assigned_at
+                if assigned_at.tzinfo is None:
+                    assigned_at = assigned_at.replace(tzinfo=UTC)
+                if assigned_at <= cutoff:
+                    stalled += 1
+                    oldest_minutes = max(
+                        oldest_minutes, int((now - assigned_at).total_seconds() // 60)
+                    )
+                    break  # one stale active assignment marks the unit stalled
+        if stalled:
+            out.append((e, stalled, oldest_minutes))
     return out
 
 
@@ -999,6 +1051,24 @@ def build_router(
             )
             for e, age in _stuck_experiments(experiment_repository, per_job_factory, now)
         ]
+        # C16: mid-run stalls — an in_progress unit wedged on a stale ACTIVE
+        # assignment (lost offer delivery; re-delivery didn't self-heal). The
+        # 2026-07-01 incident class the zero-units detector above cannot see.
+        items.extend(
+            AttentionExperiment(
+                experiment_id=e.experiment_id,
+                tenant_id=e.tenant_id,
+                label=getattr(e, "tenant_experiment_label", None),
+                age_minutes=oldest_minutes,
+                reason=(
+                    f"{n} unit(s) stalled in_progress on a stale assignment "
+                    "(no result, no refusal — possible lost offer delivery)"
+                ),
+            )
+            for e, n, oldest_minutes in _stalled_unit_experiments(
+                experiment_repository, per_job_factory, now
+            )
+        )
         # D16.1 §7: a CERTIFIED result rejected for a feature_schema violation is a
         # §7 leak or executor/schema mismatch — the unit goes terminal, so the
         # experiment stalls until a human acts (abort / re-certify). BYOT flags

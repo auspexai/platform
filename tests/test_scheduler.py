@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from auspexai_platform.db.models import (
     Assignment,
@@ -19,8 +19,10 @@ from auspexai_platform.db.repositories import (
     WorkUnitRepository,
 )
 from auspexai_platform.scheduler import (
+    ASSIGNMENT_REDELIVERY_LEASE_SECONDS,
     MAX_ASSIGNMENT_ATTEMPTS,
     Scheduler,
+    assignment_presumed_lost,
     integrity_policy_for_request,
     is_retryable_refusal,
     is_sub_floor_policy,
@@ -821,3 +823,194 @@ def test_scheduler_halts_suspended_account_experiments(
     # Unsuspend → dispatch resumes.
     suspended["value"] = False
     assert scheduler.pick_for_worker(w) is not None
+
+
+# ---- C16: at-least-once offer delivery (stale-active re-delivery) ----------
+# Incident 2026-07-01 (exp-9WLGijaO): an assignment row committed server-side
+# but the offer RESPONSE was lost in flight (poll read-timeout under settle-sweep
+# DB contention) — the worker never learned of it, the active row blocked every
+# re-offer, and the unit wedged forever. The soft lease makes delivery
+# at-least-once: a stale active row is re-delivered to its own worker.
+
+
+def _active_assignment(*, age_seconds: float, attempt_count: int = 1, now: datetime) -> Assignment:
+    return Assignment(
+        assignment_id="asg-x",
+        unit_id="u1",
+        worker_id="wkr-a",
+        worker_pubkey_hex="a" * 64,
+        assigned_at=now - timedelta(seconds=age_seconds),
+        attempt_count=attempt_count,
+    )
+
+
+def _backdate_assignment(db, assignment_id: str, seconds: float) -> None:
+    """Simulate a lost offer response: the row exists, the worker never heard,
+    and time passes (the worker keeps polling and getting no-work)."""
+    past = (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+    with db.transaction() as cur:
+        cur.execute(
+            "UPDATE assignments SET assigned_at = ? WHERE assignment_id = ?",
+            (past, assignment_id),
+        )
+
+
+def test_assignment_presumed_lost_predicate():
+    now = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    lease = ASSIGNMENT_REDELIVERY_LEASE_SECONDS
+    # Fresh active → presumed delivered (the worker may be executing right now).
+    assert assignment_presumed_lost(_active_assignment(age_seconds=30, now=now), now=now) is False
+    # Just inside the lease → still presumed delivered.
+    assert (
+        assignment_presumed_lost(_active_assignment(age_seconds=lease - 1, now=now), now=now)
+        is False
+    )
+    # Past the lease → presumed lost.
+    assert (
+        assignment_presumed_lost(_active_assignment(age_seconds=lease + 1, now=now), now=now)
+        is True
+    )
+    # Refused / result-bearing rows are never "lost offers".
+    assert assignment_presumed_lost(_refused_assignment(kind="runner_failed"), now=now) is False
+    assert (
+        assignment_presumed_lost(_refused_assignment(kind=None, result_id="res-1"), now=now)
+        is False
+    )
+
+
+def test_reoffer_eligible_stale_active_redelivery():
+    now = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    lease = ASSIGNMENT_REDELIVERY_LEASE_SECONDS
+    # Fresh active row → NOT re-offerable (no double-dispatch under a live offer).
+    assert reoffer_eligible(_active_assignment(age_seconds=30, now=now), now=now) is False
+    # Past the lease → the presumed-lost offer is re-deliverable to its worker.
+    assert reoffer_eligible(_active_assignment(age_seconds=lease + 1, now=now), now=now) is True
+    # The attempt cap bounds re-delivery exactly like refusal retries — no
+    # infinite re-delivery to a pairing that never lands.
+    assert (
+        reoffer_eligible(
+            _active_assignment(
+                age_seconds=lease + 1, attempt_count=MAX_ASSIGNMENT_ATTEMPTS, now=now
+            ),
+            now=now,
+        )
+        is False
+    )
+    # A naive assigned_at is treated as UTC (SQLite round-trips drop tzinfo).
+    naive = _active_assignment(age_seconds=lease + 1, now=now)
+    naive = naive.model_copy(update={"assigned_at": naive.assigned_at.replace(tzinfo=None)})
+    assert reoffer_eligible(naive, now=now) is True
+
+
+def test_stale_active_offer_redelivers_to_same_worker(
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+) -> None:
+    """The C16 lost-delivery scenario end-to-end at the scheduler: the offer row
+    exists (created during the lost poll), the unit is at full replication (its
+    own row occupies the slot), and after the lease the SAME unit is picked for
+    the SAME worker again — the capacity check must not block re-delivery."""
+    _, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    wu_repo = WorkUnitRepository(db)
+    wu_repo.submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+    AssignmentRepository(db).create(
+        assignment_id="asg-1",
+        unit_id="u1",
+        worker_id=worker.worker_id,
+        worker_pubkey_hex=worker.pubkey_hex,
+    )
+    wu_repo.mark_in_progress("u1")
+
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+    # Fresh active row: presumed delivered — nothing offered (worker may be
+    # executing; the unit is at capacity for everyone else too).
+    assert scheduler.pick_for_worker(worker) is None
+    # The response was lost; the row ages past the re-delivery lease.
+    _backdate_assignment(db, "asg-1", ASSIGNMENT_REDELIVERY_LEASE_SECONDS + 60)
+    pick = scheduler.pick_for_worker(worker)
+    assert pick is not None
+    assert pick.work_unit.unit_id == "u1"
+
+
+def test_stale_active_slot_not_offered_to_other_workers(
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+    worker_repository,
+) -> None:
+    """Re-delivery targets ONLY the owning worker: the stale row still occupies
+    its replication slot, so a different worker is capacity-blocked as before
+    (no over-assignment beyond the target while the offer might yet land)."""
+    _, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    WorkUnitRepository(db).submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+    AssignmentRepository(db).create(
+        assignment_id="asg-1",
+        unit_id="u1",
+        worker_id=worker.worker_id,
+        worker_pubkey_hex=worker.pubkey_hex,
+    )
+    _backdate_assignment(db, "asg-1", ASSIGNMENT_REDELIVERY_LEASE_SECONDS + 60)
+
+    other = worker_repository.enroll(
+        worker_id="wkr-test02",
+        pubkey_hex="b" * 64,
+        capabilities={"os": "linux"},
+    )
+    scheduler = Scheduler(experiment_repository, per_job_factory)
+    assert scheduler.pick_for_worker(other) is None
+
+
+def test_stalled_unit_experiments_detector(
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+) -> None:
+    """C16 detection backstop: a unit wedged on a stale ACTIVE assignment
+    surfaces on the E14 attention feed (the mid-run stall the zero-units
+    detector can't see — it returned count:0 live during the incident); a
+    fresh active assignment does not."""
+    from auspexai_platform.api.experiments import (
+        STALLED_UNIT_MINUTES,
+        _stalled_unit_experiments,
+    )
+
+    _, worker = enrolled_worker
+    _, _, experiment, _ = approved_experiment
+    db = per_job_factory.get_or_create(experiment.experiment_id)
+    wu_repo = WorkUnitRepository(db)
+    wu_repo.submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+    wu_repo.mark_in_progress("u1")
+    AssignmentRepository(db).create(
+        assignment_id="asg-1",
+        unit_id="u1",
+        worker_id=worker.worker_id,
+        worker_pubkey_hex=worker.pubkey_hex,
+    )
+    now = datetime.now(UTC)
+    # Fresh assignment → nothing to report.
+    assert _stalled_unit_experiments(experiment_repository, per_job_factory, now) == []
+    # Stale past the threshold → surfaced, with the unit count and age.
+    _backdate_assignment(db, "asg-1", STALLED_UNIT_MINUTES * 60 + 120)
+    out = _stalled_unit_experiments(experiment_repository, per_job_factory, now)
+    assert len(out) == 1
+    exp, n_units, oldest_minutes = out[0]
+    assert exp.experiment_id == experiment.experiment_id
+    assert n_units == 1
+    assert oldest_minutes >= STALLED_UNIT_MINUTES
+
+
+def test_stall_threshold_exceeds_redelivery_lease():
+    """Load-bearing ordering: soft-lease re-delivery (the self-heal) must get
+    first shot before the attention surface pages a human — a re-armed row gets
+    a fresh assigned_at and drops back below the stall threshold."""
+    from auspexai_platform.api.experiments import STALLED_UNIT_MINUTES
+
+    assert STALLED_UNIT_MINUTES * 60 > ASSIGNMENT_REDELIVERY_LEASE_SECONDS

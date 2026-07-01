@@ -380,6 +380,11 @@ def build_router(
         # under the attempt cap). In that case an assignment row already exists
         # (refused) — re-arm it rather than INSERT into the UNIQUE (unit,worker)
         # slot. A fresh pairing has no row and takes the create path.
+        # C16 (at-least-once delivery): the same re-arm path also serves a
+        # stale-ACTIVE row whose offer response was lost in flight (the worker
+        # never learned of its assignment) — after the re-delivery lease,
+        # reoffer_eligible admits it and reactivate() hands the SAME row back
+        # to the same worker with a fresh assigned_at + attempt bump.
         existing = assignments_repo.get_for_unit_and_worker(
             pick.work_unit.unit_id, worker.worker_id
         )

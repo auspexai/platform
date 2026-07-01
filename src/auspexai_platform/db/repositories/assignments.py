@@ -117,15 +117,17 @@ class AssignmentRepository:
         return got
 
     def reactivate(self, assignment_id: str) -> Assignment:
-        """Re-arm a previously-refused assignment so the unit can be re-offered
-        to the same worker (§2.1 #8 dispatch-retry).
+        """Re-arm an assignment so the unit can be re-offered to the same worker.
 
-        Clears the refusal fields, stamps a fresh `assigned_at`, and bumps
-        `attempt_count`. Used only for *retryable* refusals (environmental /
-        transient failures — runner crash, sandbox unavailable, thermal) that
-        may succeed on a retry; terminal refusals (policy / capability) are
-        never reactivated. Raises AssignmentNotFoundError if the id is unknown
-        and AssignmentAlreadyResolvedError if the assignment has a result (a
+        Two callers, one mechanism: (a) §2.1 #8 dispatch-retry — a *retryable*
+        refusal (environmental/transient failure) that may succeed on a retry;
+        terminal refusals (policy/capability) are never reactivated. (b) C16
+        at-least-once delivery — a stale-ACTIVE row whose offer response was
+        lost in flight (no result, no refusal, older than the re-delivery
+        lease); the refusal-field clears are no-ops there, the fresh
+        `assigned_at` restarts the lease, and the attempt bump caps runaway
+        re-delivery. Raises AssignmentNotFoundError if the id is unknown and
+        AssignmentAlreadyResolvedError if the assignment has a result (a
         completed assignment is not re-offerable).
         """
         existing = self.get_by_id(assignment_id)

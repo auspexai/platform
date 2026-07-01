@@ -41,6 +41,7 @@ from auspexai_platform.db.repositories import (
 )
 from auspexai_platform.db.repositories.model_prestage import DuplicatePrestageError
 from auspexai_platform.scheduler import (
+    assignment_presumed_lost,
     reoffer_eligible,
     worker_is_degraded,
     worker_is_self_paused,
@@ -94,9 +95,10 @@ def _model_count(worker) -> int:
 
 
 def _count_stalled(pj) -> int:
-    """§2.1 #8-tail: in-progress units stranded because every assignment is a
-    non-reofferable refusal (terminal kind, or retryable but at the attempt cap)
-    and none is active — the unit can't complete without intervention."""
+    """§2.1 #8-tail: in-progress units stranded because no assignment is
+    working or re-offerable — every row is a non-reofferable refusal (terminal
+    kind, or retryable-at-cap) or a presumed-lost active row at the attempt cap
+    (C16) — the unit can't complete without intervention."""
     if pj is None:
         return 0
     work_units = WorkUnitRepository(pj)
@@ -106,10 +108,15 @@ def _count_stalled(pj) -> int:
         assignments = assignments_repo.list_for_unit(unit.unit_id)
         if not assignments:
             continue  # in-progress but unassigned (a transient state) — not stalled
-        if any(a.refused_at is None and a.result_id is None for a in assignments):
-            continue  # an active assignment exists — someone's working it
+        if any(
+            a.refused_at is None and a.result_id is None and not assignment_presumed_lost(a)
+            for a in assignments
+        ):
+            continue  # a FRESH active assignment exists — someone's working it
         if any(reoffer_eligible(a) for a in assignments):
-            continue  # a refused assignment is still re-offerable — not stalled
+            # Re-offerable — a retryable refusal, or a presumed-lost offer the
+            # C16 lease will re-deliver on the worker's next poll. Self-heals.
+            continue
         stalled += 1
     return stalled
 

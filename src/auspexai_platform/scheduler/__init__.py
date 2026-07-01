@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from auspexai_platform.db.models import (
@@ -264,18 +265,67 @@ def worker_is_degraded(worker: Worker) -> bool:
     return thermal.get("state") == "critical"
 
 
-def reoffer_eligible(
-    assignment: Assignment, *, max_attempts: int = MAX_ASSIGNMENT_ATTEMPTS
+# C16: how long an ACTIVE assignment may sit result-less and refusal-less before
+# the offer is presumed lost in flight and becomes re-DELIVERABLE to its own
+# worker. The offer response can be lost (read timeout / edge 502 under origin
+# slowness — observed live 2026-07-01, exp-9WLGijaO): the row commits server-side
+# but the worker never learns of it, and without this lease the unit wedges
+# forever (the active row blocks re-offer; a full replica count blocks everyone
+# else; below-floor blocks the settle-sweep). Keep the lease WELL above real unit
+# durations: a worker still executing past it would double-run at worst, and the
+# submit route 409s the second result (result_already_submitted) — safe, not free.
+ASSIGNMENT_REDELIVERY_LEASE_SECONDS = 600
+
+
+def assignment_presumed_lost(
+    assignment: Assignment,
+    *,
+    redelivery_lease_seconds: float = ASSIGNMENT_REDELIVERY_LEASE_SECONDS,
+    now: datetime | None = None,
 ) -> bool:
-    """True if an existing (refused) assignment row can be re-offered to the
-    same worker. Requires: the row is refused (not active, not result-bearing),
-    the refusal kind is retryable, and the attempt cap isn't exhausted. The
-    scheduler uses this to decide eligibility; the assignment route uses it to
-    decide create-vs-reactivate, so the policy lives in one place."""
+    """C16: True for an ACTIVE row (no result, no refusal) older than the
+    re-delivery lease — the offer response was presumably lost in flight and
+    the worker never learned of its assignment. A fresh active row is presumed
+    delivered (the worker may be executing right now)."""
+    if assignment.result_id is not None or assignment.refused_at is not None:
+        return False
+    assigned_at = assignment.assigned_at
+    if assigned_at.tzinfo is None:
+        assigned_at = assigned_at.replace(tzinfo=UTC)
+    age = ((now or datetime.now(UTC)) - assigned_at).total_seconds()
+    return age > redelivery_lease_seconds
+
+
+def reoffer_eligible(
+    assignment: Assignment,
+    *,
+    max_attempts: int = MAX_ASSIGNMENT_ATTEMPTS,
+    redelivery_lease_seconds: float = ASSIGNMENT_REDELIVERY_LEASE_SECONDS,
+    now: datetime | None = None,
+) -> bool:
+    """True if an existing assignment row can be re-offered to the same worker.
+
+    Two cases, one policy point (the scheduler uses this to decide eligibility;
+    the assignment route uses it to decide create-vs-reactivate):
+
+    - **refused-retryable** (§2.1 #8 dispatch-retry): the row is refused, the
+      refusal kind is retryable, and the attempt cap isn't exhausted.
+    - **stale-active re-delivery** (C16, at-least-once offer): the row is ACTIVE
+      (no result, no refusal) but older than the re-delivery lease — the offer
+      response was presumably lost in flight, so the same row is re-delivered
+      to its own worker through the same re-arm path. Without this, a lost
+      response wedges the unit permanently.
+
+    A result-bearing row is never re-offerable."""
     if assignment.result_id is not None:
         return False
     if assignment.refused_at is None:
-        return False
+        # C16 stale-active branch: re-deliver a presumed-lost offer, under the
+        # same attempt cap that bounds refusal retries (no infinite re-delivery
+        # to a pairing that never lands).
+        return assignment.attempt_count < max_attempts and assignment_presumed_lost(
+            assignment, redelivery_lease_seconds=redelivery_lease_seconds, now=now
+        )
     if not is_retryable_refusal(assignment.refused_kind, assignment.refused_reason):
         return False
     return assignment.attempt_count < max_attempts
@@ -475,7 +525,16 @@ class Scheduler:
                 existing = assignments.get_for_unit_and_worker(unit.unit_id, worker.worker_id)
                 if existing is not None and not reoffer_eligible(existing):
                     continue
-                if assignments.count_active_for_unit(unit.unit_id) >= unit.replication_target:
+                # C16: a stale-ACTIVE row (lost-delivery re-offer) already occupies
+                # its replication slot — re-delivering it attaches no new worker, so
+                # the capacity check applies only to NEW pairings and refused-row
+                # re-arms (a refused row's slot was released to other workers, and
+                # count_active excludes it — the check below still protects it).
+                occupies_slot = existing is not None and existing.refused_at is None
+                if (
+                    not occupies_slot
+                    and assignments.count_active_for_unit(unit.unit_id) >= unit.replication_target
+                ):
                     continue
                 return SchedulerPick(
                     experiment_id=experiment.experiment_id,
