@@ -540,6 +540,9 @@ def certification_issue(
     click.echo(f"  sensitive flags: {envelope.sensitive_content_flags}")
     click.echo(f"  replication floor: {envelope.replication_floor}")
     click.echo(f"  duration ≤:     {envelope.duration_hours_ceiling}")
+    click.echo(
+        f"  tolerance envelope: {envelope.comparison_envelope or '(none — no comparison features)'}"
+    )
     click.echo(f"  advisor:        {envelope.advisor or '(none — low-risk: publish + contest)'}")
     click.echo("  §6.7.2 auto-checks: PASS")
     if not apply_changes:
@@ -564,6 +567,7 @@ def certification_issue(
             replication_floor=envelope.replication_floor,
             max_units_ceiling=envelope.max_units_ceiling,
             duration_hours_ceiling=envelope.duration_hours_ceiling,
+            comparison_envelope=envelope.comparison_envelope,
             cose_signed_blob=blob,
             signing_key_pubkey_hex=signing_key.pubkey_hex,
             certified_by=envelope.certified_by,

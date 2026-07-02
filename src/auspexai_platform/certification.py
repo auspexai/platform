@@ -39,6 +39,11 @@ class CertificateEnvelope:
     certified_by: str
     advisor: str | None
     certified_at: str  # ISO-8601 UTC
+    # C7: the LOCKED tolerance envelope — {feature_path: comparison-rule} for every
+    # feature_schema entry with a `comparison`. Binding it makes §9.2 enforceable
+    # (a run can't silently WIDEN the envelope and still resolve as certified).
+    # None = a legacy cert issued before envelope-binding (not locked; reissue to bind).
+    comparison_envelope: dict[str, Any] | None = None
 
     def canonical_bytes(self) -> bytes:
         """Deterministic serialization the certificate signs. Sorted keys +
@@ -47,6 +52,10 @@ class CertificateEnvelope:
         d = asdict(self)
         d["sensitive_content_flags"] = sorted(d["sensitive_content_flags"])
         d["model_ids"] = sorted(d["model_ids"])
+        # Legacy (unbound) certs omit the key entirely, so their canonical bytes stay
+        # byte-identical to pre-binding — old signatures keep verifying.
+        if d.get("comparison_envelope") is None:
+            d.pop("comparison_envelope", None)
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -118,6 +127,8 @@ def envelope_from_manifest(
     if not tenant_id:
         raise ValueError("manifest has no tenant_id")
 
+    comparison_envelope = comparison_envelope_from_manifest(manifest)
+
     declared_duration = manifest.get("expected_duration_hours")
     if duration_hours_ceiling is None and declared_duration is not None:
         duration_hours_ceiling = float(declared_duration)
@@ -140,7 +151,23 @@ def envelope_from_manifest(
         certified_by=certified_by,
         advisor=advisor,
         certified_at=certified_at or datetime.now(UTC).isoformat(),
+        comparison_envelope=comparison_envelope,
     )
+
+
+def comparison_envelope_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The tolerance envelope the cert LOCKS: {feature_path: comparison-rule} for
+    every feature_schema entry that declares a `comparison` (the agreement predicate
+    features + the exact anchor). Deterministic — the same feature_schema always
+    yields the same envelope. Empty {} for a manifest with no comparison features
+    (still bound, distinct from a legacy unbound cert's None)."""
+    fs = manifest.get("feature_schema") or {}
+    out: dict[str, Any] = {}
+    if isinstance(fs, dict):
+        for feature, decl in fs.items():
+            if isinstance(decl, dict) and isinstance(decl.get("comparison"), dict):
+                out[feature] = decl["comparison"]
+    return out
 
 
 def sign_certificate(envelope: CertificateEnvelope, *, signing_key: SigningKey) -> bytes:
@@ -182,6 +209,17 @@ def match(manifest: dict[str, Any], cert: Any) -> CheckResult:
     ):
         failures.append(
             f"expected_duration_hours exceeds the certified ceiling ({cert.duration_hours_ceiling})"
+        )
+    # C7 §9.2: the cert LOCKS the tolerance envelope. A cert issued before
+    # envelope-binding (comparison_envelope is None) is legacy → skip (it predates
+    # the lock; reissue to bind it). A bound cert must match EXACTLY — any drift
+    # (tighten OR widen) requires a reissue; widening additionally trips the §9.2
+    # review at reissue time. This is what makes "widening re-issues the cert"
+    # enforceable rather than declarative.
+    cert_env = getattr(cert, "comparison_envelope", None)
+    if cert_env is not None and comparison_envelope_from_manifest(manifest) != cert_env:
+        failures.append(
+            "tolerance envelope differs from the certified profile (§9.2 widening review)"
         )
     return CheckResult(passed=not failures, failures=failures)
 

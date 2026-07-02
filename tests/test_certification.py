@@ -199,6 +199,61 @@ def test_match_rejects_locked_field_changes(db, over):
     assert not match(_starter_manifest(**over), rec).passed
 
 
+# ---- C7: the cert LOCKS the tolerance envelope (§9.2 enforceable) ----
+
+_FS = {
+    "lexical.type_token_ratio": {"kind": "numeric", "comparison": {"rule": "numeric", "rel": 0.02}},
+    "lexical.top_tokens": {"kind": "set", "comparison": {"rule": "set_jaccard", "min": 0.9}},
+}
+_ENV = {
+    "lexical.type_token_ratio": {"rule": "numeric", "rel": 0.02},
+    "lexical.top_tokens": {"rule": "set_jaccard", "min": 0.9},
+}
+
+
+def test_comparison_envelope_extracted_and_bound():
+    from auspexai_platform.certification import comparison_envelope_from_manifest
+
+    assert comparison_envelope_from_manifest(_starter_manifest(feature_schema=_FS)) == _ENV
+    assert comparison_envelope_from_manifest(_starter_manifest()) == {}  # no feature_schema
+    env = envelope_from_manifest(
+        _starter_manifest(feature_schema=_FS),
+        snapshot_version="s",
+        profile_name="starter",
+        certified_by="m",
+    )
+    assert env.comparison_envelope == _ENV
+
+
+def test_match_rejects_widened_envelope(db):
+    """§9.2: a bound cert rejects a manifest that WIDENS the tolerance envelope
+    (rel 0.02 → 0.5) — no silent 'certified' on a loosened agreement bar. Also
+    verifies the envelope round-trips through the DB column."""
+    rec = _insert(CertifiedProfileRepository(db), comparison_envelope=_ENV)
+    assert rec.comparison_envelope == _ENV
+    widened = dict(_FS)
+    widened["lexical.type_token_ratio"] = {
+        "kind": "numeric",
+        "comparison": {"rule": "numeric", "rel": 0.5},
+    }
+    res = match(_starter_manifest(feature_schema=widened), rec)
+    assert not res.passed
+    assert any("tolerance envelope" in f for f in res.failures)
+
+
+def test_match_accepts_exact_envelope(db):
+    rec = _insert(CertifiedProfileRepository(db), comparison_envelope=_ENV)
+    assert match(_starter_manifest(feature_schema=_FS), rec).passed
+
+
+def test_match_legacy_cert_skips_envelope(db):
+    """A cert issued before envelope-binding (comparison_envelope None) is not
+    locked — match() skips the envelope check (backward compatible) until reissue."""
+    rec = _insert(CertifiedProfileRepository(db))
+    assert rec.comparison_envelope is None
+    assert match(_starter_manifest(feature_schema=_FS), rec).passed
+
+
 # ---- is_newer_build (the re-certification staleness signal) ----
 
 

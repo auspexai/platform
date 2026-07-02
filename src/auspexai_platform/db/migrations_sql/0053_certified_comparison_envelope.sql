@@ -1,0 +1,14 @@
+-- 0053_certified_comparison_envelope.sql — C7 / inference_determinism cert-envelope
+-- binding. The tolerance envelope (feature_schema comparison rules: type_token_ratio
+-- rel, top_tokens set_jaccard, the exact anchor) was NOT bound by the certificate —
+-- match() (§6.7.3) checked the executor package digest + operational fields only, so a
+-- run could WIDEN the envelope in its manifest and still resolve as certified. That
+-- left the C7 §9.2 guarantee ("tightening is free, widening re-issues the cert")
+-- DECLARATIVE, not enforced.
+--
+-- Bind it: certs issued from here carry the canonical comparison envelope in the
+-- COSE-signed body AND this denormalized column (for the submit-time match). match()
+-- now rejects a manifest whose envelope differs from the certified one. NULL = a
+-- LEGACY cert issued before binding → not locked (match() skips the check) until it is
+-- reissued. The vigiles starter is reissued in lockstep with this migration.
+ALTER TABLE certified_profiles ADD COLUMN comparison_envelope_json TEXT;

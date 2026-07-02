@@ -48,6 +48,9 @@ class CertifiedProfileRecord:
     replication_floor: int
     max_units_ceiling: int | None
     duration_hours_ceiling: float | None
+    comparison_envelope: (
+        dict | None
+    )  # C7: the locked tolerance envelope; None = legacy (pre-binding)
     cose_signed_blob: bytes
     signing_key_pubkey_hex: str
     certified_by: str
@@ -82,6 +85,7 @@ class CertifiedProfileRepository:
         replication_floor: int,
         max_units_ceiling: int | None,
         duration_hours_ceiling: float | None,
+        comparison_envelope: dict | None = None,
         cose_signed_blob: bytes,
         signing_key_pubkey_hex: str,
         certified_by: str,
@@ -101,9 +105,10 @@ class CertifiedProfileRepository:
                   (package_sha256, snapshot_version, tenant_id, profile_name,
                    research_class, sensitive_content_flags, model_ids,
                    replication_floor, max_units_ceiling, duration_hours_ceiling,
+                   comparison_envelope_json,
                    cose_signed_blob, signing_key_pubkey_hex, certified_by, advisor,
                    certified_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'certified')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'certified')
                 """,
                 (
                     package_sha256,
@@ -116,6 +121,7 @@ class CertifiedProfileRepository:
                     int(replication_floor),
                     max_units_ceiling,
                     duration_hours_ceiling,
+                    json.dumps(comparison_envelope) if comparison_envelope is not None else None,
                     cose_signed_blob,
                     signing_key_pubkey_hex,
                     certified_by,
@@ -142,6 +148,7 @@ class CertifiedProfileRepository:
         replication_floor: int,
         max_units_ceiling: int | None,
         duration_hours_ceiling: float | None,
+        comparison_envelope: dict | None = None,
         cose_signed_blob: bytes,
         signing_key_pubkey_hex: str,
         certified_by: str,
@@ -169,6 +176,7 @@ class CertifiedProfileRepository:
             replication_floor=replication_floor,
             max_units_ceiling=max_units_ceiling,
             duration_hours_ceiling=duration_hours_ceiling,
+            comparison_envelope=comparison_envelope,
             cose_signed_blob=cose_signed_blob,
             signing_key_pubkey_hex=signing_key_pubkey_hex,
             certified_by=certified_by,
@@ -252,6 +260,11 @@ class CertifiedProfileRepository:
             replication_floor=row["replication_floor"],
             max_units_ceiling=row["max_units_ceiling"],
             duration_hours_ceiling=row["duration_hours_ceiling"],
+            comparison_envelope=(
+                json.loads(row["comparison_envelope_json"])
+                if "comparison_envelope_json" in row.keys() and row["comparison_envelope_json"]
+                else None
+            ),
             cose_signed_blob=bytes(row["cose_signed_blob"]),
             signing_key_pubkey_hex=row["signing_key_pubkey_hex"],
             certified_by=row["certified_by"],
