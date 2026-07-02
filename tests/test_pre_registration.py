@@ -257,3 +257,38 @@ def test_backfill_dry_run_counts_prereg(db: Database) -> None:
     report = backfill_rekor_anchors(db, rekor_client=client, apply=False)
     assert report.prereg_candidates == 1 and client.calls == 0
     assert not repo.get("exp-dry").anchored
+
+
+def test_backfill_anchors_prereg_before_attestation_in_same_sweep(db: Database) -> None:
+    """ORDERING INVARIANT: when a fast run's pre-registration AND attestation
+    pend the SAME sweep, the pre-registration must receive the LOWER log index
+    (Rekor assigns indexes in submission order; anchors are immutable, so the
+    wrong order would brand a genuinely pre-registered run `design ≺ data` =
+    FALSE forever)."""
+    from auspexai_platform.db.repositories import AttestationRepository
+
+    PreRegistrationRepository(db).insert(
+        experiment_id="exp-fast",
+        tenant_id="lab",
+        tenant_experiment_label="label-fast",
+        manifest_hash="ab" * 32,
+        cose_signed_blob=b"\x01",
+        signing_key_pubkey_hex="ab" * 32,
+        submitted_at="2026-07-02T00:00:00+00:00",
+    )
+    AttestationRepository(db).insert(
+        attestation_id="att-fast",
+        experiment_id="exp-fast",
+        tenant_id="lab",
+        tenant_experiment_label="label-fast",
+        merkle_root="root",
+        algorithm="alg",
+        unit_count=1,
+        cose_signed_blob=b"\x02",
+        signing_key_pubkey_hex="ab" * 32,
+    )
+    client = _FakeRekor()  # monotonically increasing log indexes
+    backfill_rekor_anchors(db, rekor_client=client, apply=True)
+    prereg_idx = PreRegistrationRepository(db).get("exp-fast").rekor_log_index
+    att_idx = AttestationRepository(db).get_by_id("att-fast").rekor_log_index
+    assert prereg_idx < att_idx, "design must anchor before data within one sweep"

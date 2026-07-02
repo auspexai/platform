@@ -98,6 +98,35 @@ def backfill_rekor_anchors(
     )
     if not apply:
         return report
+    # D16.2 ORDERING INVARIANT: pre-registrations anchor FIRST. A fast run's
+    # pre-registration AND result attestation can pend the SAME sweep (submit
+    # and completion within one timer interval); Rekor log indexes are assigned
+    # in submission order, so anchoring attestations first would give the
+    # attestation the LOWER index and a genuinely pre-registered run would read
+    # `design ≺ data` = FALSE — forever (anchors are immutable). The prereg row
+    # always exists strictly before its attestation, so prereg-first preserves
+    # the true ordering in every case (same-sweep and cross-sweep alike).
+    for prec in prereg_candidates:
+        try:
+            entry = rekor_client.record(prec.cose_signed_blob)
+        except Exception:
+            logger.exception(
+                "rekor backfill failed for pre-registration %s; leaving un-anchored",
+                prec.experiment_id,
+            )
+            report.prereg_failed.append(prec.experiment_id)
+            continue
+        if entry.entry_uuid == REKOR_PLACEHOLDER_UUID:
+            report.prereg_failed.append(prec.experiment_id)
+            continue
+        prereg_repo.set_rekor(
+            prec.experiment_id,
+            log_index=entry.log_index,
+            entry_uuid=entry.entry_uuid,
+            inclusion_proof=entry.inclusion_proof or None,
+        )
+        report.prereg_anchored.append(prec.experiment_id)
+
     for rec in candidates:
         try:
             entry = rekor_client.record(rec.cose_signed_blob)
@@ -122,29 +151,4 @@ def backfill_rekor_anchors(
             ),
         )
         report.anchored.append(rec.attestation_id)
-
-    # D16.2 (Q1, ratified): the same sweep anchors the SUBMIT-TIME
-    # pre-registration statements — the anchor whose timestamp must precede the
-    # result attestation's (`design ≺ data`). Same idempotency + per-row fault
-    # tolerance; a NoOp/degraded response leaves the row a candidate.
-    for prec in prereg_candidates:
-        try:
-            entry = rekor_client.record(prec.cose_signed_blob)
-        except Exception:
-            logger.exception(
-                "rekor backfill failed for pre-registration %s; leaving un-anchored",
-                prec.experiment_id,
-            )
-            report.prereg_failed.append(prec.experiment_id)
-            continue
-        if entry.entry_uuid == REKOR_PLACEHOLDER_UUID:
-            report.prereg_failed.append(prec.experiment_id)
-            continue
-        prereg_repo.set_rekor(
-            prec.experiment_id,
-            log_index=entry.log_index,
-            entry_uuid=entry.entry_uuid,
-            inclusion_proof=entry.inclusion_proof or None,
-        )
-        report.prereg_anchored.append(prec.experiment_id)
     return report
