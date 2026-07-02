@@ -148,6 +148,53 @@ def test_submit_no_warn_exact_with_serving_pin(
     assert "experiment.exact_without_pin" not in actions
 
 
+def test_submit_rejects_sampling_with_agreement_reducer(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """inference_determinism Inc 1 (coherence gate): seeded sampling (temperature > 0)
+    paired with an AGREEMENT reducer is incoherent — sampled replicas legitimately
+    differ, so agreement would be meaningless or falsely claimed. Hard 422, never a
+    false-consensus run."""
+    privkey, binding = registered_tenant
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "sampling-agree-001",
+            reducer={"kind": "builtin_hash_agreement"},
+            inference_determinism={"temperature": 0.7, "seed": 7},
+        ),
+    )
+    assert response.status_code == 422, response.text
+    assert (
+        response.json()["detail"]["error"]["code"] == "sampling_incoherent_with_agreement_consensus"
+    )
+
+
+def test_submit_rejects_sampling_not_yet_enforced(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """inference_determinism Inc 1: even with a coherent (non-agreement) consensus,
+    the worker does not yet honor a declared temperature (v0.2 M1 / Inc 2), so a temp>0
+    manifest would silently run greedy. Reject at submit until enforcement lands.
+    (Inc 2 removes THIS reject, leaving the coherence reject above.)"""
+    privkey, binding = registered_tenant
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "sampling-noreducer-001",
+            inference_determinism={"temperature": 0.9, "seed": 7},  # no agreement reducer
+        ),
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["error"]["code"] == "seeded_sampling_not_yet_enforced"
+
+
 def test_submit_publishes_experiment_submitted_event(
     client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
 ) -> None:

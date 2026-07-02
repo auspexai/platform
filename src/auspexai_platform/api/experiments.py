@@ -801,6 +801,57 @@ def build_router(
                     },
                 )
 
+        # C7 / inference_determinism (Inc 1) — the SAMPLING COHERENCE GATE.
+        # Seeded sampling (inference_determinism.temperature > 0) makes replica
+        # outputs legitimately DIFFER, so an agreement consensus mode (hash-agreement
+        # or within_cell_tolerance) would either spuriously fail or — with a loose
+        # envelope — FALSELY claim corroboration. Permanent rule: sampling requires a
+        # non-agreement collection mode (process-only / distributional). AND until the
+        # worker honors a declared temperature (manifest v0.2 M1 / Inc 2), the fleet
+        # CANNOT run sampling at all — allowing it to submit would silently execute
+        # greedy (declared != actual). So today reject temp>0 outright; Inc 2 drops the
+        # second (not-yet-enforced) reject, leaving the coherence reject as the durable
+        # gate. Ref: inference_determinism_scoping_memo.md §3c/§6. Greedy (temperature 0
+        # or an omitted inference_determinism block) is unaffected — the common case.
+        determinism = body.manifest.get("inference_determinism")
+        declared_temp = determinism.get("temperature", 0) if isinstance(determinism, dict) else 0
+        try:
+            is_sampling = float(declared_temp) > 0
+        except (TypeError, ValueError):
+            is_sampling = False
+        if is_sampling:
+            sampling_reducer_kind = reducer.get("kind") if isinstance(reducer, dict) else None
+            if sampling_reducer_kind in ("builtin_hash_agreement", "builtin_within_cell_tolerance"):
+                raise HTTPException(
+                    status_code=422,  # UNPROCESSABLE_CONTENT
+                    detail={
+                        "error": {
+                            "code": "sampling_incoherent_with_agreement_consensus",
+                            "message": (
+                                "seeded sampling (inference_determinism.temperature > 0) is "
+                                f"incoherent with the agreement reducer {sampling_reducer_kind!r}: "
+                                "sampled replicas legitimately differ, so cross-worker agreement "
+                                "would be meaningless or falsely claimed. Declare a non-agreement "
+                                "collection mode (process-only / distributional)."
+                            ),
+                        }
+                    },
+                )
+            raise HTTPException(
+                status_code=422,  # UNPROCESSABLE_CONTENT
+                detail={
+                    "error": {
+                        "code": "seeded_sampling_not_yet_enforced",
+                        "message": (
+                            "seeded sampling (inference_determinism.temperature > 0) is declared "
+                            "but the fleet does not yet honor a per-experiment temperature (lands "
+                            "in manifest v0.2 M1); submitting it now would silently run greedy. "
+                            "Use temperature 0, or await M1 enforcement."
+                        ),
+                    }
+                },
+            )
+
         # Insert manifest. Duplicate (same canonical hash) means re-submission;
         # treat as 409 — researchers shouldn't blindly re-upload identical
         # manifests; the receipt audit chain wants distinct submission events.
