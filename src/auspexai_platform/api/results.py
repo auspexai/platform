@@ -39,6 +39,7 @@ from auspexai_platform.db.repositories import (
     ReceiptIndexRepository,
     ResultRepository,
     ResultTransferRepository,
+    UnitConsensusRepository,
 )
 from auspexai_platform.db.repositories.attestations import (
     AttestationRecord,
@@ -94,6 +95,12 @@ class ResultItem(BaseModel):
     worker_signature: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
     worker_id: Annotated[str | None, ExposureTag.ACCOUNT_SCOPED] = None
     worker_pubkey_hex: Annotated[str | None, ExposureTag.ACCOUNT_SCOPED] = None
+    # C7 Inc 4 (legibility): for the consensus row of a within_cell_tolerance
+    # unit — HOW the replicas agreed: {method, representative, representative_hash,
+    # spread, envelope, agreeing_workers, outlier_count}. Same science-exposure
+    # boundary as the payload (the representative is composed of declared,
+    # §7-contained features). None for exact / process_only / raw-replica rows.
+    consensus_evidence: Annotated[dict[str, Any] | None, ExposureTag.TENANT_SCOPED] = None
 
 
 class ResultListResponse(BaseModel):
@@ -110,6 +117,10 @@ class AttestationUnit(BaseModel):
     # legacy v0 attestations.
     unit_payload_sha256: str | None = None
     environment: dict[str, Any] | None = None
+    # C7 Inc 4: tolerance evidence {spread, outlier_count, envelope} echoed from
+    # the signed predicate; the leaf's consensus_result_hash is the deterministic
+    # representative's hash for such units. None for exact / process_only.
+    tolerance: dict[str, Any] | None = None
 
 
 class ResultSetAttestationResponse(BaseModel):
@@ -189,7 +200,9 @@ def _experiment_not_found(experiment_id: str) -> HTTPException:
     )
 
 
-def _to_item(result: Result, receipt_id: str | None) -> ResultItem:
+def _to_item(
+    result: Result, receipt_id: str | None, consensus_evidence: dict[str, Any] | None = None
+) -> ResultItem:
     aged = result.payload_aged_off_at is not None
     return ResultItem(
         result_id=result.result_id,
@@ -206,6 +219,7 @@ def _to_item(result: Result, receipt_id: str | None) -> ResultItem:
         worker_signature=result.worker_signature,
         worker_id=result.worker_id,
         worker_pubkey_hex=result.worker_pubkey_hex,
+        consensus_evidence=consensus_evidence,
     )
 
 
@@ -282,6 +296,7 @@ def build_router(
             receipt_id=e.receipt_id,
             unit_payload_sha256=e.unit_payload_sha256,
             environment=e.environment,
+            tolerance=e.tolerance,
         )
 
     def _collect_attestation_units(experiment_id: str) -> list[AttestationUnit]:
@@ -361,9 +376,21 @@ def build_router(
 
         repo.mark_delivered([r.result_id for r in rows])
         rmap = _receipt_map(experiment_id)
+        # C7 Inc 4: attach the tolerance-consensus evidence to each CONSENSUS row
+        # (how the unit agreed: representative/spread/envelope/outliers). One
+        # query; empty map for exact / pre-Inc-4 experiments.
+        evidence = UnitConsensusRepository(per_job_db).map_all()
         items = [
             filter_for_credential(
-                _to_item(r, rmap.get(r.result_id)),
+                _to_item(
+                    r,
+                    rmap.get(r.result_id),
+                    consensus_evidence=(
+                        evidence[r.unit_id].evidence_dict()
+                        if r.is_consensus and r.unit_id in evidence
+                        else None
+                    ),
+                ),
                 credential,
                 resource_tenant_id=experiment.tenant_id,
             )
@@ -595,6 +622,13 @@ def build_router(
         # tables, not the best-effort index.
         rmap = receipt_map_from_per_job(per_job_db) if per_job_db is not None else {}
         receipt_repo = ReceiptRepository(per_job_db) if per_job_db is not None else None
+        # C7 Inc 4: the per-unit tolerance-consensus evidence — ships in the
+        # bundle (the SDK's delivered-vs-attested check maps a tolerance unit to
+        # its representative hash through this block) and resolves the
+        # coordinator-side one-root binding below the same way.
+        uc_evidence = (
+            UnitConsensusRepository(per_job_db).map_all() if per_job_db is not None else {}
+        )
 
         results_out: list[dict[str, Any]] = []
         receipts_out: list[dict[str, Any]] = []
@@ -787,7 +821,18 @@ def build_router(
                     else None
                 ),
             }
-            delivered = {(r.unit_id, r.semantic_hash or "") for r in consensus}
+
+            # C7 Inc 4: a tolerance unit is DELIVERED as a promoted replica row
+            # (whose semantic_hash is that worker's own) but ATTESTED by its
+            # deterministic representative's hash — map through the evidence so
+            # the one-root binding holds; row-less units compare as before.
+            def _delivered_hash(r) -> str:
+                uc = uc_evidence.get(r.unit_id)
+                if r.is_consensus and uc is not None and uc.representative_hash:
+                    return uc.representative_hash
+                return r.semantic_hash or ""
+
+            delivered = {(r.unit_id, _delivered_hash(r)) for r in consensus}
             attested = {(e.unit_id, e.consensus_result_hash) for e in entries}
             if delivered == attested:
                 # One root binds data ↔ custody ↔ Rekor.
@@ -845,6 +890,14 @@ def build_router(
             "manifest": manifest.manifest_json if manifest is not None else None,
             "work_units": work_units_out,
             "consensus_results": results_out,
+            # C7 Inc 4: per-unit tolerance-consensus evidence (empty for exact /
+            # pre-Inc-4 experiments). The SDK verifier maps each such unit's
+            # delivered row to the attested representative hash through this
+            # block; the representative/spread/envelope are the researcher-facing
+            # "how it agreed" record, §7-contained by construction.
+            "unit_consensus": [
+                {"unit_id": uid, **rec.evidence_dict()} for uid, rec in sorted(uc_evidence.items())
+            ],
             "receipts": receipts_out,
             "attestation": attestation_out,
             "transfer": {

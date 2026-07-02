@@ -49,7 +49,7 @@ from auspexai_platform.receipts.models import (
 from auspexai_platform.receipts.rekor import NoOpRekorClient, RekorClient
 from auspexai_platform.receipts.repository import ReceiptRecord, ReceiptRepository
 from auspexai_platform.receipts.signing import SigningKey, cose_sign1_encode
-from auspexai_platform.receipts.tolerance import tolerance_agreement
+from auspexai_platform.receipts.tolerance import predicate_features, tolerance_agreement
 from auspexai_platform.result_signature import canonical_result_bytes
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,14 @@ class ReceiptIssuanceOutcome:
     # workers inside the envelope. The caller promotes one of THESE (never an
     # outlier) as the durable consensus copy.
     agreeing_result_ids: list[int] = field(default_factory=list)
+    # C7 Inc 4: the tolerance-consensus evidence to persist at issuance —
+    # representative / representative_hash / per-feature spread / the envelope in
+    # force / counts. None for exact hash-agreement (nothing beyond the shared
+    # hash to evidence) and for a non-agreed unit (no consensus to evidence; the
+    # divergence index carries the outliers). The caller writes it to the per-job
+    # `unit_consensus` table beside the consensus promotion — raw replicas age
+    # off, so this is the durable record of HOW the unit agreed.
+    tolerance_evidence: dict | None = None
 
 
 def _semantic_hash(result: Result) -> str:
@@ -144,21 +152,25 @@ def _reduce_unit(
     *,
     experiment: Experiment,
     manifest: dict | None,
-) -> tuple[AgreementOutcome, list[Result], list[Result]]:
-    """Dispatch on the manifest's reducer kind; return the agreement outcome plus
-    the partition (agreeing results that earn receipts, outliers recorded as
-    divergence). `within_cell_tolerance` reads the feature_schema envelope; the
-    default — and any unknown kind, defensively — is exact hash-agreement.
+) -> tuple[AgreementOutcome, list[Result], list[Result], dict | None]:
+    """Dispatch on the manifest's reducer kind; return the agreement outcome, the
+    partition (agreeing results that earn receipts, outliers recorded as
+    divergence), and — for an AGREED tolerance unit — the Inc 4 evidence dict
+    (representative / spread / envelope-in-force / counts) the caller persists.
+    `within_cell_tolerance` reads the feature_schema envelope; the default — and
+    any unknown kind, defensively — is exact hash-agreement.
 
     C7 swaps ONLY the agreement predicate. The C14 count/floor logic that decides
     WHEN a unit settles is untouched (the floor is read here as the corroboration
     threshold, not re-implemented)."""
     reducer = (manifest or {}).get("reducer") or {}
     if reducer.get("kind") == TOLERANCE_METHOD:
+        feature_schema = (manifest or {}).get("feature_schema") or {}
+        tolerance_features = reducer.get("tolerance_features")
         part = tolerance_agreement(
             results,
-            feature_schema=(manifest or {}).get("feature_schema") or {},
-            tolerance_features=reducer.get("tolerance_features"),
+            feature_schema=feature_schema,
+            tolerance_features=tolerance_features,
             floor=getattr(experiment, "replication_floor", None) or 1,
         )
         outcome = AgreementOutcome(
@@ -168,15 +180,32 @@ def _reduce_unit(
             semantic_hash=part.representative_hash,
         )
         if part.agreed:
+            # The envelope IN FORCE at issuance: the per-feature comparison rules
+            # the predicate actually evaluated (the calibrated numbers a reviewer
+            # checks the spread against).
+            envelope = {
+                path: feature_schema[path]["comparison"]
+                for path in predicate_features(feature_schema, tolerance_features)
+            }
+            evidence = {
+                "method": TOLERANCE_METHOD,
+                "representative": part.representative,
+                "representative_hash": part.representative_hash,
+                "spread": part.per_feature_spread,
+                "envelope": envelope,
+                "agreeing_workers": len(part.agreeing_indices),
+                "outlier_count": len(part.outlier_indices),
+            }
             return (
                 outcome,
                 [results[i] for i in part.agreeing_indices],
                 [results[i] for i in part.outlier_indices],
+                evidence,
             )
-        return outcome, [], results
+        return outcome, [], results, None
 
     outcome = hash_agreement_reducer(results)
-    return (outcome, results, []) if outcome.agreed else (outcome, [], results)
+    return (outcome, results, [], None) if outcome.agreed else (outcome, [], results, None)
 
 
 def _generate_receipt_id() -> str:
@@ -229,7 +258,9 @@ def issue_receipts_for_completed_unit(
         deduped.append(r)
     results = deduped
 
-    outcome, agreeing, outliers = _reduce_unit(results, experiment=experiment, manifest=manifest)
+    outcome, agreeing, outliers, tolerance_evidence = _reduce_unit(
+        results, experiment=experiment, manifest=manifest
+    )
 
     # Firewall #1 (A2): index every OUTLIER's honest work in the divergence
     # trust-index — evidentiary now, counted only once the equal-trust flip is
@@ -389,4 +420,5 @@ def issue_receipts_for_completed_unit(
         issued_receipt_ids=issued,
         agreement=outcome,
         agreeing_result_ids=[r.result_id for r in agreeing],
+        tolerance_evidence=tolerance_evidence,
     )

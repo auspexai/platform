@@ -977,3 +977,168 @@ class TestAttestationPersistence:
         assert b2["attestation_id"] == b1["attestation_id"]
         assert b2["cose_b64"] == b1["cose_b64"]
         assert b2["unit_count"] == 1 and b2["units"]  # convenience units re-derived
+
+
+# ---- C7 Inc 4: tolerance evidence — representative-hash leaf + predicate ------
+
+
+class TestToleranceEvidence:
+    """Inc 4: an agreed tolerance unit's leaf binds the DETERMINISTIC
+    representative's hash (persisted at issuance in `unit_consensus`), with the
+    spread/outlier/envelope evidence riding the signed predicate — while
+    row-less units (exact / process_only / pre-Inc-4) keep the promoted
+    replica's semantic hash, so already-persisted roots rebuild identically."""
+
+    @staticmethod
+    def _seed_unit(db, *, unit_id: str, payload: dict, method: str) -> str:
+        """work_unit + one consensus-promoted result + the authoritative per-job
+        receipt row. Returns the promoted row's semantic_hash."""
+        from datetime import UTC as _UTC
+        from datetime import datetime as _dt
+
+        now = _dt.now(_UTC)
+        db.execute(
+            "INSERT OR IGNORE INTO work_units "
+            "(unit_id, payload_json, status, replication_target, completions_so_far, created_at) "
+            "VALUES (?, '{}', 'completed', 2, 2, ?)",
+            (unit_id, now.isoformat()),
+        )
+        repo = ResultRepository(db)
+        result = repo.insert(
+            result_id=f"res-{unit_id}",
+            unit_id=unit_id,
+            worker_id="wkr-1",
+            worker_pubkey_hex="ab" * 32,
+            exit_code=0,
+            payload=payload,
+            worker_signature="c2ln",
+            completed_at=now,
+        )
+        repo.promote_consensus(unit_id, result.result_id)
+        insert_per_job_receipt(
+            db,
+            receipt_id=f"rcpt-{unit_id}",
+            unit_id=unit_id,
+            agreeing_workers=2,
+            method=method,
+        )
+        return result.semantic_hash
+
+    def test_evidenced_unit_leafs_representative_and_carries_predicate_evidence(
+        self, tmp_path: Path
+    ):
+        from auspexai_platform.db.repositories import UnitConsensusRepository
+        from auspexai_platform.receipts.attestation import (
+            collect_result_set_entries,
+            receipt_map_from_per_job,
+        )
+        from auspexai_platform.receipts.issuance import TOLERANCE_METHOD
+
+        factory = PerJobDatabaseFactory(tmp_path / "jobs")
+        db = factory.get_or_create("exp-tol")
+        # u-evidenced: tolerance unit WITH a persisted evidence row.
+        row_hash = self._seed_unit(
+            db, unit_id="u-evidenced", payload={"x": 1}, method=TOLERANCE_METHOD
+        )
+        rep_hash = "cd" * 32
+        UnitConsensusRepository(db).record(
+            unit_id="u-evidenced",
+            method=TOLERANCE_METHOD,
+            representative={"lexical.type_token_ratio": 0.5},
+            representative_hash=rep_hash,
+            spread={"lexical.type_token_ratio": 0.01},
+            envelope={"lexical.type_token_ratio": {"rule": "numeric", "rel": 0.02}},
+            agreeing_workers=2,
+            outlier_count=1,
+        )
+        # u-legacy: tolerance-method unit WITHOUT a row (pre-Inc-4 / write failed).
+        legacy_hash = self._seed_unit(
+            db, unit_id="u-legacy", payload={"x": 2}, method=TOLERANCE_METHOD
+        )
+
+        entries = collect_result_set_entries(db, receipt_id_by_result=receipt_map_from_per_job(db))
+        by_unit = {e.unit_id: e for e in entries}
+        # The evidenced unit's leaf binds the representative, not the promoted row.
+        assert by_unit["u-evidenced"].consensus_result_hash == rep_hash != row_hash
+        assert by_unit["u-evidenced"].tolerance == {
+            "spread": {"lexical.type_token_ratio": 0.01},
+            "outlier_count": 1,
+            "envelope": {"lexical.type_token_ratio": {"rule": "numeric", "rel": 0.02}},
+        }
+        # The row-less unit keeps the promoted replica's hash (backward compat).
+        assert by_unit["u-legacy"].consensus_result_hash == legacy_hash
+        assert by_unit["u-legacy"].tolerance is None
+
+        # Predicate: evidence rides the signed predicate for the evidenced unit
+        # only; the root binds the representative leaf.
+        key = load_or_generate_signing_key(tmp_path / "sign.key")
+        att = build_result_set_attestation(
+            attestation_id="att-tol",
+            tenant_experiment_label="exp-label",
+            tenant_id="tenant-a",
+            entries=entries,
+            signing_key=key,
+        )
+        payload_bytes, _ = cose_sign1_decode(att.cose_signed_blob, expected_pubkey=key.public_key)
+        body = cbor2.loads(cbor2.loads(payload_bytes)["predicate"])
+        units = {u["unit_id"]: u for u in body["units"]}
+        assert units["u-evidenced"]["consensus_result_hash"] == rep_hash
+        assert units["u-evidenced"]["tolerance"]["outlier_count"] == 1
+        assert "tolerance" not in units["u-legacy"]
+
+    def test_tolerance_field_is_predicate_only_not_leaf(self, tmp_path: Path):
+        """Like environment/integrity_basis: attaching tolerance evidence must
+        not change the Merkle root — a verifier's root recompute stays stable."""
+        bare = [ResultSetEntry("u1", "h1", "r1", unit_payload_sha256="aa" * 32)]
+        tagged = [
+            ResultSetEntry(
+                "u1",
+                "h1",
+                "r1",
+                unit_payload_sha256="aa" * 32,
+                tolerance={"spread": {}, "outlier_count": 0, "envelope": {}},
+            )
+        ]
+        assert merkle_root(bare, schema_version=1) == merkle_root(tagged, schema_version=1)
+
+    def test_unit_consensus_repo_round_trip(self, tmp_path: Path):
+        from auspexai_platform.db.repositories import UnitConsensusRepository
+
+        factory = PerJobDatabaseFactory(tmp_path / "jobs")
+        db = factory.get_or_create("exp-rt")
+        db.execute(
+            "INSERT INTO work_units (unit_id, payload_json, status, replication_target, "
+            "completions_so_far, created_at) VALUES ('u1', '{}', 'completed', 2, 2, 't')"
+        )
+        repo = UnitConsensusRepository(db)
+        repo.record(
+            unit_id="u1",
+            method="builtin_within_cell_tolerance",
+            representative={"f": 1.0},
+            representative_hash="ee" * 32,
+            spread={"f": 0.0},
+            envelope={"f": {"rule": "numeric", "rel": 0.02}},
+            agreeing_workers=3,
+            outlier_count=0,
+        )
+        rec = repo.get("u1")
+        assert rec is not None and rec.representative_hash == "ee" * 32
+        assert rec.representative == {"f": 1.0} and rec.spread == {"f": 0.0}
+        assert rec.agreeing_workers == 3 and rec.outlier_count == 0
+        assert repo.map_all() == {"u1": rec}
+        ev = rec.evidence_dict()
+        assert ev["method"] == "builtin_within_cell_tolerance"
+        assert ev["envelope"]["f"] == {"rule": "numeric", "rel": 0.02}
+        # idempotent replace (re-finalization)
+        repo.record(
+            unit_id="u1",
+            method="builtin_within_cell_tolerance",
+            representative=None,
+            representative_hash="ff" * 32,
+            spread=None,
+            envelope=None,
+            agreeing_workers=2,
+            outlier_count=1,
+        )
+        rec2 = repo.get("u1")
+        assert rec2.representative_hash == "ff" * 32 and rec2.representative is None

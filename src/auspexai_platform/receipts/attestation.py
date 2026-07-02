@@ -102,6 +102,11 @@ class ResultSetEntry:
     # Firewall #1: coordinator-asserted corroboration basis (predicate-only, like
     # `environment` — never in the leaf). None on legacy v0 rebuild paths.
     integrity_basis: str | None = None
+    # C7 Inc 4: tolerance-consensus evidence for a within_cell_tolerance unit —
+    # {spread, outlier_count, envelope} persisted at issuance (predicate-only,
+    # never the leaf; the leaf binds the representative via consensus_result_hash).
+    # None for exact / process_only units and pre-Inc-4 tolerance units.
+    tolerance: dict[str, object] | None = None
 
 
 def unit_payload_sha256(payload_json: str) -> str:
@@ -178,6 +183,20 @@ def _unit_agreeing_workers(per_job_db) -> dict[str, int]:
         for unit_id in receipt.work_unit_ids:
             out[unit_id] = max(out.get(unit_id, 0), int(receipt.quorum_agreement.agreeing_workers))
     return out
+
+
+def _unit_consensus_evidence(per_job_db) -> dict:
+    """{unit_id: UnitConsensusRecord} — the C7 Inc 4 tolerance evidence persisted
+    at issuance. Empty for pre-Inc-4 experiments (the table exists but has no
+    rows) — those units keep the promoted replica's semantic hash as their leaf,
+    so already-persisted attestations rebuild byte-identically. Defensive against
+    a per-job handle opened outside the factory's ensure chain (no table)."""
+    from auspexai_platform.db.repositories.unit_consensus import UnitConsensusRepository
+
+    try:
+        return UnitConsensusRepository(per_job_db).map_all()
+    except Exception:
+        return {}
 
 
 def _unit_consensus_methods(per_job_db) -> dict[str, str]:
@@ -354,6 +373,7 @@ def collect_result_set_entries(
     payload_hashes = _unit_payload_hashes(per_job_db)
     agreeing_workers = _unit_agreeing_workers(per_job_db)
     consensus_methods = _unit_consensus_methods(per_job_db)
+    consensus_evidence = _unit_consensus_evidence(per_job_db)
     entries: list[ResultSetEntry] = []
     after_completed_at: str | None = None
     after_result_id: str | None = None
@@ -367,10 +387,25 @@ def collect_result_set_entries(
             receipt_id = receipt_id_by_result.get(r.result_id)
             if receipt_id is None or r.semantic_hash is None:
                 continue
+            # C7 Inc 4 (design §4 bridge): a tolerance unit's leaf binds the
+            # DETERMINISTIC representative — the canonical consensus value — not
+            # an arbitrarily-promoted replica's variant. Row-less units (exact,
+            # process_only, pre-Inc-4) keep the promoted replica's hash, so
+            # already-persisted roots rebuild byte-identically.
+            uc = consensus_evidence.get(r.unit_id)
+            leaf_hash = r.semantic_hash
+            tolerance: dict | None = None
+            if uc is not None and uc.representative_hash:
+                leaf_hash = uc.representative_hash
+                tolerance = {
+                    "spread": uc.spread,
+                    "outlier_count": uc.outlier_count,
+                    "envelope": uc.envelope,
+                }
             entries.append(
                 ResultSetEntry(
                     unit_id=r.unit_id,
-                    consensus_result_hash=r.semantic_hash,
+                    consensus_result_hash=leaf_hash,
                     receipt_id=receipt_id,
                     unit_payload_sha256=payload_hashes.get(r.unit_id),
                     environment=r.environment,
@@ -378,6 +413,7 @@ def collect_result_set_entries(
                         agreeing_workers.get(r.unit_id, 0),
                         consensus_methods.get(r.unit_id, HASH_AGREEMENT_METHOD),
                     ),
+                    tolerance=tolerance,
                 )
             )
         if len(rows) < page_size:
@@ -463,6 +499,12 @@ def build_result_set_attestation(
             # (predicate-only, never the leaf — the root stays reproducible).
             if e.integrity_basis is not None:
                 unit["integrity_basis"] = e.integrity_basis
+            # C7 Inc 4: tolerance evidence (spread / outliers / envelope-in-force)
+            # rides the signed predicate — predicate-only, like `environment`.
+            # Omitted for non-tolerance units, so their predicates stay
+            # byte-identical to the pre-Inc-4 format.
+            if e.tolerance is not None:
+                unit["tolerance"] = e.tolerance
         units.append(unit)
     predicate = {
         "merkle_root": root,

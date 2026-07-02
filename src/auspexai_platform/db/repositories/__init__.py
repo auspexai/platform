@@ -29,6 +29,10 @@ from auspexai_platform.db.repositories.software_requests import SoftwareRequestR
 from auspexai_platform.db.repositories.tenant_applications import TenantApplicationRepository
 from auspexai_platform.db.repositories.tenants import TenantRepository
 from auspexai_platform.db.repositories.trust_model_policy import TrustModelPolicyRepository
+from auspexai_platform.db.repositories.unit_consensus import (
+    UnitConsensusRecord,
+    UnitConsensusRepository,
+)
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.db.repositories.workers import WorkerRepository
 
@@ -53,6 +57,8 @@ __all__ = [
     "TenantApplicationRepository",
     "TenantRepository",
     "TrustModelPolicyRepository",
+    "UnitConsensusRecord",
+    "UnitConsensusRepository",
     "WorkUnitRepository",
     "WorkerRepository",
 ]

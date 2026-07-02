@@ -63,6 +63,7 @@ from auspexai_platform.db.repositories import (
     ExperimentRepository,
     ReceiptIndexRepository,
     ResultRepository,
+    UnitConsensusRepository,
     WorkerRepository,
     WorkUnitRepository,
 )
@@ -1301,6 +1302,32 @@ def finalize_completed_unit(
                         "result_id": consensus_result_id,
                     },
                 )
+                # C7 Inc 4: persist the tolerance-consensus evidence beside the
+                # promotion — the durable record of HOW the unit agreed
+                # (representative / spread / envelope-in-force / outlier count).
+                # Raw replicas age off, so issuance time is the only chance.
+                # Best-effort like the receipt index: never blocks completion —
+                # a missing row degrades the unit to the legacy promoted-row
+                # attestation leaf, it never falsifies anything.
+                if issuance_outcome.tolerance_evidence is not None:
+                    try:
+                        ev = issuance_outcome.tolerance_evidence
+                        UnitConsensusRepository(per_job_db).record(
+                            unit_id=unit_id,
+                            method=ev["method"],
+                            representative=ev["representative"],
+                            representative_hash=ev["representative_hash"],
+                            spread=ev["spread"],
+                            envelope=ev["envelope"],
+                            agreeing_workers=ev["agreeing_workers"],
+                            outlier_count=ev["outlier_count"],
+                        )
+                    except Exception:
+                        logger.exception(
+                            "unit_consensus evidence write failed for unit %s — the unit "
+                            "falls back to the promoted-replica attestation leaf",
+                            unit_id,
+                        )
             if issuance_outcome.issued_receipt_ids:
                 for _promote_wid in promote_worker_ids:
                     _maybe_auto_promote(

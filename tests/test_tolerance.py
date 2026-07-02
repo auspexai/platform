@@ -156,21 +156,46 @@ class TestReduceUnitDispatch:
             _r(_payload(0.50, [["a", 1]])),
             _r(_payload(0.95, [["z", 1]])),
         ]
-        outcome, agreeing, outliers = _reduce_unit(rs, experiment=exp, manifest=manifest)
+        outcome, agreeing, outliers, evidence = _reduce_unit(rs, experiment=exp, manifest=manifest)
         assert outcome.agreed and outcome.method == TOLERANCE_METHOD
         assert outcome.agreeing_workers == 2
         assert len(agreeing) == 2 and len(outliers) == 1
+        # C7 Inc 4: an agreed tolerance unit yields the evidence the caller
+        # persists — representative + hash + per-feature spread + the envelope
+        # in force + counts.
+        assert evidence is not None and evidence["method"] == TOLERANCE_METHOD
+        assert evidence["representative_hash"] == outcome.semantic_hash
+        assert evidence["agreeing_workers"] == 2 and evidence["outlier_count"] == 1
+        assert set(evidence["spread"]) == {
+            "lexical.type_token_ratio",
+            "lexical.top_tokens",
+            "refusal",
+        }
+        # The envelope is the per-feature comparison rules the predicate evaluated.
+        assert evidence["envelope"]["lexical.type_token_ratio"] == {"rule": "numeric", "rel": 0.05}
+        assert "response_sha256" not in evidence["envelope"]  # exact anchor ≠ predicate
+
+    def test_tolerance_no_agreement_yields_no_evidence(self) -> None:
+        exp = SimpleNamespace(replication_floor=3)
+        manifest = {"reducer": {"kind": TOLERANCE_METHOD}, "feature_schema": FS}
+        rs = [_r(_payload(t, [["a", 1]])) for t in (0.30, 0.60, 0.90)]
+        outcome, _agreeing, _outliers, evidence = _reduce_unit(
+            rs, experiment=exp, manifest=manifest
+        )
+        assert not outcome.agreed and evidence is None
 
     def test_default_is_hash_agreement(self) -> None:
         exp = SimpleNamespace(replication_floor=2)
         rs = [_r({"x": 1}), _r({"x": 1})]
-        outcome, agreeing, outliers = _reduce_unit(rs, experiment=exp, manifest=None)
+        outcome, agreeing, outliers, evidence = _reduce_unit(rs, experiment=exp, manifest=None)
         assert outcome.agreed and outcome.method == "builtin_hash_agreement"
         assert len(agreeing) == 2 and outliers == []
+        assert evidence is None  # exact: nothing beyond the shared hash to evidence
 
     def test_hash_disagreement_all_outliers(self) -> None:
         exp = SimpleNamespace(replication_floor=2)
         rs = [_r({"x": 1}), _r({"x": 2})]
-        outcome, agreeing, outliers = _reduce_unit(rs, experiment=exp, manifest=None)
+        outcome, agreeing, outliers, evidence = _reduce_unit(rs, experiment=exp, manifest=None)
         assert not outcome.agreed
         assert agreeing == [] and len(outliers) == 2
+        assert evidence is None

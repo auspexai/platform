@@ -127,6 +127,28 @@ CREATE TABLE IF NOT EXISTS receipts (
 );
 
 CREATE INDEX IF NOT EXISTS receipts_issued_idx ON receipts(issued_at);
+
+
+-- C7 Inc 4: per-unit tolerance-consensus evidence, persisted AT ISSUANCE (the
+-- Inc 2 deferral). Written only for `builtin_within_cell_tolerance` units that
+-- reached agreement; exact/process_only units have no row (their consensus hash
+-- IS a replica's semantic hash — nothing extra to evidence). Issuance-time
+-- persistence is load-bearing: raw replica payloads age off, so the partition
+-- cannot be recomputed later. All JSON members are §7-contained (the
+-- representative is composed of DECLARED features only — the same containment
+-- boundary as the result payloads themselves).
+CREATE TABLE IF NOT EXISTS unit_consensus (
+    unit_id             TEXT    PRIMARY KEY,
+    method              TEXT    NOT NULL,
+    representative_json TEXT,            -- the deterministic per-feature consensus vector
+    representative_hash TEXT,            -- semantic_hash(0, representative): the attestation-leaf hash for a tolerance unit
+    spread_json         TEXT,            -- {feature: observed spread among ALL replicas}
+    envelope_json       TEXT,            -- {feature: comparison rule} in force at issuance
+    agreeing_workers    INTEGER NOT NULL,
+    outlier_count       INTEGER NOT NULL DEFAULT 0,
+    recorded_at         TEXT    NOT NULL,
+    FOREIGN KEY (unit_id) REFERENCES work_units(unit_id)
+);
 """
 
 
@@ -159,6 +181,7 @@ class PerJobDatabaseFactory:
             _ensure_results_served_weights_columns(db)
             _ensure_results_ran_under_column(db)
             _ensure_work_units_pin_column(db)
+            _ensure_unit_consensus_table(db)
             self._cache[experiment_id] = db
             return db
 
@@ -185,6 +208,7 @@ class PerJobDatabaseFactory:
             _ensure_results_served_weights_columns(db)
             _ensure_results_ran_under_column(db)
             _ensure_work_units_pin_column(db)
+            _ensure_unit_consensus_table(db)
             self._cache[experiment_id] = db
             return db
 
@@ -266,6 +290,30 @@ def _ensure_work_units_pin_column(db: Database) -> None:
     (M4-tail pin / force-assign). Part of PER_JOB_SCHEMA_SQL for new DBs; this
     converges existing per-job DBs. NULL = unpinned (every existing unit)."""
     _add_columns_idempotent(db, "work_units", (("pinned_worker_id", "TEXT"),))
+
+
+def _ensure_unit_consensus_table(db: Database) -> None:
+    """Idempotently create the C7 Inc 4 `unit_consensus` evidence table on
+    existing per-job DBs (part of PER_JOB_SCHEMA_SQL for new ones). Old
+    experiments simply have no rows — their attestation leaves keep the
+    promoted replica's semantic hash, so already-persisted roots rebuild
+    byte-identically."""
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS unit_consensus (
+            unit_id             TEXT    PRIMARY KEY,
+            method              TEXT    NOT NULL,
+            representative_json TEXT,
+            representative_hash TEXT,
+            spread_json         TEXT,
+            envelope_json       TEXT,
+            agreeing_workers    INTEGER NOT NULL,
+            outlier_count       INTEGER NOT NULL DEFAULT 0,
+            recorded_at         TEXT    NOT NULL,
+            FOREIGN KEY (unit_id) REFERENCES work_units(unit_id)
+        )
+        """
+    )
 
 
 def _ensure_results_retention_columns(db: Database) -> None:
