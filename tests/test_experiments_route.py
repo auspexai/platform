@@ -938,3 +938,104 @@ def test_experiment_phase_submitted_awaits_assessment(
         tenant_id=binding.tenant_id, tenant_experiment_label="sub-phase", manifest_hash=_hash
     )
     assert _experiment_phase(sub, per_job_factory, datetime.now(UTC)) == "awaiting_assessment"
+
+
+# ---- D16.2: pre-registration at submit --------------------------------------
+
+_PR_FS = {
+    "probe_id": {
+        "meaning": "which probe",
+        "kind": "categorical",
+        "role": "key",
+        "change_means": "different probe",
+        "categories": ["p-a"],
+    },
+    "lexical.type_token_ratio": {
+        "meaning": "ttr",
+        "kind": "numeric",
+        "role": "summary",
+        "range": {"min": 0.0, "max": 1.0},
+        "change_means": "vocab shift",
+        "comparison": {"rule": "numeric", "rel": 0.02},
+    },
+}
+_PR_BLOCK = {
+    "hypothesis": "responses to each fixed probe are stable across rounds",
+    "analysis_method": "per probe_id, compare the consensus vector round-over-round",
+    "features": ["lexical.type_token_ratio"],
+    "timescale": "intra_experiment_rounds",
+    "decision_rule": "drift IFF the consensus vector exits the declared envelope",
+    "expected_result": "no probe drifts",
+    "stopping_rule": "converge-on-stability; not data-peeking-dependent",
+    "comparison_keys": ["probe_id"],
+}
+
+
+def test_submit_pre_registered_records_anchor(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """D16.2: a valid pre-registered v0.4 manifest submits (201), and the
+    coordinator COSE-signs + persists the submit-time anchor row (placeholder
+    Rekor sentinels — the hourly backfill anchors) + audits it."""
+    privkey, binding = registered_tenant
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "prereg-001",
+            schema_version="0.4",
+            feature_schema=_PR_FS,
+            pre_registration=dict(_PR_BLOCK),
+        ),
+    )
+    assert response.status_code == 201, response.text
+    exp_id = response.json()["experiment_id"]
+    rec = client.app.state.pre_registration_repository.get(exp_id)
+    assert rec is not None and not rec.anchored
+    assert rec.manifest_hash == response.json()["manifest_hash"]
+    actions = [a.action for a in client.app.state.audit_repository.latest(limit=20)]
+    assert "pre_registration.recorded" in actions
+
+
+def test_submit_invalid_pre_registration_rejected(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """A pre-registration naming an undeclared feature is refused BEFORE storage
+    — a malformed design never gets an anchor."""
+    privkey, binding = registered_tenant
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "prereg-bad-001",
+            schema_version="0.4",
+            feature_schema=_PR_FS,
+            pre_registration={**_PR_BLOCK, "features": ["not.declared"]},
+        ),
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["error"]["code"] == "pre_registration_invalid"
+
+
+def test_submit_v04_feature_schema_only_accepted(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """The D16.1 gate accepts v0.4 (a superset of v0.3) — a v0.4 manifest
+    declaring only a feature_schema must not be rejected."""
+    privkey, binding = registered_tenant
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "v04-fs-001",
+            schema_version="0.4",
+            feature_schema=_PR_FS,
+        ),
+    )
+    assert response.status_code == 201, response.text

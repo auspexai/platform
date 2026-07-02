@@ -451,6 +451,11 @@ class ResultSetAttestation:
     # flag is part of the COSE-signed predicate (tamper-evident), so a verifier
     # can never mistake a partial set for the complete one.
     partial: bool = False
+    # D16.2 (maximal tier): the submit-time pre-registration reference
+    # {manifest_hash, rekor_log_index, rekor_entry_uuid, submitted_at} — the
+    # published finding is cryptographically bound to the design it claims to
+    # test. Predicate-only; None when the experiment was not pre-registered.
+    pre_registration: dict | None = None
 
 
 def build_result_set_attestation(
@@ -465,6 +470,7 @@ def build_result_set_attestation(
     schema_version: int = 1,
     diverged_units: list[DivergedUnitEntry] | None = None,
     governance_footprint: dict | None = None,
+    pre_registration: dict | None = None,
 ) -> ResultSetAttestation:
     """Build + COSE-sign (+ Rekor-anchor) the result-set attestation. Pure given
     its inputs — the same set yields a byte-identical root, so the endpoint can
@@ -516,6 +522,12 @@ def build_result_set_attestation(
     }
     if partial:
         predicate["partial"] = True
+    # D16.2 (§4 maximal tier): bind the finding to its pre-registered design —
+    # the submit-time anchor reference rides the signed predicate. Omitted when
+    # the experiment was not pre-registered, so those predicates stay
+    # byte-identical to the pre-D16.2 format.
+    if schema_version >= 1 and pre_registration is not None:
+        predicate["pre_registration"] = pre_registration
     # Firewall #1 (G4): diverged units ride the predicate (coordinator-asserted,
     # not leaf-bound — the root is unchanged). Omitted entirely when empty so an
     # all-agreeing run's predicate stays byte-identical to the pre-firewall format.
@@ -569,4 +581,5 @@ def build_result_set_attestation(
         partial=partial,
         diverged_units=diverged_ordered,
         governance_footprint=governance_footprint,
+        pre_registration=pre_registration,
     )

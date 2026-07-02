@@ -40,6 +40,11 @@ class BackfillReport:
     candidates: int = 0
     anchored: list[str] = field(default_factory=list)  # attestation_ids newly anchored
     failed: list[str] = field(default_factory=list)  # left un-anchored for next run
+    # D16.2: submit-time pre-registration anchors swept by the same run (Q1:
+    # reuse the hourly timer). Keyed by experiment_id.
+    prereg_candidates: int = 0
+    prereg_anchored: list[str] = field(default_factory=list)
+    prereg_failed: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         verb = "anchored" if self.applied else "would anchor"
@@ -52,9 +57,18 @@ class BackfillReport:
         )
         if self.failed:
             head += f", {len(self.failed)} failed (left un-anchored)"
+        pcount = len(self.prereg_anchored) if self.applied else self.prereg_candidates
+        head += f"; {self.prereg_candidates} un-anchored pre-registration(s), {verb} {pcount}"
+        if self.prereg_failed:
+            head += f", {len(self.prereg_failed)} failed"
         lines = [head]
         lines += [f"  - {aid}: anchored" for aid in self.anchored]
         lines += [f"  - {aid}: FAILED (left un-anchored for next run)" for aid in self.failed]
+        lines += [f"  - pre-registration {eid}: anchored" for eid in self.prereg_anchored]
+        lines += [
+            f"  - pre-registration {eid}: FAILED (left un-anchored for next run)"
+            for eid in self.prereg_failed
+        ]
         return "\n".join(lines)
 
 
@@ -73,9 +87,15 @@ def backfill_rekor_anchors(
     degraded response) is treated as a no-op — the row is NOT stamped with a
     placeholder, so it stays a candidate for the next real run.
     """
+    from auspexai_platform.db.repositories import PreRegistrationRepository
+
     repo = AttestationRepository(control_db)
+    prereg_repo = PreRegistrationRepository(control_db)
     candidates = repo.list_unanchored()
-    report = BackfillReport(applied=apply, candidates=len(candidates))
+    prereg_candidates = prereg_repo.list_unanchored()
+    report = BackfillReport(
+        applied=apply, candidates=len(candidates), prereg_candidates=len(prereg_candidates)
+    )
     if not apply:
         return report
     for rec in candidates:
@@ -102,4 +122,29 @@ def backfill_rekor_anchors(
             ),
         )
         report.anchored.append(rec.attestation_id)
+
+    # D16.2 (Q1, ratified): the same sweep anchors the SUBMIT-TIME
+    # pre-registration statements — the anchor whose timestamp must precede the
+    # result attestation's (`design ≺ data`). Same idempotency + per-row fault
+    # tolerance; a NoOp/degraded response leaves the row a candidate.
+    for prec in prereg_candidates:
+        try:
+            entry = rekor_client.record(prec.cose_signed_blob)
+        except Exception:
+            logger.exception(
+                "rekor backfill failed for pre-registration %s; leaving un-anchored",
+                prec.experiment_id,
+            )
+            report.prereg_failed.append(prec.experiment_id)
+            continue
+        if entry.entry_uuid == REKOR_PLACEHOLDER_UUID:
+            report.prereg_failed.append(prec.experiment_id)
+            continue
+        prereg_repo.set_rekor(
+            prec.experiment_id,
+            log_index=entry.log_index,
+            entry_uuid=entry.entry_uuid,
+            inclusion_proof=entry.inclusion_proof or None,
+        )
+        report.prereg_anchored.append(prec.experiment_id)
     return report

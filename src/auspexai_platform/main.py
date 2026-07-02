@@ -185,6 +185,7 @@ def create_app(
     retired_key_repository = svc.retired_key_repository
     receipt_index_repository = svc.receipt_index_repository
     attestation_repository = svc.attestation_repository
+    pre_registration_repository = svc.pre_registration_repository
     certified_profile_repository = svc.certified_profile_repository
     result_transfer_repository = svc.result_transfer_repository
     model_prestage_repository = svc.model_prestage_repository
@@ -274,6 +275,7 @@ def create_app(
     app.state.account_repository = account_repository
     app.state.tenant_repository = tenant_repository
     app.state.manifest_repository = manifest_repository
+    app.state.pre_registration_repository = pre_registration_repository
     app.state.experiment_repository = experiment_repository
     app.state.audit_repository = audit_repository
     app.state.worker_repository = worker_repository
@@ -328,6 +330,7 @@ def create_app(
             receipt_index_repository=receipt_index_repository,
             signing_key=receipt_signing_key,
             attestation_repository=attestation_repository,
+            pre_registration_repository=pre_registration_repository,
             certified_profile_repository=certified_profile_repository,
             account_repository=account_repository,  # Tier-1 account-run gate
             tenant_tier=_tenant_tier,  # §9 #48 class-by-tier auto-approval
@@ -454,6 +457,7 @@ def create_app(
             manifest_repository=manifest_repository,
             prestage_repository=model_prestage_repository,
             attestation_repository=attestation_repository,
+            pre_registration_repository=pre_registration_repository,
             promotion_auto_t1_t2=_promotion_auto_t1_t2,
             governance_footprint_builder=_governance_footprint_for,
             trust_model_policy_repository=trust_model_policy_repository,
@@ -497,6 +501,7 @@ def create_app(
             signing_key=receipt_signing_key,
             audit_repository=audit_repository,
             attestation_repository=attestation_repository,
+            pre_registration_repository=pre_registration_repository,
             governance_footprint_builder=_governance_footprint_for,
         ),
         prefix="/api/v0",

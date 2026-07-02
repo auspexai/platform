@@ -356,6 +356,7 @@ def settle_sweep(
                     event_bus=None,
                     governance_footprint_builder=svc.governance_footprint_for,
                     manifest_repository=svc.manifest_repository,
+                    pre_registration_repository=svc.pre_registration_repository,
                 )
             if starved is not None:
                 report.paused.append(starved)

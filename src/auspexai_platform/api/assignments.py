@@ -280,6 +280,7 @@ def build_router(
     manifest_repository=None,  # M3b conductor: read acquisition coords from the manifest
     prestage_repository=None,  # M3b conductor: the model_prestage table
     attestation_repository: AttestationRepository | None = None,  # A1: persist on complete
+    pre_registration_repository=None,  # D16.2: bind the attestation to the design
     # §6.2 promotion mode: () -> bool, True when T1->T2 auto-promotion is enabled
     # (auto_with_override). Unwired (tests) defaults to True = behavior-preserving.
     promotion_auto_t1_t2=None,
@@ -884,6 +885,7 @@ def build_router(
                 event_bus=event_bus,
                 governance_footprint_builder=governance_footprint_builder,
                 manifest_repository=manifest_repository,
+                pre_registration_repository=pre_registration_repository,
             )
 
         return ResultSubmissionResponse(
@@ -1088,6 +1090,7 @@ def _maybe_emit_completion_attestation(
     attestation_repository: AttestationRepository | None = None,
     event_bus=None,
     governance_footprint_builder=None,
+    pre_registration_repository=None,  # D16.2: bind the finding to its design
 ) -> None:
     """If the experiment is now COMPLETED, build + PERSIST (+ audit + emit) the
     canonical result-set completion attestation (#34 §6.3, M7-tail / A1).
@@ -1133,6 +1136,13 @@ def _maybe_emit_completion_attestation(
             )
             raise
         emit_diverged = collect_diverged_units(per_job_db)
+        # D16.2 (maximal tier): the submit-time pre-registration reference rides
+        # the signed predicate — the finding is bound to the design it tested.
+        prereg = (
+            pre_registration_repository.get(experiment_id)
+            if pre_registration_repository is not None
+            else None
+        )
         attestation = build_result_set_attestation(
             attestation_id=f"att-{secrets.token_urlsafe(9)}",
             tenant_experiment_label=experiment.tenant_experiment_label,
@@ -1146,6 +1156,7 @@ def _maybe_emit_completion_attestation(
                 if governance_footprint_builder is not None
                 else None
             ),
+            pre_registration=prereg.predicate_ref() if prereg is not None else None,
         )
         if attestation_repository is not None:
             try:
@@ -1219,6 +1230,7 @@ def finalize_completed_unit(
     event_bus=None,
     governance_footprint_builder=None,
     manifest_repository=None,  # C7: resolves manifest_json so within_cell_tolerance reads its envelope
+    pre_registration_repository=None,  # D16.2: bind the attestation to the pre-registered design
 ) -> None:
     """Post-completion processing for a unit that JUST transitioned to `completed`:
     issue receipts (best-effort), promote the consensus result, run the worker
@@ -1373,6 +1385,7 @@ def finalize_completed_unit(
         attestation_repository=attestation_repository,
         event_bus=event_bus,
         governance_footprint_builder=governance_footprint_builder,
+        pre_registration_repository=pre_registration_repository,
     )
 
 

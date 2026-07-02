@@ -266,6 +266,7 @@ def build_router(
     audit_repository,
     attestation_repository: AttestationRepository | None = None,
     governance_footprint_builder=None,  # firewall #2: (experiment, entries, diverged, db) -> dict
+    pre_registration_repository=None,  # D16.2: bind the attestation to the design
 ) -> APIRouter:
     router = APIRouter()
 
@@ -288,6 +289,14 @@ def build_router(
             if entry.result_id is not None:
                 out[entry.result_id] = entry.receipt_id
         return out
+
+    def _prereg_ref(experiment_id: str) -> dict | None:
+        """D16.2 (maximal tier): the submit-time pre-registration reference the
+        attestation predicate carries; None when not pre-registered."""
+        if pre_registration_repository is None:
+            return None
+        rec = pre_registration_repository.get(experiment_id)
+        return rec.predicate_ref() if rec is not None else None
 
     def _unit_from_entry(e: ResultSetEntry) -> AttestationUnit:
         return AttestationUnit(
@@ -525,6 +534,7 @@ def build_router(
             partial=partial,
             diverged_units=diverged,
             governance_footprint=footprint,
+            pre_registration=_prereg_ref(experiment_id),
         )
 
         # A1 lazy canonicalize-on-read: persist a freshly-built FINAL attestation
@@ -629,6 +639,14 @@ def build_router(
         uc_evidence = (
             UnitConsensusRepository(per_job_db).map_all() if per_job_db is not None else {}
         )
+        # D16.2: the submit-time pre-registration anchor ships in the bundle so a
+        # verifier checks `design ≺ data` + analysis-matches-declared OFFLINE
+        # (the block itself is in the bundled signed manifest).
+        prereg_rec = (
+            pre_registration_repository.get(experiment_id)
+            if pre_registration_repository is not None
+            else None
+        )
 
         results_out: list[dict[str, Any]] = []
         receipts_out: list[dict[str, Any]] = []
@@ -713,6 +731,7 @@ def build_router(
                 rekor_client=None,
                 partial=False,
                 diverged_units=lazy_diverged,
+                pre_registration=_prereg_ref(experiment_id),
                 governance_footprint=(
                     governance_footprint_builder(
                         experiment, lazy_entries, lazy_diverged, per_job_db
@@ -898,6 +917,19 @@ def build_router(
             "unit_consensus": [
                 {"unit_id": uid, **rec.evidence_dict()} for uid, rec in sorted(uc_evidence.items())
             ],
+            "pre_registration": (
+                {
+                    "manifest_hash": prereg_rec.manifest_hash,
+                    "submitted_at": prereg_rec.submitted_at,
+                    "cose_b64": b64encode(prereg_rec.cose_signed_blob).decode(),
+                    "signing_key_pubkey_hex": prereg_rec.signing_key_pubkey_hex,
+                    "rekor_log_index": prereg_rec.rekor_log_index,
+                    "rekor_entry_uuid": prereg_rec.rekor_entry_uuid,
+                    "rekor_inclusion_proof": prereg_rec.rekor_inclusion_proof,
+                }
+                if prereg_rec is not None
+                else None
+            ),
             "receipts": receipts_out,
             "attestation": attestation_out,
             "transfer": {

@@ -69,7 +69,12 @@ from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.feature_schema import validate_feature_schema
 from auspexai_platform.maintenance import projected_raw_age_off
-from auspexai_platform.receipts.signing import SigningKey
+from auspexai_platform.pre_registration import (
+    build_pre_registration_predicate,
+    validate_pre_registration,
+)
+from auspexai_platform.receipts.intoto import build_pre_registration_statement
+from auspexai_platform.receipts.signing import SigningKey, cose_sign1_encode
 from auspexai_platform.receipts.tolerance import validate_tolerance_reducer
 from auspexai_platform.scheduler import (
     is_sub_floor_policy,
@@ -557,6 +562,7 @@ def build_router(
     receipt_index_repository: ReceiptIndexRepository | None = None,
     signing_key: SigningKey | None = None,
     attestation_repository: AttestationRepository | None = None,
+    pre_registration_repository=None,  # D16.2: the submit-time anchor store
     # Promotion-gate certifications (RFC 0001 / Ethics §6.7). Optional so the
     # router builds in tests without it; absent → no run is ever certified-cleared.
     certified_profile_repository: CertifiedProfileRepository | None = None,
@@ -737,7 +743,8 @@ def build_router(
         # retained), so it must be well-formed and contained at submit.
         feature_schema = body.manifest.get("feature_schema")
         if feature_schema is not None:
-            if str(body.manifest.get("schema_version")) != "0.3":
+            # v0.4 (D16.2) is a superset of v0.3 — feature_schema is a member of both.
+            if str(body.manifest.get("schema_version")) not in ("0.3", "0.4"):
                 raise HTTPException(
                     status_code=422,  # UNPROCESSABLE_CONTENT
                     detail={
@@ -745,7 +752,7 @@ def build_router(
                             "code": "feature_schema_requires_v0_3",
                             "message": (
                                 "a manifest declaring feature_schema must set "
-                                'schema_version "0.3" (D16.1)'
+                                'schema_version "0.3" or later (D16.1)'
                             ),
                         }
                     },
@@ -797,6 +804,28 @@ def build_router(
                                 "are inconsistent (no agreement predicate)"
                             ),
                             "details": {"errors": tol_errors[:20]},
+                        }
+                    },
+                )
+
+        # D16.2: a declared pre_registration must be well-formed, §7-safe, and
+        # CHECKABLE against this same manifest (features exist in the
+        # feature_schema and carry the comparison envelope the design
+        # pre-registers) BEFORE storage — a malformed design never gets an
+        # anchor. Mirror validation; the coordinator does not import the SDK.
+        if body.manifest.get("pre_registration") is not None:
+            pr_errors = validate_pre_registration(body.manifest)
+            if pr_errors:
+                raise HTTPException(
+                    status_code=422,  # UNPROCESSABLE_CONTENT
+                    detail={
+                        "error": {
+                            "code": "pre_registration_invalid",
+                            "message": (
+                                "the declared pre_registration is malformed or not "
+                                "checkable against this manifest (D16.2)"
+                            ),
+                            "details": {"errors": pr_errors[:20]},
                         }
                     },
                 )
@@ -965,6 +994,65 @@ def build_router(
                 else None,
             },
         )
+
+        # D16.2 (§4 strong tier): COSE-sign + persist the SUBMIT-TIME
+        # pre-registration anchor. Placeholder Rekor sentinels; the hourly A2
+        # backfill anchors it publicly — its timestamp then provably precedes
+        # the result attestation's completion-time anchor (`design ≺ data`).
+        # Best-effort: a failure never blocks the submit (the minimum tier —
+        # tenant-signed manifest + the audit timestamp above — already holds,
+        # and the citable/DOI gate fails CLOSED on a missing row), but it is
+        # audited loudly because the row is load-bearing for citation.
+        if (
+            body.manifest.get("pre_registration") is not None
+            and pre_registration_repository is not None
+            and signing_key is not None
+        ):
+            try:
+                predicate_cbor = build_pre_registration_predicate(
+                    manifest_hash=experiment.manifest_hash,
+                    tenant_id=experiment.tenant_id,
+                    tenant_experiment_label=experiment.tenant_experiment_label,
+                    pre_registration=body.manifest["pre_registration"],
+                    submitted_at=experiment.submitted_at.isoformat(),
+                )
+                statement_cbor = build_pre_registration_statement(
+                    predicate_cbor=predicate_cbor,
+                    experiment_id=experiment.experiment_id,
+                )
+                blob = cose_sign1_encode(payload=statement_cbor, signing_key=signing_key)
+                pre_registration_repository.insert(
+                    experiment_id=experiment.experiment_id,
+                    tenant_id=experiment.tenant_id,
+                    tenant_experiment_label=experiment.tenant_experiment_label,
+                    manifest_hash=experiment.manifest_hash,
+                    cose_signed_blob=blob,
+                    signing_key_pubkey_hex=signing_key.pubkey_hex,
+                    submitted_at=experiment.submitted_at.isoformat(),
+                )
+                audit_repository.append(
+                    actor_class=CredentialClass.SYSTEM,
+                    actor_identifier="coordinator",
+                    action="pre_registration.recorded",
+                    resource_type="experiment",
+                    resource_id=experiment.experiment_id,
+                    payload={"manifest_hash": experiment.manifest_hash},
+                )
+            except Exception:
+                logger.exception(
+                    "pre_registration anchor write failed for %s — the minimum tier "
+                    "(signed manifest + audit timestamp) holds; the citable gate "
+                    "will fail closed without this row",
+                    experiment.experiment_id,
+                )
+                audit_repository.append(
+                    actor_class=CredentialClass.SYSTEM,
+                    actor_identifier="coordinator",
+                    action="pre_registration.record_failed",
+                    resource_type="experiment",
+                    resource_id=experiment.experiment_id,
+                    payload={"manifest_hash": experiment.manifest_hash},
+                )
 
         # C7 Inc 3: the exact-without-pin footgun. Byte-exact hash agreement on a
         # BYO / heterogeneous fleet predictably diverges unless the serving stack is
@@ -1587,6 +1675,7 @@ def build_router(
                         # attestation too — it MUST carry the footprint (the
                         # bug a live D6 run surfaced: emit here lacked it).
                         governance_footprint_builder=governance_footprint_builder,
+                        pre_registration_repository=pre_registration_repository,
                     )
                 updated = experiment_repository.get_by_id(experiment_id) or updated
         return filter_for_credential(

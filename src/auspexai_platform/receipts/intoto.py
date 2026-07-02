@@ -25,6 +25,9 @@ AUSPEXAI_RESULT_SET_PREDICATE_TYPE = "https://auspexai.network/result-set/v0"
 # unit_payload_sha256; predicate units carry coordinator-asserted environment.
 AUSPEXAI_RESULT_SET_PREDICATE_TYPE_V1 = "https://auspexai.network/result-set/v1"
 
+# D16.2: the submit-time pre-registration anchor's predicate type.
+AUSPEXAI_PRE_REGISTRATION_PREDICATE_TYPE = "https://auspexai.network/pre-registration/v0"
+
 
 def build_statement(
     *,
@@ -75,6 +78,32 @@ def build_result_set_statement(
             }
         ],
         "predicateType": predicate_type,
+        "predicate": predicate_cbor,
+    }
+    return cbor2.dumps(statement, canonical=True)
+
+
+def build_pre_registration_statement(
+    *,
+    predicate_cbor: bytes,
+    experiment_id: str,
+) -> bytes:
+    """Build an in-toto v1 Statement wrapping a pre-registration predicate
+    (D16.2, preregistration_design.md §4). Mirrors `build_result_set_statement`
+    with the pre-registration predicate type; the subject binds the experiment
+    id + a SHA-256 digest of the predicate body. COSE-signed at SUBMIT and
+    Rekor-anchored (the hourly backfill), so its anchor timestamp precedes the
+    result attestation's — `design ≺ data`, publicly provable."""
+    predicate_digest = hashlib.sha256(predicate_cbor).hexdigest()
+    statement = {
+        "_type": INTOTO_STATEMENT_TYPE,
+        "subject": [
+            {
+                "name": f"auspexai:pre-registration/{experiment_id}",
+                "digest": {"sha256": predicate_digest},
+            }
+        ],
+        "predicateType": AUSPEXAI_PRE_REGISTRATION_PREDICATE_TYPE,
         "predicate": predicate_cbor,
     }
     return cbor2.dumps(statement, canonical=True)
