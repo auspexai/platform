@@ -28,6 +28,7 @@ from auspexai_platform.db.repositories import (
     ExperimentRepository,
     ManifestRepository,
     ModelPrestageRepository,
+    PreRegistrationDeviationRepository,
     PreRegistrationRepository,
     PromotionPolicyRepository,
     ReceiptIndexRepository,
@@ -71,6 +72,7 @@ class CoordinatorServices:
     receipt_index_repository: ReceiptIndexRepository
     attestation_repository: AttestationRepository
     pre_registration_repository: PreRegistrationRepository
+    pre_registration_deviation_repository: PreRegistrationDeviationRepository
     certified_profile_repository: CertifiedProfileRepository
     result_transfer_repository: ResultTransferRepository
     model_prestage_repository: ModelPrestageRepository
@@ -120,6 +122,7 @@ def build_coordinator_services(
     receipt_index_repository = ReceiptIndexRepository(db)
     attestation_repository = AttestationRepository(db)
     pre_registration_repository = PreRegistrationRepository(db)
+    pre_registration_deviation_repository = PreRegistrationDeviationRepository(db)
     certified_profile_repository = CertifiedProfileRepository(db)
     result_transfer_repository = ResultTransferRepository(db)
     model_prestage_repository = ModelPrestageRepository(db)
@@ -281,6 +284,7 @@ def build_coordinator_services(
         certified_profile_repository=certified_profile_repository,
         attestation_repository=attestation_repository,
         pre_registration_repository=pre_registration_repository,
+        pre_registration_deviation_repository=pre_registration_deviation_repository,
         result_transfer_repository=result_transfer_repository,
         model_prestage_repository=model_prestage_repository,
         software_request_repository=software_request_repository,

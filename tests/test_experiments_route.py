@@ -1039,3 +1039,163 @@ def test_submit_v04_feature_schema_only_accepted(
         ),
     )
     assert response.status_code == 201, response.text
+
+
+# ---- D16.2-D: deviation records ----------------------------------------------
+
+
+def _declare_deviation(client, privkey, pubkey_hex, exp_id, manifest_hash, what, why):
+    """Sign the canonical declaration with the TENANT key and POST it (the SDK
+    `experiment deviate` convention)."""
+    import base64
+
+    from auspexai_platform.pre_registration import canonical_deviation_bytes
+
+    sig = base64.b64encode(privkey.sign(canonical_deviation_bytes(manifest_hash, what, why)))
+    body = {"what_changed": what, "why": why, "tenant_signature_b64": sig.decode()}
+    raw = json.dumps(body).encode()
+    path = f"/api/v0/experiments/{exp_id}/pre-registration/deviations"
+    headers = sign_request(
+        privkey=privkey,
+        pubkey_hex=pubkey_hex,
+        method="POST",
+        path=path,
+        authority="testserver",
+        body=raw,
+    )
+    headers["Content-Type"] = "application/json"
+    return client.post(path, headers=headers, content=raw)
+
+
+def _submit_pre_registered(client, privkey, binding, label):
+    resp = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            label,
+            schema_version="0.4",
+            feature_schema=_PR_FS,
+            pre_registration=dict(_PR_BLOCK),
+        ),
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["experiment_id"], resp.json()["manifest_hash"]
+
+
+def test_declare_deviation_appends_signed_record(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """§5: a deviation is a NEW signed record referencing the original — the
+    original row is untouched; a second declaration appends, never edits."""
+    privkey, binding = registered_tenant
+    exp_id, mh = _submit_pre_registered(client, privkey, binding, "dev-appends-001")
+
+    r1 = _declare_deviation(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        exp_id,
+        mh,
+        "widened the ttr envelope for the exploratory follow-up",
+        "the pre-registered envelope excluded a legitimate serving-band effect",
+    )
+    assert r1.status_code == 201, r1.text
+    assert r1.json()["manifest_hash"] == mh
+    assert r1.json()["rekor_entry_uuid"] == "lab-mode-no-rekor"  # pends the sweep
+
+    r2 = _declare_deviation(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        exp_id,
+        mh,
+        "added an unplanned per-band stratification",
+        "the cross-band split emerged in the data; reported as exploratory",
+    )
+    assert r2.status_code == 201
+    # Append-only history, in declaration order; the original prereg untouched.
+    devs = client.app.state.pre_registration_deviation_repository.list_for_experiment(exp_id)
+    assert len(devs) == 2
+    assert client.app.state.pre_registration_repository.get(exp_id).manifest_hash == mh
+    actions = [a.action for a in client.app.state.audit_repository.latest(limit=10)]
+    assert "pre_registration.deviation_recorded" in actions
+
+
+def test_declare_deviation_requires_pre_registration(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    privkey, binding = registered_tenant
+    resp = _submit_as_researcher(
+        client, privkey, binding.pubkey_hex, _manifest(binding.tenant_id, "dev-nopr-001")
+    )
+    exp_id = resp.json()["experiment_id"]
+    r = _declare_deviation(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        exp_id,
+        "ab" * 32,
+        "changed the analysis method entirely",
+        "no pre-registration exists so this must be refused",
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"]["error"]["code"] == "not_pre_registered"
+
+
+def test_declare_deviation_bad_signature_rejected(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """The declaration signature must verify against the AUTHENTICATED caller's
+    key over the canonical bytes — a signature over different content fails."""
+    import base64
+
+    from auspexai_platform.pre_registration import canonical_deviation_bytes
+
+    privkey, binding = registered_tenant
+    exp_id, mh = _submit_pre_registered(client, privkey, binding, "dev-badsig-001")
+    # Sign DIFFERENT content than what is submitted.
+    sig = base64.b64encode(
+        privkey.sign(canonical_deviation_bytes(mh, "something else entirely", "not this"))
+    )
+    body = {
+        "what_changed": "widened the envelope after seeing results",
+        "why": "signature will not match this content",
+        "tenant_signature_b64": sig.decode(),
+    }
+    raw = json.dumps(body).encode()
+    path = f"/api/v0/experiments/{exp_id}/pre-registration/deviations"
+    headers = sign_request(
+        privkey=privkey,
+        pubkey_hex=binding.pubkey_hex,
+        method="POST",
+        path=path,
+        authority="testserver",
+        body=raw,
+    )
+    headers["Content-Type"] = "application/json"
+    r = client.post(path, headers=headers, content=raw)
+    assert r.status_code == 422
+    assert r.json()["detail"]["error"]["code"] == "deviation_signature_invalid"
+
+
+def test_declare_deviation_maintainer_forbidden(
+    client: TestClient,
+    registered_tenant: tuple[Ed25519PrivateKey, object],
+    maintainer_token: str,
+) -> None:
+    """A deviation is the RESEARCHER's declaration — the operator cannot make it."""
+    privkey, binding = registered_tenant
+    exp_id, _mh = _submit_pre_registered(client, privkey, binding, "dev-maint-001")
+    r = client.post(
+        f"/api/v0/experiments/{exp_id}/pre-registration/deviations",
+        headers={"Authorization": f"Bearer {maintainer_token}"},
+        json={
+            "what_changed": "operator attempts a deviation record",
+            "why": "must be refused - not the declarer",
+            "tenant_signature_b64": "AAAA",
+        },
+    )
+    assert r.status_code == 403
+    assert r.json()["detail"]["error"]["code"] == "deviation_declarer_forbidden"

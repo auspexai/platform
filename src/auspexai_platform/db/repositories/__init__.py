@@ -19,6 +19,10 @@ from auspexai_platform.db.repositories.experiments import ExperimentRepository
 from auspexai_platform.db.repositories.manifests import ManifestRepository
 from auspexai_platform.db.repositories.model_prestage import ModelPrestageRepository
 from auspexai_platform.db.repositories.model_requests import ModelRequestRepository
+from auspexai_platform.db.repositories.pre_registration_deviations import (
+    DeviationRecord,
+    PreRegistrationDeviationRepository,
+)
 from auspexai_platform.db.repositories.pre_registrations import (
     PreRegistrationRecord,
     PreRegistrationRepository,
@@ -47,10 +51,12 @@ __all__ = [
     "AttestationRepository",
     "AuditRepository",
     "CertifiedProfileRepository",
+    "DeviationRecord",
     "ExperimentRepository",
     "ManifestRepository",
     "ModelPrestageRepository",
     "ModelRequestRepository",
+    "PreRegistrationDeviationRepository",
     "PreRegistrationRecord",
     "PreRegistrationRepository",
     "PromotionPolicyRepository",

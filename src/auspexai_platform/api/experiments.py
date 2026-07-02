@@ -28,6 +28,7 @@ Manifest submission flow:
 from __future__ import annotations
 
 import logging
+import secrets
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
@@ -70,10 +71,15 @@ from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.feature_schema import validate_feature_schema
 from auspexai_platform.maintenance import projected_raw_age_off
 from auspexai_platform.pre_registration import (
+    build_deviation_predicate,
     build_pre_registration_predicate,
+    canonical_deviation_bytes,
     validate_pre_registration,
 )
-from auspexai_platform.receipts.intoto import build_pre_registration_statement
+from auspexai_platform.receipts.intoto import (
+    build_deviation_statement,
+    build_pre_registration_statement,
+)
 from auspexai_platform.receipts.signing import SigningKey, cose_sign1_encode
 from auspexai_platform.receipts.tolerance import validate_tolerance_reducer
 from auspexai_platform.scheduler import (
@@ -294,6 +300,17 @@ def _experiment_phase(experiment, per_job_factory, now: datetime) -> str | None:
     if in_flight > 0 or completed > 0:
         return "running"
     return "queued"  # pending work, nothing started
+
+
+class DeviationDeclarationRequest(BaseModel):
+    """D16.2-D (§5): a researcher's declaration that the analysis changed after
+    the pre-registered design — what changed and why, signed by the DECLARER
+    over the canonical bytes (manifest_hash + what_changed + why; the SDK's
+    `experiment deviate` convention). Append-only; never an edit."""
+
+    what_changed: str = Field(min_length=10, max_length=2000)
+    why: str = Field(min_length=10, max_length=2000)
+    tenant_signature_b64: str = Field(min_length=1)
 
 
 class ExperimentSubmissionRequest(BaseModel):
@@ -563,6 +580,7 @@ def build_router(
     signing_key: SigningKey | None = None,
     attestation_repository: AttestationRepository | None = None,
     pre_registration_repository=None,  # D16.2: the submit-time anchor store
+    pre_registration_deviation_repository=None,  # D16.2-D: append-only deviations
     # Promotion-gate certifications (RFC 0001 / Ethics §6.7). Optional so the
     # router builds in tests without it; absent → no run is ever certified-cleared.
     certified_profile_repository: CertifiedProfileRepository | None = None,
@@ -1350,6 +1368,159 @@ def build_router(
             event_bus=event_bus,
             extra_payload=override_audit or None,
         )
+
+    @router.post(
+        "/experiments/{experiment_id}/pre-registration/deviations",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def declare_deviation(
+        experiment_id: str,
+        body: DeviationDeclarationRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> dict:
+        """D16.2-D (§5): record an append-only, tenant-signed deviation from the
+        pre-registered design. The DECLARER signs (accountability); the
+        coordinator COSE-signs an anchor statement binding the declaration
+        digest + the coordinator-observed declared_at, Rekor-anchored by the
+        hourly sweep — WHEN the analysis changed is publicly provable. The
+        original pre-registration is never edited. Exploratory analysis is
+        allowed and valuable; these records keep it from masquerading as
+        confirmatory. NOT a maintainer action — a deviation is the researcher's
+        own declaration."""
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None:
+            raise _experiment_not_found(experiment_id)
+        declarer_ok = (
+            credential.is_researcher() and credential.tenant_id == experiment.tenant_id
+        ) or (
+            credential.is_account()
+            and credential.account_id is not None
+            and experiment.submitted_by_account_id == credential.account_id
+        )
+        if not declarer_ok:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": {
+                        "code": "deviation_declarer_forbidden",
+                        "message": (
+                            "a deviation is declared by the experiment's own researcher "
+                            "(or the account that ran it) — not by other parties"
+                        ),
+                    }
+                },
+            )
+        if pre_registration_repository is None or pre_registration_deviation_repository is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"error": {"code": "deviations_unavailable", "message": "not wired"}},
+            )
+        prereg = pre_registration_repository.get(experiment_id)
+        if prereg is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT
+                if hasattr(status, "HTTP_422_UNPROCESSABLE_CONTENT")
+                else 422,
+                detail={
+                    "error": {
+                        "code": "not_pre_registered",
+                        "message": (
+                            "this experiment has no pre-registration — there is no "
+                            "declared design to deviate from (exploratory runs need "
+                            "no deviation records)"
+                        ),
+                    }
+                },
+            )
+        # The DECLARER's signature over the canonical declaration, verified
+        # against the AUTHENTICATED caller's key — nobody can plant a deviation
+        # under someone else's name.
+        from base64 import b64decode as _b64d
+
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        declaration = canonical_deviation_bytes(prereg.manifest_hash, body.what_changed, body.why)
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(credential.pubkey_hex)).verify(
+                _b64d(body.tenant_signature_b64), declaration
+            )
+        except (InvalidSignature, ValueError, TypeError):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": {
+                        "code": "deviation_signature_invalid",
+                        "message": (
+                            "tenant_signature_b64 does not verify over the canonical "
+                            "declaration (manifest_hash + what_changed + why) with the "
+                            "authenticated credential's key"
+                        ),
+                    }
+                },
+            ) from None
+        declared_at = datetime.now(UTC).isoformat()
+        deviation_id = f"dev-{secrets.token_urlsafe(9)}"
+        predicate_cbor = build_deviation_predicate(
+            tenant_experiment_label=experiment.tenant_experiment_label,
+            tenant_id=experiment.tenant_id,
+            manifest_hash=prereg.manifest_hash,
+            what_changed=body.what_changed,
+            why=body.why,
+            tenant_pubkey_hex=credential.pubkey_hex,
+            tenant_signature_b64=body.tenant_signature_b64,
+            declared_at=declared_at,
+        )
+        statement_cbor = build_deviation_statement(
+            predicate_cbor=predicate_cbor, deviation_id=deviation_id
+        )
+        blob = cose_sign1_encode(payload=statement_cbor, signing_key=signing_key)
+        record = pre_registration_deviation_repository.insert(
+            deviation_id=deviation_id,
+            experiment_id=experiment_id,
+            tenant_id=experiment.tenant_id,
+            manifest_hash=prereg.manifest_hash,
+            what_changed=body.what_changed,
+            why=body.why,
+            tenant_pubkey_hex=credential.pubkey_hex,
+            tenant_signature_b64=body.tenant_signature_b64,
+            cose_signed_blob=blob,
+            signing_key_pubkey_hex=signing_key.pubkey_hex,
+            declared_at=declared_at,
+        )
+        audit_repository.append(
+            actor_class=credential.kind,
+            actor_identifier=credential.pubkey_hex,
+            actor_tenant_id=credential.tenant_id,
+            action="pre_registration.deviation_recorded",
+            resource_type="experiment",
+            resource_id=experiment_id,
+            payload={
+                "deviation_id": deviation_id,
+                "manifest_hash": prereg.manifest_hash,
+                "what_changed": body.what_changed[:200],
+            },
+        )
+        return record.bundle_dict()
+
+    @router.get("/experiments/{experiment_id}/pre-registration/deviations")
+    async def list_deviations(
+        experiment_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> dict:
+        """D16.2-D: the experiment's append-only deviation history (owner or
+        maintainer). Empty list = the pre-registered analysis stands unchanged."""
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None or not _can_view(credential, experiment):
+            raise _experiment_not_found(experiment_id)
+        if pre_registration_deviation_repository is None:
+            return {"deviations": []}
+        return {
+            "deviations": [
+                r.bundle_dict()
+                for r in pre_registration_deviation_repository.list_for_experiment(experiment_id)
+            ]
+        }
 
     @router.post("/experiments/{experiment_id}/assessment")
     async def assess_experiment(

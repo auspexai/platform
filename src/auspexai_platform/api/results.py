@@ -267,6 +267,7 @@ def build_router(
     attestation_repository: AttestationRepository | None = None,
     governance_footprint_builder=None,  # firewall #2: (experiment, entries, diverged, db) -> dict
     pre_registration_repository=None,  # D16.2: bind the attestation to the design
+    pre_registration_deviation_repository=None,  # D16.2-D: ship deviations in the bundle
 ) -> APIRouter:
     router = APIRouter()
 
@@ -647,6 +648,16 @@ def build_router(
             if pre_registration_repository is not None
             else None
         )
+        # D16.2-D: the append-only deviation history ships with the bundle —
+        # a reader tells confirmatory from exploratory honestly, offline.
+        deviations_out = (
+            [
+                d.bundle_dict()
+                for d in pre_registration_deviation_repository.list_for_experiment(experiment_id)
+            ]
+            if pre_registration_deviation_repository is not None
+            else []
+        )
 
         results_out: list[dict[str, Any]] = []
         receipts_out: list[dict[str, Any]] = []
@@ -930,6 +941,7 @@ def build_router(
                 if prereg_rec is not None
                 else None
             ),
+            "deviations": deviations_out,
             "receipts": receipts_out,
             "attestation": attestation_out,
             "transfer": {

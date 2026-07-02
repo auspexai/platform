@@ -292,3 +292,30 @@ def test_backfill_anchors_prereg_before_attestation_in_same_sweep(db: Database) 
     prereg_idx = PreRegistrationRepository(db).get("exp-fast").rekor_log_index
     att_idx = AttestationRepository(db).get_by_id("att-fast").rekor_log_index
     assert prereg_idx < att_idx, "design must anchor before data within one sweep"
+
+
+def test_backfill_anchors_deviations(db: Database) -> None:
+    """D16.2-D: deviation anchors ride the same sweep (design-side phase)."""
+    from auspexai_platform.db.repositories import PreRegistrationDeviationRepository
+
+    repo = PreRegistrationDeviationRepository(db)
+    repo.insert(
+        deviation_id="dev-1",
+        experiment_id="exp-d",
+        tenant_id="lab",
+        manifest_hash="ab" * 32,
+        what_changed="widened the envelope for exploratory follow-up",
+        why="a legitimate serving-band effect emerged",
+        tenant_pubkey_hex="cd" * 32,
+        tenant_signature_b64="c2ln",
+        cose_signed_blob=b"\x03",
+        signing_key_pubkey_hex="ab" * 32,
+        declared_at="2026-07-02T00:00:00+00:00",
+    )
+    client = _FakeRekor()
+    backfill_rekor_anchors(db, rekor_client=client, apply=True)
+    rec = repo.get("dev-1")
+    assert rec.anchored and rec.rekor_log_index >= 5000
+    assert repo.list_unanchored() == []
+    d = rec.bundle_dict()
+    assert d["what_changed"].startswith("widened") and d["cose_b64"]

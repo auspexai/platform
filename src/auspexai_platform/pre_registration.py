@@ -21,6 +21,8 @@ Two public surfaces:
 
 from __future__ import annotations
 
+import hashlib
+import json as _json
 from typing import Any
 
 import cbor2
@@ -134,5 +136,53 @@ def build_pre_registration_predicate(
         "experiment_id": tenant_experiment_label,
         "pre_registration": pre_registration,
         "submitted_at": submitted_at,
+    }
+    return cbor2.dumps(predicate, canonical=True)
+
+
+# ── D16.2-D: deviations (§5) ──────────────────────────────────────────────────
+
+# Length bounds for the declaration's free-text members (mirrored by the SDK).
+DEVIATION_TEXT_BOUNDS = (10, 2000)
+
+
+def canonical_deviation_bytes(manifest_hash: str, what_changed: str, why: str) -> bytes:
+    """The canonical declaration the TENANT signs (mirrored byte-for-byte by the
+    SDK's `experiment deviate`): the original design's manifest hash + what
+    changed + why. Sorted keys, compact separators — the manifest-signing
+    convention applied to the deviation."""
+    return _json.dumps(
+        {"manifest_hash": manifest_hash, "what_changed": what_changed, "why": why},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def build_deviation_predicate(
+    *,
+    tenant_experiment_label: str,
+    tenant_id: str,
+    manifest_hash: str,
+    what_changed: str,
+    why: str,
+    tenant_pubkey_hex: str,
+    tenant_signature_b64: str,
+    declared_at: str,
+) -> bytes:
+    """Canonical CBOR predicate for a deviation's coordinator anchor. Binds the
+    ORIGINAL design (manifest_hash), the declaration digest, the DECLARER's own
+    signature (accountability travels into the public log), and the
+    coordinator-observed declared_at — so WHEN the analysis changed is publicly
+    provable, separately from the immutable original."""
+    predicate = {
+        "experiment_id": tenant_experiment_label,
+        "tenant_id": tenant_id,
+        "manifest_hash": manifest_hash,
+        "declaration_sha256": hashlib.sha256(
+            canonical_deviation_bytes(manifest_hash, what_changed, why)
+        ).hexdigest(),
+        "tenant_pubkey_hex": tenant_pubkey_hex,
+        "tenant_signature_b64": tenant_signature_b64,
+        "declared_at": declared_at,
     }
     return cbor2.dumps(predicate, canonical=True)

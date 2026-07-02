@@ -87,12 +87,17 @@ def backfill_rekor_anchors(
     degraded response) is treated as a no-op — the row is NOT stamped with a
     placeholder, so it stays a candidate for the next real run.
     """
-    from auspexai_platform.db.repositories import PreRegistrationRepository
+    from auspexai_platform.db.repositories import (
+        PreRegistrationDeviationRepository,
+        PreRegistrationRepository,
+    )
 
     repo = AttestationRepository(control_db)
     prereg_repo = PreRegistrationRepository(control_db)
+    deviation_repo = PreRegistrationDeviationRepository(control_db)
     candidates = repo.list_unanchored()
     prereg_candidates = prereg_repo.list_unanchored()
+    deviation_candidates = deviation_repo.list_unanchored()
     report = BackfillReport(
         applied=apply, candidates=len(candidates), prereg_candidates=len(prereg_candidates)
     )
@@ -126,6 +131,24 @@ def backfill_rekor_anchors(
             inclusion_proof=entry.inclusion_proof or None,
         )
         report.prereg_anchored.append(prec.experiment_id)
+
+    # D16.2-D: deviation anchors ride the same design-side phase.
+    for drec in deviation_candidates:
+        try:
+            entry = rekor_client.record(drec.cose_signed_blob)
+        except Exception:
+            logger.exception(
+                "rekor backfill failed for deviation %s; leaving un-anchored", drec.deviation_id
+            )
+            continue
+        if entry.entry_uuid == REKOR_PLACEHOLDER_UUID:
+            continue
+        deviation_repo.set_rekor(
+            drec.deviation_id,
+            log_index=entry.log_index,
+            entry_uuid=entry.entry_uuid,
+            inclusion_proof=entry.inclusion_proof or None,
+        )
 
     for rec in candidates:
         try:

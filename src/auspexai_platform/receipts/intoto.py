@@ -27,6 +27,8 @@ AUSPEXAI_RESULT_SET_PREDICATE_TYPE_V1 = "https://auspexai.network/result-set/v1"
 
 # D16.2: the submit-time pre-registration anchor's predicate type.
 AUSPEXAI_PRE_REGISTRATION_PREDICATE_TYPE = "https://auspexai.network/pre-registration/v0"
+# D16.2-D: a deviation record's anchor (append-only; §5).
+AUSPEXAI_DEVIATION_PREDICATE_TYPE = "https://auspexai.network/pre-registration-deviation/v0"
 
 
 def build_statement(
@@ -104,6 +106,30 @@ def build_pre_registration_statement(
             }
         ],
         "predicateType": AUSPEXAI_PRE_REGISTRATION_PREDICATE_TYPE,
+        "predicate": predicate_cbor,
+    }
+    return cbor2.dumps(statement, canonical=True)
+
+
+def build_deviation_statement(
+    *,
+    predicate_cbor: bytes,
+    deviation_id: str,
+) -> bytes:
+    """Build an in-toto v1 Statement wrapping a deviation predicate (D16.2-D §5).
+    COSE-signed at declaration and Rekor-anchored by the same sweep as the
+    pre-registration anchors — the deviation's own `declared_at` becomes
+    publicly provable, never a silent edit of the original."""
+    predicate_digest = hashlib.sha256(predicate_cbor).hexdigest()
+    statement = {
+        "_type": INTOTO_STATEMENT_TYPE,
+        "subject": [
+            {
+                "name": f"auspexai:pre-registration-deviation/{deviation_id}",
+                "digest": {"sha256": predicate_digest},
+            }
+        ],
+        "predicateType": AUSPEXAI_DEVIATION_PREDICATE_TYPE,
         "predicate": predicate_cbor,
     }
     return cbor2.dumps(statement, canonical=True)
