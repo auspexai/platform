@@ -253,6 +253,35 @@ def test_submit_rejects_sampling_repl1_when_tier_floors_it_up(
     )
 
 
+def test_submit_accepts_sampling_with_process_only_reducer_any_tier_any_repl(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """C17 (v0.6, ratified 2026-07-03): the observe-only reducer is a declared
+    NON-agreement collection mode, so seeded sampling is coherent with it at ANY
+    effective replication — including a T1 tenant whose repl request floors up
+    (the case the agreement reducers rightly reject). This is the unlock: the
+    eval-sweep archetype at any trust tier."""
+    privkey, binding = registered_tenant  # fresh tenant, no account → T1
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "sampling-observe-001",
+            replication_factor=3,
+            reducer={"kind": "builtin_process_only"},
+            inference_determinism={"temperature": 0.9, "seed": 7, "top_p": 0.9},
+        ),
+    )
+    assert response.status_code == 201, response.text
+    experiment_id = response.json()["experiment_id"]
+    experiment = client.app.state.experiment_repository.get_by_id(experiment_id)
+    assert experiment.required_capabilities.get("features") == ["generation_policy"]
+    # And the maintainer may freely RAISE replication (more observations) —
+    # observe-only is exempt from the sampling raise-guard by design.
+
+
 def test_replication_raise_rejected_on_sampling_experiment(
     client: TestClient,
     registered_tenant: tuple[Ed25519PrivateKey, object],

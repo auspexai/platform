@@ -82,6 +82,13 @@ class WhoamiResponse(BaseModel):
     orcid_id: Annotated[str | None, ExposureTag.ACCOUNT_SCOPED] = Field(
         default=None, description="Account holder only: the linked ORCID iD (D8), if any."
     )
+    # E11 D3a: the identity-verification STAMP's presence (not the timestamp — no
+    # new exposure class). Lets the dashboard tell "linked" from "verified", and
+    # offer re-verify when the stamp is absent but an iD is linked.
+    identity_verified: Annotated[bool | None, ExposureTag.ACCOUNT_SCOPED] = Field(
+        default=None,
+        description="Account holder only: whether identity verification is currently stamped.",
+    )
     # The account-identity root surfaced to the holder so the dashboard Identity
     # card can render the GitHub identity alongside ORCID. `display_name` is the
     # OAuth-verified handle (the GitHub login for a github-rooted account — the
@@ -120,6 +127,7 @@ def build_router(credential_dep, account_repository: AccountRepository | None = 
         rs_threshold = None
         rs_eligible = None
         orcid_id = None
+        identity_verified = None
         display_name = None
         idp = None
         if account_repository is not None and credential.account_id is not None:
@@ -128,6 +136,7 @@ def build_router(credential_dep, account_repository: AccountRepository | None = 
                 suspended_at = account.suspended_at
                 suspension_reason = account.suspension_reason
                 orcid_id = account.orcid_id
+                identity_verified = account.identity_verified_at is not None
                 display_name = account.display_name
                 idp = account.idp.value if account.idp is not None else None
                 rs = account_repository.research_standing_summary(credential.account_id)
@@ -147,6 +156,7 @@ def build_router(credential_dep, account_repository: AccountRepository | None = 
             research_standing_threshold=rs_threshold,
             research_standing_eligible_for_r2=rs_eligible,
             orcid_id=orcid_id,
+            identity_verified=identity_verified,
             display_name=display_name,
             idp=idp,
         )

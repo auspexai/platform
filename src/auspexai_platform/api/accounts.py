@@ -118,6 +118,13 @@ class PromoteRequest(BaseModel):
     reason: str  # AUD-7: mandatory — every trust action carries a recorded reason (matches demote)
     verification_method: IdentityVerificationMethod | None = None
     verification_note: str | None = None
+    # E11 D1 (RATIFIED 2026-07-03): the judgment-tier checklist the maintainer
+    # ticked in the console (identity/clean_record/age/track_record; R3 adds
+    # evidence_reviewed). Recorded VERBATIM into the audit payload — the
+    # checklist IS the record of judgment, never a gate (§3.3: judgment tiers
+    # are never auto-granted; this is legibility + provenance, not mechanics).
+    # Optional: absence = a legacy console / a mechanical-tier promote.
+    checklist: dict[str, bool] | None = None
 
 
 class DemoteRequest(BaseModel):
@@ -145,6 +152,9 @@ class PromoteResearchStandingRequest(BaseModel):
     # default; R0 is the no-account state. One step up at a time.
     target: int = Field(ge=2, le=3)
     reason: str  # mandatory — every trust action carries a recorded reason
+    # E11 D1: the judgment-tier checklist (see PromoteRequest.checklist). The R3
+    # variant carries the extra `evidence_reviewed` item (ratified Q3).
+    checklist: dict[str, bool] | None = None
 
 
 class DemoteResearchStandingRequest(BaseModel):
@@ -722,6 +732,9 @@ def build_router(
                 "affected_worker_ids": affected,
                 "gate_override": bool(gate_warnings),
                 "gate_warnings": gate_warnings,
+                # E11 D1: the judgment checklist, recorded verbatim (None =
+                # legacy console / mechanical-tier promote).
+                "checklist": body.checklist,
             },
         )
 
@@ -799,6 +812,8 @@ def build_router(
                 "reason": body.reason,
                 "gate_override": bool(gate_warnings),
                 "gate_warnings": gate_warnings,
+                # E11 D1: the judgment checklist (R3 adds evidence_reviewed).
+                "checklist": body.checklist,
             },
         )
         return ResearchStandingResponse(

@@ -57,6 +57,10 @@ logger = logging.getLogger(__name__)
 
 HASH_AGREEMENT_METHOD = "builtin_hash_agreement"
 TOLERANCE_METHOD = "builtin_within_cell_tolerance"
+# C17 / manifest v0.6 (process_only_reducer_and_provenance_v0_6_design.md,
+# RATIFIED 2026-07-03): the OBSERVE-ONLY collection mode — no cross-replica
+# agreement is ever claimed; every replica is an independent observation.
+PROCESS_ONLY_METHOD = "builtin_process_only"
 
 
 @dataclass(frozen=True)
@@ -164,6 +168,44 @@ def _reduce_unit(
     WHEN a unit settles is untouched (the floor is read here as the corroboration
     threshold, not re-implemented)."""
     reducer = (manifest or {}).get("reducer") or {}
+    if reducer.get("kind") == PROCESS_ONLY_METHOD:
+        # C17 observe-only: every collected replica is a valid, independent
+        # OBSERVATION — all earn receipts, none is ever an outlier, nothing is
+        # ever `diverged` (no comparison is made). Each receipt records
+        # agreeing_workers=1 (a replica corroborates only itself — the honest
+        # count), so the existing basis classifier yields `process_only` at ANY
+        # replica count, untouched. The evidence row binds a DETERMINISTIC
+        # representative (lexicographic-first observation hash — ratified Q3;
+        # explicitly NOT a consensus claim) as the attestation leaf; the
+        # observation count rides the evidence row and every observation's hash
+        # is durably anchored in the receipts' result_hash_anchors.
+        if not results:
+            outcome = AgreementOutcome(
+                agreed=False,
+                method=PROCESS_ONLY_METHOD,
+                agreeing_workers=0,
+                semantic_hash=None,
+            )
+            return outcome, [], [], None
+        representative_hash = min(_semantic_hash(r) for r in results)
+        outcome = AgreementOutcome(
+            agreed=True,
+            method=PROCESS_ONLY_METHOD,
+            agreeing_workers=1,
+            semantic_hash=representative_hash,
+        )
+        evidence = {
+            "method": PROCESS_ONLY_METHOD,
+            "representative": None,  # there is no consensus value, by design
+            "representative_hash": representative_hash,
+            "spread": None,
+            "envelope": None,
+            # Evidence-only observation count (basis reads the RECEIPTS' honest
+            # agreeing_workers=1, never this row).
+            "agreeing_workers": len(results),
+            "outlier_count": 0,
+        }
+        return outcome, results, [], evidence
     if reducer.get("kind") == TOLERANCE_METHOD:
         feature_schema = (manifest or {}).get("feature_schema") or {}
         tolerance_features = reducer.get("tolerance_features")

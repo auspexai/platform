@@ -387,21 +387,28 @@ def collect_result_set_entries(
             receipt_id = receipt_id_by_result.get(r.result_id)
             if receipt_id is None or r.semantic_hash is None:
                 continue
-            # C7 Inc 4 (design §4 bridge): a tolerance unit's leaf binds the
-            # DETERMINISTIC representative — the canonical consensus value — not
-            # an arbitrarily-promoted replica's variant. Row-less units (exact,
-            # process_only, pre-Inc-4) keep the promoted replica's hash, so
-            # already-persisted roots rebuild byte-identically.
+            # C7 Inc 4 (design §4 bridge): an evidenced unit's leaf binds the
+            # DETERMINISTIC representative — for tolerance, the canonical
+            # consensus value; for C17 observe-only, the lexicographic-first
+            # observation hash (explicitly NOT a consensus claim) — not an
+            # arbitrarily-promoted replica's variant. Row-less units (exact,
+            # repl-1 process_only, pre-Inc-4) keep the promoted replica's hash,
+            # so already-persisted roots rebuild byte-identically. The
+            # `tolerance` predicate block is attached ONLY for the tolerance
+            # method — an observe-only unit has no spread/envelope to claim
+            # (its observation count + hashes live in the evidence row and the
+            # receipts' result anchors).
             uc = consensus_evidence.get(r.unit_id)
             leaf_hash = r.semantic_hash
             tolerance: dict | None = None
             if uc is not None and uc.representative_hash:
                 leaf_hash = uc.representative_hash
-                tolerance = {
-                    "spread": uc.spread,
-                    "outlier_count": uc.outlier_count,
-                    "envelope": uc.envelope,
-                }
+                if uc.method == TOLERANCE_METHOD:
+                    tolerance = {
+                        "spread": uc.spread,
+                        "outlier_count": uc.outlier_count,
+                        "envelope": uc.envelope,
+                    }
             entries.append(
                 ResultSetEntry(
                     unit_id=r.unit_id,

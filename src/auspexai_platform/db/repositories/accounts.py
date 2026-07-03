@@ -173,33 +173,25 @@ class AccountRepository:
         target_tier: TrustTier,
         set_by_class: object | None = None,
     ) -> Account:
-        """Drop trust_tier to target_tier. Revokes identity verification if
-        crossing below T2. Raises AccountNotFoundError if unknown/retired.
-        `set_by_class` (F4) records WHO did it for the governance footprint."""
+        """Drop trust_tier to target_tier. Raises AccountNotFoundError if
+        unknown/retired. `set_by_class` (F4) records WHO did it for the
+        governance footprint.
+
+        E11 D2 (RATIFIED 2026-07-03): a demotion NEVER touches the identity
+        columns — trust and identity are orthogonal facts (identity did not
+        become false because trust dropped), and the old clear-on-demote
+        stranded accounts linked-but-unverified with no UI path back. Actual
+        identity concerns use the deliberate, separately-audited
+        `revoke_identity()` (which also clears `orcid_id`)."""
         set_by = getattr(set_by_class, "value", set_by_class)
         with self.db.transaction() as cur:
-            if target_tier < TrustTier.T2_TRUSTED:
-                cur.execute(
-                    """
-                    UPDATE accounts
-                    SET trust_tier = ?,
-                        tier_set_by_class = ?,
-                        identity_verified_at = NULL,
-                        identity_verified_by = NULL,
-                        identity_verification_method = NULL,
-                        identity_verification_note = NULL
-                    WHERE account_id = ? AND retired_at IS NULL
-                    """,
-                    (int(target_tier), set_by, account_id),
-                )
-            else:
-                cur.execute(
-                    """
-                    UPDATE accounts SET trust_tier = ?, tier_set_by_class = ?
-                    WHERE account_id = ? AND retired_at IS NULL
-                    """,
-                    (int(target_tier), set_by, account_id),
-                )
+            cur.execute(
+                """
+                UPDATE accounts SET trust_tier = ?, tier_set_by_class = ?
+                WHERE account_id = ? AND retired_at IS NULL
+                """,
+                (int(target_tier), set_by, account_id),
+            )
             if cur.rowcount == 0:
                 raise AccountNotFoundError(account_id)
         got = self.get_by_id(account_id)
