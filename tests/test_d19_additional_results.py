@@ -69,7 +69,7 @@ class TestAdditionalResultsExport:
     ):
         privkey, binding, experiment, _mh = approved_experiment
         db = per_job_factory.get_or_create(experiment.experiment_id)
-        _repo, results = _seed_unit(
+        _seed_unit(
             per_job_factory,
             experiment.experiment_id,
             unit_id="u1",
@@ -142,7 +142,7 @@ class TestObservationRetentionTier:
     ):
         _privkey, _binding, experiment, _mh = approved_experiment
         db = per_job_factory.get_or_create(experiment.experiment_id)
-        _repo, results = _seed_unit(
+        _seed_unit(
             per_job_factory,
             experiment.experiment_id,
             unit_id="u1",
