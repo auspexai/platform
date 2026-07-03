@@ -117,6 +117,12 @@ def _result_hash(result: Result) -> str:
             payload=result.payload,
             schema_version=result.schema_version,
             served_weights=result.served_weights,
+            # 2026-07-03 (found by D19's first real anchor recompute): this
+            # call omitted ran_under, so every v2 anchor hashed a body with
+            # ran_under blanked — NOT "the exact bytes the worker signed".
+            # Receipts issued in the bug window (A2#32 → today) keep their
+            # blanked-variant anchors (immutable COSE); the SDK accepts both.
+            ran_under=result.ran_under,
         )
     ).hexdigest()
 

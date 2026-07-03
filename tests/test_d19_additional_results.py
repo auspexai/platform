@@ -167,3 +167,42 @@ class TestObservationRetentionTier:
             )
             is None
         )
+
+
+def test_result_hash_anchor_covers_the_full_v2_signed_body():
+    # 2026-07-03: _result_hash omitted ran_under, so every v2 anchor hashed a
+    # blanked body — caught by D19's first real anchor recompute. The anchor
+    # must equal sha256 of the FULL canonical v2 bytes.
+    from hashlib import sha256
+
+    from auspexai_platform.db.models import Result
+    from auspexai_platform.receipts.issuance import _result_hash
+    from auspexai_platform.result_signature import canonical_result_bytes
+
+    r = Result(
+        result_id="res-1",
+        unit_id="u1",
+        worker_id="wkr-1",
+        worker_pubkey_hex="ab" * 32,
+        exit_code=0,
+        payload={"v": 1},
+        worker_signature="c2ln",
+        completed_at=datetime(2026, 7, 3, tzinfo=UTC),
+        received_at=datetime(2026, 7, 3, tzinfo=UTC),
+        schema_version=2,
+        served_weights={"m": "a" * 64},
+        ran_under="strict",
+    )
+    expected = sha256(
+        canonical_result_bytes(
+            unit_id="u1",
+            worker_pubkey="ab" * 32,
+            completed_at=r.completed_at,
+            exit_code=0,
+            payload={"v": 1},
+            schema_version=2,
+            served_weights={"m": "a" * 64},
+            ran_under="strict",
+        )
+    ).hexdigest()
+    assert _result_hash(r) == expected
