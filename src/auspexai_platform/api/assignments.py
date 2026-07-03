@@ -1333,6 +1333,7 @@ def finalize_completed_unit(
                             envelope=ev["envelope"],
                             agreeing_workers=ev["agreeing_workers"],
                             outlier_count=ev["outlier_count"],
+                            outlier_result_hashes=ev.get("outlier_result_hashes"),
                         )
                     except Exception:
                         logger.exception(

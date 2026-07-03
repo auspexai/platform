@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS unit_consensus (
     envelope_json       TEXT,            -- {feature: comparison rule} in force at issuance
     agreeing_workers    INTEGER NOT NULL,
     outlier_count       INTEGER NOT NULL DEFAULT 0,
+    outlier_hashes_json TEXT,            -- D19: outlier semantic hashes (predicate-anchored; NULL pre-fix)
     recorded_at         TEXT    NOT NULL,
     FOREIGN KEY (unit_id) REFERENCES work_units(unit_id)
 );
@@ -309,11 +310,23 @@ def _ensure_unit_consensus_table(db: Database) -> None:
             envelope_json       TEXT,
             agreeing_workers    INTEGER NOT NULL,
             outlier_count       INTEGER NOT NULL DEFAULT 0,
+            outlier_hashes_json TEXT,
             recorded_at         TEXT    NOT NULL,
             FOREIGN KEY (unit_id) REFERENCES work_units(unit_id)
         )
         """
     )
+    _ensure_unit_consensus_outlier_hashes_column(db)
+
+
+def _ensure_unit_consensus_outlier_hashes_column(db: Database) -> None:
+    """D19 forward-fix: tolerance OUTLIER result hashes were recorded nowhere
+    signed (only `outlier_count`) — so outlier payloads could never be
+    anchor-verified post-hoc. NULL on pre-fix rows: those outliers are simply
+    never exported (anchor-or-omit)."""
+    cols = {r["name"] for r in db.execute("PRAGMA table_info(unit_consensus)")}
+    if "outlier_hashes_json" not in cols:
+        db.execute("ALTER TABLE unit_consensus ADD COLUMN outlier_hashes_json TEXT")
 
 
 def _ensure_results_retention_columns(db: Database) -> None:

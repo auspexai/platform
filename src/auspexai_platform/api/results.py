@@ -230,6 +230,26 @@ def _result_set_root(consensus_results: list[Result]) -> str:
     return hashlib.sha256(json.dumps(items, separators=(",", ":")).encode()).hexdigest()
 
 
+def _drain_non_consensus(per_job_db) -> list[Result]:
+    """EVERY non-promoted row, paged to exhaustion (D19) — same
+    never-from-one-capped-page rule as `_drain_consensus`."""
+    repo = ResultRepository(per_job_db)
+    rows: list[Result] = []
+    after_completed_at: str | None = None
+    after_result_id: str | None = None
+    while True:
+        page = repo.list_non_consensus(
+            limit=MAX_PAGE_SIZE,
+            after_completed_at=after_completed_at,
+            after_result_id=after_result_id,
+        )
+        rows.extend(page)
+        if len(page) < MAX_PAGE_SIZE:
+            return rows
+        after_completed_at = page[-1].completed_at.isoformat()
+        after_result_id = page[-1].result_id
+
+
 def _drain_consensus(per_job_db) -> list[Result]:
     """EVERY consensus row, paged to exhaustion. The export bundle must never
     be built from one capped page: the proof-of-transfer signs the result-set
@@ -700,6 +720,77 @@ def build_router(
                     )
                     seen_receipts.add(rid)
 
+        # ── D19: the non-consensus evidentiary record ─────────────────────────
+        # Basis-labeled + ANCHOR-OR-OMIT (ratified 2026-07-03): a row ships only
+        # if its hash anchors to something already signed —
+        #   observation (builtin_process_only extra replicas) → its OWN receipt;
+        #   diverged (agreement-mode, whole-unit disagreement) → the predicate's
+        #     diverged_units[].result_hashes;
+        #   outlier (tolerance) → the predicate tolerance block's
+        #     outlier_result_hashes (post-forward-fix experiments only).
+        # Agreement DUPLICATES (byte-identical / within-envelope corroboration
+        # byproducts) never export — they carry no information the promoted row
+        # doesn't. Nothing here can masquerade as corroborated evidence: the
+        # section is separate and every row carries integrity_basis.
+        additional_out: list[dict[str, Any]] = []
+        if per_job_db is not None:
+            consensus_units = {r.unit_id for r in consensus}
+            diverged_hashes = {
+                e.unit_id: set(e.result_hashes) for e in collect_diverged_units(per_job_db)
+            }
+            for r in _drain_non_consensus(per_job_db):
+                uc = uc_evidence.get(r.unit_id)
+                rid = rmap.get(r.result_id)
+                basis: str | None = None
+                if uc is not None and uc.method == "builtin_process_only":
+                    basis = "observation" if rid else None
+                elif r.unit_id not in consensus_units:
+                    if r.semantic_hash in diverged_hashes.get(r.unit_id, set()):
+                        basis = "diverged"
+                elif (
+                    uc is not None
+                    and uc.outlier_result_hashes
+                    and r.semantic_hash in uc.outlier_result_hashes
+                ):
+                    basis = "outlier"
+                if basis is None:
+                    continue
+                additional_out.append(
+                    {
+                        "result_id": r.result_id,
+                        "unit_id": r.unit_id,
+                        "integrity_basis": basis,
+                        "semantic_hash": r.semantic_hash,
+                        "payload": None if r.payload_aged_off_at else r.payload,
+                        "aged_off": r.payload_aged_off_at is not None,
+                        "worker_signature": r.worker_signature,
+                        "worker_pubkey_hex": r.worker_pubkey_hex,
+                        "exit_code": r.exit_code,
+                        "environment": r.environment,
+                        "schema_version": r.schema_version,
+                        "served_weights": r.served_weights,
+                        "ran_under": r.ran_under,
+                        "receipt_id": rid,
+                        "completed_at": r.completed_at.isoformat(),
+                    }
+                )
+                # An observation's own receipt is its anchor — ship it.
+                if (
+                    basis == "observation"
+                    and rid
+                    and receipt_repo is not None
+                    and rid not in seen_receipts
+                ):
+                    rec = receipt_repo.get_by_id(rid)
+                    if rec is not None:
+                        receipts_out.append(
+                            {
+                                "receipt_id": rid,
+                                "cose_b64": b64encode(rec.cose_signed_blob).decode(),
+                            }
+                        )
+                        seen_receipts.add(rid)
+
         manifest = manifest_repository.get(experiment.manifest_hash)
 
         # EB-1: the INPUT leg — every work unit's payload (the parameters each
@@ -914,12 +1005,17 @@ def build_router(
             payload={"transfer_id": transfer.transfer_id, "result_set_root": root},
         )
         return {
-            "schema": "auspexai-evidence-bundle/v1",
+            "schema": (
+                "auspexai-evidence-bundle/v2" if additional_out else "auspexai-evidence-bundle/v1"
+            ),
             "experiment_id": experiment_id,
             "manifest_hash": experiment.manifest_hash,
             "manifest": manifest.manifest_json if manifest is not None else None,
             "work_units": work_units_out,
             "consensus_results": results_out,
+            # D19: basis-labeled non-consensus evidence (anchor-or-omit; absent
+            # key ≡ empty on v1 bundles).
+            **({"additional_results": additional_out} if additional_out else {}),
             # C7 Inc 4: per-unit tolerance-consensus evidence (empty for exact /
             # pre-Inc-4 experiments). The SDK verifier maps each such unit's
             # delivered row to the attested representative hash through this

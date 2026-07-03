@@ -36,6 +36,9 @@ class UnitConsensusRecord:
     envelope: dict[str, Any] | None
     agreeing_workers: int
     outlier_count: int
+    # D19: the outliers' semantic hashes — the predicate anchor that lets an
+    # outlier payload be exported and independently verified. None on pre-fix rows.
+    outlier_result_hashes: list[str] | None
     recorded_at: str
 
     def evidence_dict(self) -> dict[str, Any]:
@@ -49,6 +52,7 @@ class UnitConsensusRecord:
             "envelope": self.envelope,
             "agreeing_workers": self.agreeing_workers,
             "outlier_count": self.outlier_count,
+            "outlier_result_hashes": self.outlier_result_hashes,
         }
 
 
@@ -69,6 +73,7 @@ class UnitConsensusRepository:
         envelope: dict[str, Any] | None,
         agreeing_workers: int,
         outlier_count: int,
+        outlier_result_hashes: list[str] | None = None,
     ) -> None:
         """Persist (idempotently — re-finalization replaces) the unit's
         tolerance-consensus evidence."""
@@ -77,8 +82,8 @@ class UnitConsensusRepository:
             INSERT OR REPLACE INTO unit_consensus (
                 unit_id, method, representative_json, representative_hash,
                 spread_json, envelope_json, agreeing_workers, outlier_count,
-                recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                outlier_hashes_json, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 unit_id,
@@ -89,6 +94,7 @@ class UnitConsensusRepository:
                 json.dumps(envelope) if envelope is not None else None,
                 int(agreeing_workers),
                 int(outlier_count),
+                json.dumps(outlier_result_hashes) if outlier_result_hashes else None,
                 datetime.now(UTC).isoformat(),
             ),
         )
@@ -122,5 +128,6 @@ class UnitConsensusRepository:
             envelope=_load("envelope_json"),
             agreeing_workers=row["agreeing_workers"],
             outlier_count=row["outlier_count"],
+            outlier_result_hashes=_load("outlier_hashes_json"),
             recorded_at=row["recorded_at"],
         )

@@ -110,10 +110,23 @@ class SweepReport:
 
 
 def _horizon_for(
-    result: Result, experiment: Experiment, *, raw_ttl_days: int, grace_days: int
+    result: Result,
+    experiment: Experiment,
+    *,
+    raw_ttl_days: int,
+    grace_days: int,
+    observation_units: frozenset[str] = frozenset(),
 ) -> datetime | None:
-    """The age-off deadline for a result's payload, or None if it should be KEPT."""
-    if result.is_consensus:
+    """The age-off deadline for a result's payload, or None if it should be KEPT.
+
+    D19 (ratified 2026-07-03): the tier follows what the run DECLARED as its
+    science. Under `builtin_process_only` every replica is an independent
+    observation — the declared scientific content — so ALL of a process-only
+    unit's rows take the T-C horizon (download-then-purge on the consensus
+    clock), not the T-X byproduct clock they landed on by promotion accident.
+    Diverged replicas and tolerance outliers stay T-X: corroboration byproducts,
+    interesting briefly, hashes verify forever."""
+    if result.is_consensus or result.unit_id in observation_units:
         # T-C: kept (experiment-lifetime) unless an override TTL is set and the
         # results have been collected (offload → the researcher owns the copy).
         cons_ttl = experiment.consensus_ttl_days
@@ -155,11 +168,21 @@ def age_off_sweep(
                 continue
             repo = ResultRepository(per_job)
             raw_ttl = experiment.raw_payload_ttl_days or DEFAULT_RAW_TTL_DAYS
+            observation_units = frozenset(
+                row["unit_id"]
+                for row in per_job.execute(
+                    "SELECT unit_id FROM unit_consensus WHERE method = 'builtin_process_only'"
+                )
+            )
             ageable: list[str] = []
             bytes_freed = 0
             for r in repo.list_active_payloads():
                 horizon = _horizon_for(
-                    r, experiment, raw_ttl_days=raw_ttl, grace_days=DEFAULT_GRACE_DAYS
+                    r,
+                    experiment,
+                    raw_ttl_days=raw_ttl,
+                    grace_days=DEFAULT_GRACE_DAYS,
+                    observation_units=observation_units,
                 )
                 if horizon is not None and horizon < now:
                     ageable.append(r.result_id)

@@ -202,6 +202,24 @@ class ResultRepository:
             after_result_id=after_result_id,
         )
 
+    def list_non_consensus(
+        self,
+        *,
+        limit: int,
+        after_completed_at: str | None = None,
+        after_result_id: str | None = None,
+    ) -> list[Result]:
+        """The NON-promoted rows (D19): observe-only extra observations,
+        diverged replicas, tolerance outliers, and agreement duplicates —
+        classification happens at the export layer, which knows each unit's
+        consensus method."""
+        return self._list_paginated(
+            where="is_consensus = 0",
+            limit=limit,
+            after_completed_at=after_completed_at,
+            after_result_id=after_result_id,
+        )
+
     def list_all(
         self,
         *,

@@ -237,6 +237,13 @@ def _reduce_unit(
                 "envelope": envelope,
                 "agreeing_workers": len(part.agreeing_indices),
                 "outlier_count": len(part.outlier_indices),
+                # D19: anchor the outliers' hashes in the durable evidence (and
+                # thence the signed predicate) — without this an outlier payload
+                # can never be exported (anchor-or-omit).
+                "outlier_result_hashes": sorted(
+                    {_semantic_hash(results[i]) for i in part.outlier_indices}
+                )
+                or None,
             }
             return (
                 outcome,

@@ -409,6 +409,11 @@ def collect_result_set_entries(
                         "outlier_count": uc.outlier_count,
                         "envelope": uc.envelope,
                     }
+                    # D19: predicate-only (leaf-excluded — roots unchanged), the
+                    # same pattern as diverged_units: outlier payloads become
+                    # exportable because their hashes are now SIGNED.
+                    if uc.outlier_result_hashes:
+                        tolerance["outlier_result_hashes"] = uc.outlier_result_hashes
             entries.append(
                 ResultSetEntry(
                     unit_id=r.unit_id,
