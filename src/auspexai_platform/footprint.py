@@ -105,6 +105,31 @@ def replication_footprint(
     }
 
 
+def generation_footprint(manifest: dict[str, Any] | None) -> dict[str, Any]:
+    """Firewall #2 / v0.2 M1 Inc 3: the generation policy the SIGNED MANIFEST
+    declared — `greedy` vs `seeded_sampling` plus the declared params — so a
+    researcher can interpret agreement/divergence in kind (sampled replicas
+    legitimately differ; greedy replicas should not). Coordinator-asserted from
+    the stored manifest; the worker enforces the same declaration per-request,
+    so declared == actual for any result that ingressed. Always present, stable
+    shape: mode + (params only when a block was declared)."""
+    det = (manifest or {}).get("inference_determinism")
+    det = det if isinstance(det, dict) else {}
+    try:
+        is_sampling = float(det.get("temperature", 0) or 0) > 0
+    except (TypeError, ValueError):
+        is_sampling = False
+    out: dict[str, Any] = {"mode": "seeded_sampling" if is_sampling else "greedy"}
+    params = {
+        k: det[k]
+        for k in ("temperature", "seed", "top_p", "top_k", "min_p", "serving_version_pin")
+        if det.get(k) is not None
+    }
+    if params:
+        out["params"] = params
+    return out
+
+
 def compute_independence(per_job_db, worker_account_resolver) -> dict[str, Any]:
     """Account-level consensus-set independence over the AGREEING results (every
     result of a consensus unit — they all agreed; `promote_consensus` just picks a
@@ -195,11 +220,12 @@ def assemble_governance_footprint(
     diverged_units,
     replication_target: int | None = None,  # AUD-5: the real C14 (target, floor)
     replication_floor: int | None = None,
+    generation: dict[str, Any] | None = None,  # v0.2 M1 Inc 3 (None = legacy caller)
 ) -> dict[str, Any]:
     """Assemble the full `governance_footprint` dict (firewall #2 §4). Pure: the
     caller resolves the asserted inputs from the DBs; the recomputable
     integrity_basis counts come from `entries` + `diverged_units`."""
-    return {
+    footprint = {
         "schema_version": FOOTPRINT_SCHEMA_VERSION,
         "tenant": {"tier": tier_label(tenant_tier), "identity_gate": identity_gate},
         "replication": replication_footprint(
@@ -219,6 +245,12 @@ def assemble_governance_footprint(
         "containment": containment,
         "integrity_basis": {"counts": integrity_basis_counts(entries, diverged_units)},
     }
+    # v0.2 M1 Inc 3: the declared generation policy (greedy vs seeded-sampling),
+    # so agreement/divergence is interpretable in kind. Additive + optional so
+    # legacy callers/verifiers are untouched.
+    if generation is not None:
+        footprint["generation"] = generation
+    return footprint
 
 
 def assert_footprint_recomputable(footprint, entries, diverged_units) -> None:

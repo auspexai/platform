@@ -1014,3 +1014,24 @@ def test_stall_threshold_exceeds_redelivery_lease():
     from auspexai_platform.api.experiments import STALLED_UNIT_MINUTES
 
     assert STALLED_UNIT_MINUTES * 60 > ASSIGNMENT_REDELIVERY_LEASE_SECONDS
+
+
+# ---- v0.2 M1: the features dimension (generation_policy routing) ------------
+
+
+def test_worker_satisfies_features_dimension():
+    def worker_with_features(features):
+        w = _worker(worker_id="w", models=["m-a"])
+        if features is not None:
+            w.capabilities["worker_features"] = features
+        return w
+
+    req = {"models": ["m-a"], "features": ["generation_policy"]}
+    # A declaring worker is eligible; a silent (pre-M1) worker is NOT — its
+    # broker would burn sampling units with params_rejected at request time.
+    assert worker_satisfies(worker_with_features(["generation_policy"]), req) is True
+    assert worker_satisfies(worker_with_features(None), req) is False
+    assert worker_satisfies(worker_with_features([]), req) is False
+    assert worker_satisfies(worker_with_features(["other_feature"]), req) is False
+    # No features requirement ⇒ the dimension is inert (back-compat).
+    assert worker_satisfies(worker_with_features(None), {"models": ["m-a"]}) is True

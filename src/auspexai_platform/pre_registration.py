@@ -68,8 +68,12 @@ def validate_pre_registration(manifest: dict[str, Any]) -> list[str]:
     unknown = set(pr) - _KNOWN_FIELDS
     if unknown:
         errors.append(f"pre_registration has unknown fields: {sorted(unknown)}")
-    if str(manifest.get("schema_version")) != "0.4":
-        errors.append('a manifest declaring pre_registration must set schema_version "0.4"')
+    # Blacklist form (mirrors the SDK validator): pre_registration entered the
+    # contract at 0.4; any LATER superset version (0.5+) carries it too.
+    if str(manifest.get("schema_version")) in ("0.1", "0.2", "0.3"):
+        errors.append(
+            'a manifest declaring pre_registration must set schema_version "0.4" or later'
+        )
 
     version = pr.get("version", "0.1")
     if version != "0.1":

@@ -426,17 +426,73 @@ def _derive_required_capabilities(manifest: dict[str, Any]) -> dict[str, list[st
     """M1 (#30): a worker must locally hold every model the manifest marks
     `local_weights_required` (BYOM, §5.8). Keyed by the worker store model_id
     (`<repo-slug>-<quant>`, exact match for hash-agreement consensus). Empty ⇒ no
-    requirement (every worker eligible). Phase-1 emits only the "models" key; the
-    manifest stays opaque otherwise."""
+    requirement (every worker eligible). The manifest stays opaque otherwise.
+
+    v0.2 M1 `features`: a seeded-sampling experiment additionally requires
+    workers whose build declares the `generation_policy` feature — a volunteer
+    fleet never rolls atomically, and a pre-M1 broker would burn every unit
+    with params_rejected at request time instead of refusing cleanly."""
+    required: dict[str, list[str]] = {}
     models = manifest.get("models")
-    if not isinstance(models, list):
-        return {}
-    required = [
-        m["id"]
-        for m in models
-        if isinstance(m, dict) and m.get("local_weights_required") and m.get("id")
-    ]
-    return {"models": required} if required else {}
+    if isinstance(models, list):
+        model_ids = [
+            m["id"]
+            for m in models
+            if isinstance(m, dict) and m.get("local_weights_required") and m.get("id")
+        ]
+        if model_ids:
+            required["models"] = model_ids
+    determinism = manifest.get("inference_determinism")
+    declared_temp = determinism.get("temperature", 0) if isinstance(determinism, dict) else 0
+    try:
+        if float(declared_temp) > 0:
+            required["features"] = ["generation_policy"]
+    except (TypeError, ValueError):
+        pass
+    return required
+
+
+def _reject_sampling_agreement_raise(manifest_repository, experiment, new_target: int) -> None:
+    """v0.2 M1 §3c, consulted at the maintainer replication-raising overrides
+    (the A'-clamp precedent: what submit gates, an override must not silently
+    re-open). Raising the target above 1 on a seeded-sampling experiment that
+    declares an agreement reducer would wake the dormant agreement machinery on
+    legitimately-differing replicas — reject. There is no force path: this is
+    structural incoherence, not a trust judgment."""
+    if new_target <= 1:
+        return
+    stored = manifest_repository.get(experiment.manifest_hash)
+    manifest = stored.manifest_json if stored is not None else None
+    if not isinstance(manifest, dict):
+        return
+    det = manifest.get("inference_determinism")
+    temp = det.get("temperature", 0) if isinstance(det, dict) else 0
+    try:
+        if float(temp) <= 0:
+            return
+    except (TypeError, ValueError):
+        return
+    reducer = manifest.get("reducer")
+    kind = reducer.get("kind") if isinstance(reducer, dict) else None
+    if kind is None:
+        # No declared reducer falls back to hash-agreement at issuance.
+        kind = "builtin_hash_agreement"
+    if kind in ("builtin_hash_agreement", "builtin_within_cell_tolerance"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": {
+                    "code": "sampling_incoherent_with_agreement_consensus",
+                    "message": (
+                        f"cannot raise replication to {new_target} on a seeded-sampling "
+                        f"experiment declaring the agreement reducer {kind!r}: sampled "
+                        "replicas legitimately differ, so cross-worker agreement would be "
+                        "meaningless or falsely claimed (inference_determinism memo §3c). "
+                        "This experiment runs process-only at target 1."
+                    ),
+                }
+            },
+        )
 
 
 def _check_action_authz(credential: Credential, experiment, *, allow_researcher: bool) -> None:
@@ -761,8 +817,9 @@ def build_router(
         # retained), so it must be well-formed and contained at submit.
         feature_schema = body.manifest.get("feature_schema")
         if feature_schema is not None:
-            # v0.4 (D16.2) is a superset of v0.3 — feature_schema is a member of both.
-            if str(body.manifest.get("schema_version")) not in ("0.3", "0.4"):
+            # Blacklist form (mirrors the SDK validators): feature_schema entered
+            # the contract at 0.3; every later superset version carries it.
+            if str(body.manifest.get("schema_version")) in ("0.1", "0.2"):
                 raise HTTPException(
                     status_code=422,  # UNPROCESSABLE_CONTENT
                     detail={
@@ -848,17 +905,22 @@ def build_router(
                     },
                 )
 
-        # C7 / inference_determinism (Inc 1) — the SAMPLING COHERENCE GATE.
-        # Seeded sampling (inference_determinism.temperature > 0) makes replica
-        # outputs legitimately DIFFER, so an agreement consensus mode (hash-agreement
-        # or within_cell_tolerance) would either spuriously fail or — with a loose
-        # envelope — FALSELY claim corroboration. Permanent rule: sampling requires a
-        # non-agreement collection mode (process-only / distributional). AND until the
-        # worker honors a declared temperature (manifest v0.2 M1 / Inc 2), the fleet
-        # CANNOT run sampling at all — allowing it to submit would silently execute
-        # greedy (declared != actual). So today reject temp>0 outright; Inc 2 drops the
-        # second (not-yet-enforced) reject, leaving the coherence reject as the durable
-        # gate. Ref: inference_determinism_scoping_memo.md §3c/§6. Greedy (temperature 0
+        # C7 / inference_determinism — the SAMPLING COHERENCE GATE (Inc 1, made
+        # durable by Inc 2). Seeded sampling (inference_determinism.temperature > 0)
+        # makes replica outputs legitimately DIFFER, so engaging cross-replica
+        # AGREEMENT machinery would either spuriously fail (hash-agreement) or —
+        # with a loose envelope — FALSELY claim corroboration (tolerance). The
+        # agreement machinery is dormant exactly when the EFFECTIVE replication
+        # target is 1 (no peer; every unit settles process_only — "each replica an
+        # independent sample, no cross-worker agreement claimed", memo §3c). So:
+        # sampling + an agreement reducer is accepted ONLY at an effective target
+        # of 1, computed post-A'-floor with the same resolve_replication the
+        # seeding below uses (a sub-tier tenant's repl-1 request floors UP — that
+        # floored target is the honest one to gate on). Inc 2 also removed the
+        # Inc-1 "not yet enforced" blanket reject (the fleet now honors the
+        # declared policy) and added the pinned-seed floor, mirroring the SDK
+        # build-time validators (the coordinator does not import the SDK).
+        # Ref: inference_determinism_scoping_memo.md §3c/§6. Greedy (temperature 0
         # or an omitted inference_determinism block) is unaffected — the common case.
         determinism = body.manifest.get("inference_determinism")
         declared_temp = determinism.get("temperature", 0) if isinstance(determinism, dict) else 0
@@ -867,37 +929,56 @@ def build_router(
         except (TypeError, ValueError):
             is_sampling = False
         if is_sampling:
-            sampling_reducer_kind = reducer.get("kind") if isinstance(reducer, dict) else None
-            if sampling_reducer_kind in ("builtin_hash_agreement", "builtin_within_cell_tolerance"):
+            declared_seed = determinism.get("seed") if isinstance(determinism, dict) else None
+            if not isinstance(declared_seed, int) or isinstance(declared_seed, bool):
                 raise HTTPException(
                     status_code=422,  # UNPROCESSABLE_CONTENT
                     detail={
                         "error": {
-                            "code": "sampling_incoherent_with_agreement_consensus",
+                            "code": "sampling_requires_pinned_seed",
                             "message": (
-                                "seeded sampling (inference_determinism.temperature > 0) is "
-                                f"incoherent with the agreement reducer {sampling_reducer_kind!r}: "
-                                "sampled replicas legitimately differ, so cross-worker agreement "
-                                "would be meaningless or falsely claimed. Declare a non-agreement "
-                                "collection mode (process-only / distributional)."
+                                "seeded sampling (inference_determinism.temperature > 0) requires "
+                                "a pinned integer 'seed' — unseeded sampling is not accepted "
+                                "(the reproducibility floor; a sampling run's attestation attests "
+                                "the declared (model, params, seed-stream))."
                             ),
                         }
                     },
                 )
-            raise HTTPException(
-                status_code=422,  # UNPROCESSABLE_CONTENT
-                detail={
-                    "error": {
-                        "code": "seeded_sampling_not_yet_enforced",
-                        "message": (
-                            "seeded sampling (inference_determinism.temperature > 0) is declared "
-                            "but the fleet does not yet honor a per-experiment temperature (lands "
-                            "in manifest v0.2 M1); submitting it now would silently run greedy. "
-                            "Use temperature 0, or await M1 enforcement."
-                        ),
-                    }
-                },
-            )
+            sampling_reducer_kind = reducer.get("kind") if isinstance(reducer, dict) else None
+            if sampling_reducer_kind is None:
+                # A manifest with no declared reducer falls back to hash-agreement
+                # at issuance — gate it as what it will actually run.
+                sampling_reducer_kind = "builtin_hash_agreement"
+            if sampling_reducer_kind in ("builtin_hash_agreement", "builtin_within_cell_tolerance"):
+                _requested_target = int(body.manifest.get("replication_factor", 1) or 1)
+                _effective_target = _requested_target
+                if tenant_tier is not None:
+                    _effective_target, _, _ = resolve_replication(
+                        requested_target=_requested_target,
+                        requested_floor=body.manifest.get("replication_floor"),
+                        tenant_tier=tenant_tier(manifest_tenant),
+                        tier_floor_override=cert.replication_floor if cert else None,
+                    )
+                if _effective_target > 1:
+                    raise HTTPException(
+                        status_code=422,  # UNPROCESSABLE_CONTENT
+                        detail={
+                            "error": {
+                                "code": "sampling_incoherent_with_agreement_consensus",
+                                "message": (
+                                    "seeded sampling (inference_determinism.temperature > 0) at an "
+                                    f"effective replication target of {_effective_target} is "
+                                    f"incoherent with the agreement reducer "
+                                    f"{sampling_reducer_kind!r}: sampled replicas legitimately "
+                                    "differ, so cross-worker agreement would be meaningless or "
+                                    "falsely claimed. Declare replication_factor 1 (process-only: "
+                                    "each replica an independent sample) or a non-agreement "
+                                    "collection mode."
+                                ),
+                            }
+                        },
+                    )
 
         # Insert manifest. Duplicate (same canonical hash) means re-submission;
         # treat as 409 — researchers shouldn't blindly re-upload identical
@@ -1312,6 +1393,8 @@ def build_router(
                 requested_floor=replication_floor,
                 tenant_tier=tier if tier is not None else int(TrustTier.T2_TRUSTED),
             )
+            # v0.2 M1 §3c: the submit-time sampling coherence gate, consulted here too.
+            _reject_sampling_agreement_raise(manifest_repository, experiment, _rt)
             experiment_repository.set_replication(
                 experiment_id, replication_target=_rt, replication_floor=_rf, integrity_policy=_rp
             )
@@ -1339,6 +1422,10 @@ def build_router(
                 tenant_tier=tenant_tier,
                 force=force,
                 reason=reason,
+            )
+            # v0.2 M1 §3c: the submit-time sampling coherence gate, consulted here too.
+            _reject_sampling_agreement_raise(
+                manifest_repository, experiment, INTEGRITY_POLICY_REPLICATION[policy]
             )
             experiment_repository.set_integrity_policy(experiment_id, policy)
         if any(
@@ -1936,6 +2023,10 @@ def build_router(
             force=body.force,
             reason=body.reason,
         )
+        # v0.2 M1 §3c: the submit-time sampling coherence gate, consulted here too.
+        _reject_sampling_agreement_raise(
+            manifest_repository, experiment, INTEGRITY_POLICY_REPLICATION[policy]
+        )
         experiment_repository.set_integrity_policy(experiment_id, policy)
         updated = experiment_repository.get_by_id(experiment_id)
         audit_repository.append(
@@ -1979,6 +2070,8 @@ def build_router(
             requested_floor=body.replication_floor,
             tenant_tier=tier if tier is not None else int(TrustTier.T2_TRUSTED),
         )
+        # v0.2 M1 §3c: the submit-time sampling coherence gate, consulted here too.
+        _reject_sampling_agreement_raise(manifest_repository, experiment, target)
         experiment_repository.set_replication(
             experiment_id,
             replication_target=target,

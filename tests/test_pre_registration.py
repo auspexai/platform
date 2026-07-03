@@ -80,6 +80,11 @@ def test_wrong_schema_version_rejected() -> None:
     assert any("0.4" in e for e in errs)
 
 
+def test_later_superset_version_accepted() -> None:
+    # Blacklist form: pre_registration entered at 0.4; 0.5+ supersets carry it.
+    assert validate_pre_registration(_manifest(schema_version="0.5")) == []
+
+
 def test_missing_stopping_rule_rejected() -> None:
     block = dict(PRE_REG)
     del block["stopping_rule"]

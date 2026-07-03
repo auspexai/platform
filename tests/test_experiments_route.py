@@ -173,13 +173,13 @@ def test_submit_rejects_sampling_with_agreement_reducer(
     )
 
 
-def test_submit_rejects_sampling_not_yet_enforced(
+def test_submit_rejects_unseeded_sampling(
     client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
 ) -> None:
-    """inference_determinism Inc 1: even with a coherent (non-agreement) consensus,
-    the worker does not yet honor a declared temperature (v0.2 M1 / Inc 2), so a temp>0
-    manifest would silently run greedy. Reject at submit until enforcement lands.
-    (Inc 2 removes THIS reject, leaving the coherence reject above.)"""
+    """v0.2 M1 Inc 2: the pinned-seed floor, mirrored at submit (the SDK enforces
+    it at build; the coordinator does not import the SDK). Unseeded sampling is
+    never accepted — a sampling run's attestation attests the declared
+    (model, params, seed-stream)."""
     privkey, binding = registered_tenant
     response = _submit_as_researcher(
         client,
@@ -187,12 +187,114 @@ def test_submit_rejects_sampling_not_yet_enforced(
         binding.pubkey_hex,
         _manifest(
             binding.tenant_id,
-            "sampling-noreducer-001",
-            inference_determinism={"temperature": 0.9, "seed": 7},  # no agreement reducer
+            "sampling-unseeded-001",
+            inference_determinism={"temperature": 0.9},  # no seed
         ),
     )
     assert response.status_code == 422, response.text
-    assert response.json()["detail"]["error"]["code"] == "seeded_sampling_not_yet_enforced"
+    assert response.json()["detail"]["error"]["code"] == "sampling_requires_pinned_seed"
+
+
+def test_submit_accepts_process_only_seeded_sampling_and_derives_feature_gate(
+    client: TestClient,
+    registered_tenant: tuple[Ed25519PrivateKey, object],
+    account_repository,
+    tenant_repository,
+) -> None:
+    """v0.2 M1 Inc 2: the fleet now honors a declared generation policy, so a
+    COHERENT sampling manifest submits: pinned seed + an effective replication
+    target of 1 (process-only — the agreement reducer is dormant; each replica
+    an independent sample, memo §3c). Repl-1 needs a T2+ tenant (the A' floor).
+    The experiment additionally derives the `generation_policy` feature
+    requirement — mixed fleets route sampling only to declaring workers."""
+    privkey, binding = registered_tenant
+    _promote_tenant_to_t2(account_repository, tenant_repository, binding.tenant_id)
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "sampling-coherent-001",
+            replication_factor=1,
+            inference_determinism={"temperature": 0.9, "seed": 7, "top_p": 0.9},
+        ),
+    )
+    assert response.status_code == 201, response.text
+    experiment_id = response.json()["experiment_id"]
+    experiment = client.app.state.experiment_repository.get_by_id(experiment_id)
+    assert experiment.required_capabilities.get("features") == ["generation_policy"]
+    assert experiment.replication_target == 1
+
+
+def test_submit_rejects_sampling_repl1_when_tier_floors_it_up(
+    client: TestClient, registered_tenant: tuple[Ed25519PrivateKey, object]
+) -> None:
+    """The coherence gate evaluates the POST-A'-FLOOR target: a T1 tenant's
+    repl-1 sampling request floors UP (T1 floor = 2), which would wake the
+    agreement machinery — rejected. Sampling with an agreement reducer is
+    effectively T2+ (repl-1 IS the trusted policy) until a declarable
+    non-agreement collection mode lands."""
+    privkey, binding = registered_tenant  # fresh tenant, no account → T1
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "sampling-floored-001",
+            replication_factor=1,
+            inference_determinism={"temperature": 0.9, "seed": 7},
+        ),
+    )
+    assert response.status_code == 422, response.text
+    assert (
+        response.json()["detail"]["error"]["code"] == "sampling_incoherent_with_agreement_consensus"
+    )
+
+
+def test_replication_raise_rejected_on_sampling_experiment(
+    client: TestClient,
+    registered_tenant: tuple[Ed25519PrivateKey, object],
+    account_repository,
+    tenant_repository,
+    maintainer_token: str,
+) -> None:
+    """v0.2 M1 §3c at the maintainer overrides (the A'-clamp precedent): raising
+    replication above 1 on a seeded-sampling experiment would wake the dormant
+    agreement machinery — 409, no force path (structural, not a trust call)."""
+    privkey, binding = registered_tenant
+    _promote_tenant_to_t2(account_repository, tenant_repository, binding.tenant_id)
+    response = _submit_as_researcher(
+        client,
+        privkey,
+        binding.pubkey_hex,
+        _manifest(
+            binding.tenant_id,
+            "sampling-raise-001",
+            replication_factor=1,
+            inference_determinism={"temperature": 0.9, "seed": 7},
+        ),
+    )
+    assert response.status_code == 201, response.text
+    experiment_id = response.json()["experiment_id"]
+    headers = {"Authorization": f"Bearer {maintainer_token}"}
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/set-replication",
+        json={"replication_target": 3, "reason": "more corroboration"},
+        headers=headers,
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["error"]["code"] == "sampling_incoherent_with_agreement_consensus"
+    r = client.post(
+        f"/api/v0/experiments/{experiment_id}/actions/approve",
+        params={"integrity_policy": "standard"},
+        headers=headers,
+    )
+    assert r.status_code == 409, r.text
+    # Plain approval (no replication change) still works — target stays 1.
+    r = client.post(f"/api/v0/experiments/{experiment_id}/actions/approve", headers=headers)
+    assert r.status_code == 200, r.text
 
 
 def test_submit_publishes_experiment_submitted_event(

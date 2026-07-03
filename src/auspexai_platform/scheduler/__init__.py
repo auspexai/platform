@@ -404,11 +404,23 @@ def worker_satisfies(
     (`capabilities["sandbox_policy"]`) is at least as strict as the experiment's
     tenant tier requires (`required_containment`). An old worker that doesn't
     report a policy reads as permissive, so it's excluded from strict-required
-    work — fail-safe. Default permissive ⇒ no gate (the Phase-1 norm)."""
+    work — fail-safe. Default permissive ⇒ no gate (the Phase-1 norm).
+
+    **v0.2 M1 `features` dimension.** A feature-gated experiment (today:
+    `generation_policy` for seeded sampling) routes only to workers whose build
+    declares the feature in `capabilities["worker_features"]`. An old worker
+    that declares none reads as feature-less — fail-safe (a pre-M1 broker
+    would burn sampling units with params_rejected instead of refusing)."""
     if containment_rank(worker.capabilities.get("sandbox_policy")) < containment_rank(
         required_containment
     ):
         return False
+    required_features = set(required_capabilities.get("features", []))
+    if required_features:
+        declared = worker.capabilities.get("worker_features")
+        have_features = set(declared) if isinstance(declared, list) else set()
+        if not required_features <= have_features:
+            return False
     required_models = set(required_capabilities.get("models", []))
     if not required_models:
         # No model requirement: every worker eligible UNLESS the experiment

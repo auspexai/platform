@@ -136,3 +136,66 @@ class TestIndependence:
         assert ind["distinct_workers"] == 2
         assert ind["distinct_accounts"] == 2
         assert ind["per_unit"]["min_distinct_accounts"] == 2
+
+
+# ── v0.2 M1 Inc 3: the declared generation policy on the footprint ───────────
+
+
+def test_generation_footprint_modes():
+    from auspexai_platform.footprint import generation_footprint
+
+    # No manifest / no block ⇒ the greedy default, stable shape.
+    assert generation_footprint(None) == {"mode": "greedy"}
+    assert generation_footprint({}) == {"mode": "greedy"}
+    # Greedy with declared params keeps the params visible.
+    fp = generation_footprint(
+        {"inference_determinism": {"temperature": 0, "seed": 7, "serving_version_pin": "o/1"}}
+    )
+    assert fp["mode"] == "greedy"
+    assert fp["params"] == {"temperature": 0, "seed": 7, "serving_version_pin": "o/1"}
+    # Seeded sampling records the mode + the declared whitelist knobs.
+    fp = generation_footprint(
+        {"inference_determinism": {"temperature": 0.8, "seed": 42, "top_p": 0.9, "top_k": 40}}
+    )
+    assert fp["mode"] == "seeded_sampling"
+    assert fp["params"] == {"temperature": 0.8, "seed": 42, "top_p": 0.9, "top_k": 40}
+    # Malformed blocks read as greedy (nothing else could have been enforced).
+    assert generation_footprint({"inference_determinism": "junk"})["mode"] == "greedy"
+
+
+def test_assemble_footprint_carries_generation_block():
+    from auspexai_platform.footprint import generation_footprint
+
+    fp = assemble_governance_footprint(
+        tenant_tier=TrustTier.T2_TRUSTED,
+        identity_gate="verified",
+        integrity_policy=IntegrityPolicy.TRUSTED,
+        approval_experiment="auto",
+        assessment=None,
+        promotion_tier_set_by=None,
+        independence={"basis": INDEPENDENCE_BASIS_ACCOUNT, "distinct_accounts": 1},
+        containment={"required": "permissive", "ran_under": ["strict"]},
+        entries=[_entry("u1", INTEGRITY_BASIS_EXACT)],
+        diverged_units=[],
+        generation=generation_footprint(
+            {"inference_determinism": {"temperature": 0.8, "seed": 42}}
+        ),
+    )
+    assert fp["generation"] == {
+        "mode": "seeded_sampling",
+        "params": {"temperature": 0.8, "seed": 42},
+    }
+    # Legacy callers (no generation kwarg) keep the pre-M1 shape.
+    legacy = assemble_governance_footprint(
+        tenant_tier=TrustTier.T2_TRUSTED,
+        identity_gate="verified",
+        integrity_policy=IntegrityPolicy.TRUSTED,
+        approval_experiment="human",
+        assessment=None,
+        promotion_tier_set_by=None,
+        independence={},
+        containment={},
+        entries=[],
+        diverged_units=[],
+    )
+    assert "generation" not in legacy

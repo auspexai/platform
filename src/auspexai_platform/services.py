@@ -199,6 +199,7 @@ def build_coordinator_services(
             assemble_governance_footprint,
             collect_ran_under_containment,
             compute_independence,
+            generation_footprint,
         )
 
         tenant = tenant_repository.get_by_id(experiment.tenant_id)
@@ -234,6 +235,11 @@ def build_coordinator_services(
             w = worker_repository.get_by_id(worker_id)
             return (w.capabilities.get("sandbox_policy") if w is not None else None) or "permissive"
 
+        # v0.2 M1 Inc 3: the declared generation policy, from the stored (signed)
+        # manifest. A missing manifest row reads as the greedy default — honest,
+        # since nothing else could have been enforced.
+        stored_manifest = manifest_repository.get(experiment.manifest_hash)
+
         return assemble_governance_footprint(
             tenant_tier=tier,
             identity_gate=identity_gate,
@@ -252,6 +258,9 @@ def build_coordinator_services(
             # AUD-5: sign the experiment's ACTUAL (target, floor), not the coarse policy map.
             replication_target=experiment.replication_target,
             replication_floor=experiment.replication_floor,
+            generation=generation_footprint(
+                stored_manifest.manifest_json if stored_manifest is not None else None
+            ),
         )
 
     def _promotion_auto_t1_t2() -> bool:
