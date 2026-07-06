@@ -61,9 +61,19 @@ class PublicationRepository:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                rid, experiment_id, kind, tenant_id, publisher_pubkey,
-                int(standing_at_issue), json.dumps(summary), obs_merkle_root,
-                obs_rekor_uuid, ref_merkle_root, ref_rekor_uuid, doi, now,
+                rid,
+                experiment_id,
+                kind,
+                tenant_id,
+                publisher_pubkey,
+                int(standing_at_issue),
+                json.dumps(summary),
+                obs_merkle_root,
+                obs_rekor_uuid,
+                ref_merkle_root,
+                ref_rekor_uuid,
+                doi,
+                now,
             ),
         )
         return self.get(rid)  # round-trip: return what was persisted
@@ -74,7 +84,9 @@ class PublicationRepository:
         )
         return self._to_record(rows[0])
 
-    def list_for_experiment(self, experiment_id: str, kind: str | None = None) -> list[PublicationRecord]:
+    def list_for_experiment(
+        self, experiment_id: str, kind: str | None = None
+    ) -> list[PublicationRecord]:
         if kind:
             rows = self.db.execute(
                 "SELECT * FROM publication_records WHERE experiment_id = ? AND kind = ? "

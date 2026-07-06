@@ -295,6 +295,26 @@ def create_app(
         token_store, credential_resolver, account_repository=account_repository
     )
 
+    from auspexai_platform.api.publications import create_publications_router
+    from auspexai_platform.db.repositories.publications import PublicationRepository
+    from auspexai_platform.zenodo import ZenodoClient
+
+    publication_repository = PublicationRepository(svc.db)
+    app.include_router(
+        create_publications_router(
+            experiment_repository=experiment_repository,
+            account_repository=account_repository,
+            attestation_repository=attestation_repository,
+            audit_repository=audit_repository,
+            publication_repository=publication_repository,
+            signing_key=receipt_signing_key,
+            credential_dep=credential_dep,
+            zenodo_client_factory=lambda: ZenodoClient(config.state_dir),
+            pre_registration_repository=pre_registration_repository,
+        ),
+        prefix="/api/v0",
+        tags=["publications"],
+    )
     app.include_router(
         health.build_router(credential_dep, worker_repository),
         prefix="/api/v0",
