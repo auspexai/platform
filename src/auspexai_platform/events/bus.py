@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -35,7 +36,10 @@ GLOBAL = "*"
 
 # Per-subscriber queue depth. A subscriber that falls this far behind starts
 # dropping its oldest events (see `_offer`). 256 is generous for a live UI feed.
-DEFAULT_MAX_QUEUE = 256
+# E3: per-subscriber SSE queue depth — drop-oldest backpressure (below) bounds
+# memory under a slow client. Tunable via env for high-fanout deployments;
+# 256 events is generous for the 6s-poll consumers.
+DEFAULT_MAX_QUEUE = int(os.environ.get("AUSPEXAI_SSE_MAX_QUEUE", "256"))
 
 
 RECENT_BUFFER = 4096  # bounded replay ring (display rehydration, not evidence)
