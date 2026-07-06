@@ -424,6 +424,7 @@ def create_app(
             vouch_min_receipts=config.vouch_min_receipts,
             vouch_min_distinct_tenants=config.vouch_min_distinct_tenants,
             trust_model_policy_repository=trust_model_policy_repository,
+            signing_key=receipt_signing_key,
         ),
         prefix="/api/v0",
         tags=["accounts"],

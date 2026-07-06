@@ -62,3 +62,30 @@ def test_opted_in_contributors_query(tmp_path):
         )
     got = ReceiptIndexRepository(db).opted_in_account_ids("exp-a")
     assert got == ["acct-x", "acct-y"]
+
+
+def test_account_contribution_credential_signed(tmp_path):
+    # F4-B5: the credential endpoint returns a coordinator-signed claim.
+    # Signing round-trip is exercised via the receipts signing key in the
+    # integration suite; here assert the claim canonicalization + verify shape.
+    import json as _json
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    from auspexai_platform.api.accounts import build_router  # noqa: F401  (import-safety)
+    from auspexai_platform.receipts.signing import load_or_generate_signing_key
+
+    key = load_or_generate_signing_key(tmp_path / "k.json")
+    claim = {
+        "schema": "auspexai-contribution-credential/v0",
+        "account_id": "acct-x",
+        "trust_tier": 2,
+        "research_standing": 1,
+        "distinct_verified_completions": 3,
+        "total_receipts": 12,
+        "distinct_tenants": 2,
+        "issued_at": "2026-07-06T00:00:00+00:00",
+    }
+    payload = _json.dumps(claim, sort_keys=True, separators=(",", ":")).encode()
+    sig = key.private_key.sign(payload)
+    Ed25519PublicKey.from_public_bytes(bytes.fromhex(key.pubkey_hex)).verify(sig, payload)

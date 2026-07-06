@@ -125,6 +125,45 @@ def age_off(state_dir: Path | None, apply_changes: bool) -> None:
         click.echo("\nRe-run with --apply to blank these payloads.")
 
 
+@main.command("demo-audit")
+@_state_dir_option
+def demo_audit(state_dir: Path | None) -> None:
+    """E8: report tenants whose id/name matches a demo/test pattern (doubler,
+    demo, test, example, sample) with their experiment counts — so an operator
+    can clean up leftover development tenants. REPORT ONLY: never deletes (tenant
+    removal is destructive and production tenants must never be caught by a
+    pattern; the operator acts on the report deliberately)."""
+    import re
+
+    from auspexai_platform.db.database import Database
+    from auspexai_platform.db.migrations import MigrationRunner
+    from auspexai_platform.db.repositories.experiments import ExperimentRepository
+    from auspexai_platform.db.repositories.tenants import TenantRepository
+
+    config = _resolve_config(state_dir)
+    db = Database(config.control_db_path)
+    pattern = re.compile(r"(doubler|demo|test|example|sample)", re.IGNORECASE)
+    try:
+        MigrationRunner(db).apply_all()
+        tenants = TenantRepository(db).list_all()
+        exp_repo = ExperimentRepository(db)
+        flagged = []
+        for tn in tenants:
+            hay = f"{tn.tenant_id} {getattr(tn, 'display_name', '') or ''}"
+            if pattern.search(hay):
+                n = len(exp_repo.list_all(tenant_id=tn.tenant_id))
+                flagged.append((tn.tenant_id, getattr(tn, "display_name", None), n))
+    finally:
+        db.close()
+    if not flagged:
+        click.echo("no demo/test-pattern tenants found.")
+        return
+    click.echo(f"{len(flagged)} demo/test-pattern tenant(s) — review before removing:")
+    for tid, name, n in flagged:
+        click.echo(f"  {tid}  ({name or 'no name'})  · {n} experiment(s)")
+    click.echo("\nREPORT ONLY — no tenant was modified. Remove deliberately after review.")
+
+
 @main.command("settle")
 @_state_dir_option
 @click.option(

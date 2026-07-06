@@ -34,6 +34,7 @@ mis-classifies it as a Query param (every POST-body route then 422s). Keeping
 annotations as real objects sidesteps that. See CI-red postmortem 2026-05-30.
 """
 
+import json
 import logging
 import os
 import secrets
@@ -280,6 +281,7 @@ def build_router(
     vouch_min_distinct_tenants: int = VOUCH_MIN_DISTINCT_TENANTS,
     trust_model_policy_repository=None,  # firewall #1 (A2) flip toggle; OFF when unwired
     orcid_oauth_client: OrcidOAuthClient | None = None,  # D8; reads env config when None
+    signing_key=None,  # F4-B5: signs the account contribution credential
 ) -> APIRouter:
     """Build /accounts router bound to repository instances + verifier."""
 
@@ -326,6 +328,51 @@ def build_router(
         ]
         workers.sort(key=lambda x: x.worker_id)
         return AccountWorkersResponse(workers=workers)
+
+    @router.get("/accounts/{account_id}/credential")
+    async def account_credential(
+        account_id: str,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> dict:
+        """F4-B5: a coordinator-SIGNED verifiable credential of this account's
+        contribution record — CV-exportable, independently verifiable against
+        the coordinator's §5.16 public key. Account-self or maintainer. Content
+        is the recognition layer only (tier, research standing, distinct
+        verified completions, receipt/tenant counts) — no worker identity, no
+        PII."""
+        is_self = credential.account_id == account_id
+        is_maint = credential.kind == CredentialClass.MAINTAINER
+        if not (is_self or is_maint):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": {"code": "account_not_found", "message": "no such account"}},
+            )
+        account = account_repository.get_by_id(account_id)
+        if account is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": {"code": "account_not_found", "message": "no such account"}},
+            )
+        summary = account_repository.research_standing_summary(account_id)
+        receipts = tenants = 0
+        if receipt_index_repository is not None:
+            receipts, tenants = receipt_index_repository.account_receipt_summary(account_id)
+        claim = {
+            "schema": "auspexai-contribution-credential/v0",
+            "account_id": account_id,
+            "trust_tier": int(account.trust_tier),
+            "research_standing": int(getattr(summary.current, "value", summary.current)),
+            "distinct_verified_completions": summary.distinct_clean_completed_verified,
+            "total_receipts": receipts,
+            "distinct_tenants": tenants,
+            "issued_at": datetime.now(UTC).isoformat(),
+        }
+        out: dict = {"credential": claim}
+        if signing_key is not None:
+            payload = json.dumps(claim, sort_keys=True, separators=(",", ":")).encode()
+            out["coordinator_pubkey_hex"] = signing_key.pubkey_hex
+            out["signature"] = signing_key.private_key.sign(payload).hex()
+        return out
 
     @router.post(
         "/accounts/oauth/exchange",

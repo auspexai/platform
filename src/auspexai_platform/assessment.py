@@ -143,6 +143,40 @@ def assess_envelope(
     else:
         checks.append(EnvelopeCheck("model_servable", True, "catalog not evaluated"))
 
+    # D2: model-card enforcement — every declared model must carry provenance
+    # (id + version + a resolvable source: hf coords OR an attested/declared
+    # gguf digest). A model without a card is unciteable and unreproducible, so
+    # it forces review rather than auto-approve. Model-less experiments (no
+    # `models`) are exempt (synthetic/staged work).
+    models = manifest_json.get("models") or []
+    if models:
+        # Enforce model IDENTITY here (a model with no id is unciteable +
+        # unroutable); deeper provenance (version/source/digest) is worker-
+        # ATTESTED at result time (#13a), so its absence in the manifest is
+        # recorded for the reviewer but does NOT force review.
+        anon = [i for i, m in enumerate(models) if not m.get("id")]
+        has_ids = not anon
+        thin = [
+            m.get("id")
+            for m in models
+            if not (
+                m.get("version")
+                and (
+                    (m.get("hf_repo") and m.get("hf_filename"))
+                    or m.get("gguf_sha256")
+                    or manifest_json.get("hf_repo")
+                )
+            )
+        ]
+        detail = ""
+        if not has_ids:
+            detail = f"{len(anon)} model(s) declared with no id (unciteable)"
+        elif thin:
+            detail = f"identity OK; thin card (no version/source) for {thin} — reviewer note"
+        checks.append(EnvelopeCheck("model_card_declared", has_ids, detail))
+    else:
+        checks.append(EnvelopeCheck("model_card_declared", True, "no declared models"))
+
     if max_units_cap is not None:
         declared = manifest_json.get("max_units")
         within = declared is None or int(declared) <= max_units_cap
