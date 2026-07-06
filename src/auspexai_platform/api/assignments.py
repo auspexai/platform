@@ -760,15 +760,10 @@ def build_router(
         # is NOT declared, `raw_response` stays in the payload and conformance
         # rejects it as an undeclared §7 leak — no silent capture, ever.
         capture_raw = bool(
-            manifest_fs is not None
-            and (manifest_fs.manifest_json.get("capture") or {}).get("raw")
+            manifest_fs is not None and (manifest_fs.manifest_json.get("capture") or {}).get("raw")
         )
         _raw_text: str | None = None
-        if (
-            capture_raw
-            and isinstance(body.payload, dict)
-            and "raw_response" in body.payload
-        ):
+        if capture_raw and isinstance(body.payload, dict) and "raw_response" in body.payload:
             popped = body.payload.pop("raw_response")
             if isinstance(popped, str):
                 _raw_text = popped  # parked in the transit buffer after result_id is minted

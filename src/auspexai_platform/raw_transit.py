@@ -52,9 +52,7 @@ class RawTransitBuffer:
         collect). {result_id: raw_text}."""
         with self._lock:
             self._evict(now)
-            return {
-                rid: raw for rid, (exp, raw, _) in self._store.items() if exp == experiment_id
-            }
+            return {rid: raw for rid, (exp, raw, _) in self._store.items() if exp == experiment_id}
 
     def _evict(self, now: float) -> None:
         cutoff = now - self._ttl

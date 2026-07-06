@@ -263,6 +263,65 @@ def _stalled_unit_experiments(
     return out
 
 
+def _capability_unsatisfiable_experiments(
+    experiment_repository, per_job_factory, worker_repository, now: datetime
+) -> list[tuple[Any, str]]:
+    """C6a: approved experiments with pending work whose `required_capabilities`
+    NO active worker satisfies — a routing dead-end that would otherwise sit
+    pending until age-off. Distinct from C16 (a lost delivery to an ELIGIBLE
+    worker) — here the fleet simply can't run it (a model nobody serves +
+    no auto-acquire, a feature no build has, a containment floor no worker
+    meets). Returns (experiment, missing-capability summary).
+
+    Cheap by construction: only approved experiments with pending-and-never-
+    assigned units are checked, and only against the current active fleet."""
+    from auspexai_platform.db.models import WorkerStatus
+    from auspexai_platform.scheduler import CONTAINMENT_PERMISSIVE, worker_satisfies
+
+    out: list[tuple[Any, str]] = []
+    if per_job_factory is None or worker_repository is None:
+        return out
+    hb_cutoff = now - timedelta(minutes=ATTENTION_STUCK_MINUTES)
+
+    def _active(w) -> bool:
+        hb = getattr(w, "last_heartbeat_at", None)
+        if hb is None:
+            return False
+        if hb.tzinfo is None:
+            hb = hb.replace(tzinfo=UTC)
+        status = getattr(w, "status", None)
+        retired = status in (WorkerStatus.RETIRED, WorkerStatus.QUARANTINED) if status else False
+        return hb >= hb_cutoff and not retired
+
+    active = [w for w in worker_repository.list_all() if _active(w)]
+    for e in experiment_repository.list_all(status=ExperimentStatus.APPROVED):
+        req = getattr(e, "required_capabilities", None) or {}
+        if not req:
+            continue  # no requirements ⇒ any worker eligible; never unsatisfiable
+        pj = per_job_factory.get(e.experiment_id)
+        if pj is None:
+            continue
+        wu_repo = WorkUnitRepository(pj)
+        pending = wu_repo.list_all(status=WorkUnitStatus.PENDING)
+        if not pending:
+            continue  # nothing waiting → not a live routing dead-end
+        rre = bool(getattr(e, "requires_real_execution", False))
+        floor = getattr(e, "required_containment", None) or CONTAINMENT_PERMISSIVE
+        if any(
+            worker_satisfies(w, req, requires_real_execution=rre, required_containment=floor)
+            for w in active
+        ):
+            continue  # at least one active worker can run it
+        # Name what's unmet (display-only; the first non-satisfiable dimension).
+        parts = []
+        for dim, vals in req.items():
+            if vals:
+                parts.append(f"{dim}={','.join(vals)}")
+        summary = "; ".join(parts) or "declared requirements"
+        out.append((e, summary))
+    return out
+
+
 def _experiment_phase(experiment, per_job_factory, now: datetime) -> str | None:
     """E15: a coarse, presentation-only phase so a bare status — especially the
     overloaded APPROVED — doesn't read the same whether a run is awaiting
@@ -689,6 +748,8 @@ def build_router(
     # firewall #2: (experiment, entries, diverged, db) -> dict | None. The finalize
     # path also persists the canonical attestation, so it needs the footprint builder.
     governance_footprint_builder=None,
+    # C6a: enumerated to detect units no active worker can satisfy (capability gap).
+    worker_repository=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -1355,6 +1416,18 @@ def build_router(
                         reason=f"{n} certified result(s) rejected for feature_schema violations (§7)",
                     )
                 )
+        items.extend(
+            AttentionExperiment(
+                experiment_id=e.experiment_id,
+                tenant_id=e.tenant_id,
+                label=getattr(e, "tenant_experiment_label", None),
+                age_minutes=0,
+                reason=f"no active worker satisfies its requirements ({summary}) — capability gap",
+            )
+            for e, summary in _capability_unsatisfiable_experiments(
+                experiment_repository, per_job_factory, worker_repository, now
+            )
+        )
         return AttentionResponse(count=len(items), experiments=items)
 
     @router.get(

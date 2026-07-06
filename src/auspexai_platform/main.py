@@ -297,9 +297,8 @@ def create_app(
 
     from auspexai_platform.api.publications import create_publications_router
     from auspexai_platform.db.repositories.publications import PublicationRepository
-    from auspexai_platform.zenodo import ZenodoClient
-
     from auspexai_platform.raw_transit import RawTransitBuffer
+    from auspexai_platform.zenodo import ZenodoClient
 
     raw_transit = RawTransitBuffer()  # D20: ephemeral raw-content transit (in-memory)
     app.state.raw_transit = raw_transit
@@ -369,6 +368,7 @@ def create_app(
             auto_approval_gate=_auto_approval_gate,  # §9 #48 inc-4 runtime gate
             containment_strict_below_tier=config.containment_strict_below_tier,  # §41 floor
             governance_footprint_builder=_governance_footprint_for,  # firewall #2 (finalize emit)
+            worker_repository=worker_repository,
         ),
         prefix="/api/v0",
         tags=["experiments"],
