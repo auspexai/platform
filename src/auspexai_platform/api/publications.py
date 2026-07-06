@@ -55,6 +55,7 @@ def create_publications_router(
     audit_repository,
     publication_repository: PublicationRepository,
     receipt_index_repository=None,
+    raw_transit=None,
     signing_key,
     credential_dep,
     zenodo_client_factory,
@@ -257,6 +258,46 @@ def create_publications_router(
             "record_url": minted.get("record_url"),
             "mode": minted["mode"],
         }
+
+    @router.get("/experiments/{experiment_id}/raw-content")
+    async def collect_raw_content(
+        experiment_id: str,
+        credential=Depends(credential_dep),  # noqa: B008
+    ) -> dict:
+        """D20 (ratified 2026-07-06): collect the run's raw model outputs from
+        the ephemeral transit buffer — R3-only, audited, live (buffered items
+        only; raw never rests on the coordinator, so post-hoc/post-restart it is
+        gone). The researcher's driver polls this DURING the run. Ownership +
+        legal responsibility transfer on collection (TENANT_TERMS)."""
+        exp = experiment_repository.get_by_id(experiment_id)
+        if exp is None or credential.tenant_id != exp.tenant_id:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": {"code": "experiment_not_found", "message": "no such experiment"}},
+            )
+        if _standing(credential) < 3:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": {
+                        "code": "research_standing_too_low",
+                        "message": "raw-content collection requires research standing R3",
+                    }
+                },
+            )
+        if raw_transit is None:
+            return {"raw": {}, "note": "raw transit buffer not configured"}
+        import time as _time
+
+        items = raw_transit.collect_experiment(experiment_id=experiment_id, now=_time.monotonic())
+        audit_repository.append(
+            actor_class=CredentialClass.RESEARCHER,
+            action="raw_content.collected",
+            resource_type="experiment",
+            resource_id=experiment_id,
+            payload={"count": len(items)},
+        )
+        return {"raw": items, "count": len(items)}
 
     @router.get("/experiments/{experiment_id}/publications")
     async def list_publications(

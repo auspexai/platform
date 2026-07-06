@@ -277,6 +277,7 @@ def build_router(
     eligibility_thresholds=None,
     vouch_repository=None,
     event_bus=None,
+    raw_transit=None,  # D20: ephemeral raw-content transit buffer (live collection)
     manifest_repository=None,  # M3b conductor: read acquisition coords from the manifest
     prestage_repository=None,  # M3b conductor: the model_prestage table
     attestation_repository: AttestationRepository | None = None,  # A1: persist on complete
@@ -751,6 +752,26 @@ def build_router(
         feature_schema = (
             manifest_fs.manifest_json.get("feature_schema") if manifest_fs is not None else None
         )
+        # D20 (ratified 2026-07-06): raw-content live collection. `raw_response`
+        # is a RESERVED key — permitted ONLY when the manifest declares capture,
+        # and popped BEFORE schema conformance + persistence so it NEVER rests on
+        # the coordinator (features persist as today; raw parks in the ephemeral
+        # transit buffer for the R3 driver to collect during the run). If capture
+        # is NOT declared, `raw_response` stays in the payload and conformance
+        # rejects it as an undeclared §7 leak — no silent capture, ever.
+        capture_raw = bool(
+            manifest_fs is not None
+            and (manifest_fs.manifest_json.get("capture") or {}).get("raw")
+        )
+        _raw_text: str | None = None
+        if (
+            capture_raw
+            and isinstance(body.payload, dict)
+            and "raw_response" in body.payload
+        ):
+            popped = body.payload.pop("raw_response")
+            if isinstance(popped, str):
+                _raw_text = popped  # parked in the transit buffer after result_id is minted
         if feature_schema:
             violations = check_payload_conformance(feature_schema, body.payload)
             if violations:
@@ -820,6 +841,17 @@ def build_router(
             ran_under=body.ran_under,
         )
         assignments_repo.attach_result(assignment.assignment_id, result.result_id)
+        # D20: park the stripped raw in the ephemeral transit buffer keyed by the
+        # now-minted result_id — never persisted, R3-collectable during the run.
+        if _raw_text is not None and raw_transit is not None:
+            import time as _time
+
+            raw_transit.put(
+                experiment_id=experiment_id,
+                result_id=result.result_id,
+                raw_text=_raw_text,
+                now=_time.monotonic(),
+            )
         updated_unit, just_completed = work_units_repo.increment_completions(unit_id)
 
         audit_repository.append(

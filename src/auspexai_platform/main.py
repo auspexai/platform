@@ -299,6 +299,10 @@ def create_app(
     from auspexai_platform.db.repositories.publications import PublicationRepository
     from auspexai_platform.zenodo import ZenodoClient
 
+    from auspexai_platform.raw_transit import RawTransitBuffer
+
+    raw_transit = RawTransitBuffer()  # D20: ephemeral raw-content transit (in-memory)
+    app.state.raw_transit = raw_transit
     publication_repository = PublicationRepository(svc.db)
     app.include_router(
         create_publications_router(
@@ -308,6 +312,7 @@ def create_app(
             audit_repository=audit_repository,
             publication_repository=publication_repository,
             receipt_index_repository=receipt_index_repository,
+            raw_transit=raw_transit,
             signing_key=receipt_signing_key,
             credential_dep=credential_dep,
             zenodo_client_factory=lambda: ZenodoClient(config.state_dir),
@@ -478,6 +483,7 @@ def create_app(
             eligibility_thresholds=eligibility_thresholds,
             vouch_repository=vouch_repository,
             event_bus=event_bus,
+            raw_transit=raw_transit,
             manifest_repository=manifest_repository,
             prestage_repository=model_prestage_repository,
             attestation_repository=attestation_repository,
