@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 # Channel key for the operator firehose — every event is also published here.
 GLOBAL = "*"
@@ -34,6 +36,9 @@ GLOBAL = "*"
 # Per-subscriber queue depth. A subscriber that falls this far behind starts
 # dropping its oldest events (see `_offer`). 256 is generous for a live UI feed.
 DEFAULT_MAX_QUEUE = 256
+
+
+RECENT_BUFFER = 4096  # bounded replay ring (display rehydration, not evidence)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +50,7 @@ class Event:
     type: str
     experiment_id: str | None
     data: dict
+    at: str = ""  # ISO wall-clock (replay/rehydration ordering)
 
 
 def _offer(queue: asyncio.Queue, event: Event) -> None:
@@ -67,6 +73,11 @@ class EventBus:
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
         self._max_queue = max_queue
         self._seq = 0
+        # 2026-07-06 campaign UI fix C: heartbeat views accumulated client-side
+        # and lost history on navigation. Bounded replay ring → views REHYDRATE
+        # from /events/recent on mount, then continue live. In-memory by design:
+        # display data, not evidence (restart loss acceptable and honest).
+        self._recent: deque[Event] = deque(maxlen=RECENT_BUFFER)
 
     def publish(self, event_type: str, *, experiment_id: str | None, data: dict) -> Event:
         """Fan an event to its experiment channel and the global firehose.
@@ -76,7 +87,14 @@ class EventBus:
         tests / callers that want the assigned `seq`).
         """
         self._seq += 1
-        event = Event(seq=self._seq, type=event_type, experiment_id=experiment_id, data=data)
+        event = Event(
+            seq=self._seq,
+            type=event_type,
+            experiment_id=experiment_id,
+            data=data,
+            at=datetime.now(UTC).isoformat(),
+        )
+        self._recent.append(event)
         channels = [GLOBAL] if experiment_id is None else [experiment_id, GLOBAL]
         for channel in channels:
             for queue in self._subscribers.get(channel, ()):
@@ -99,6 +117,15 @@ class EventBus:
                 subs.discard(queue)
                 if not subs:
                     del self._subscribers[channel]
+
+    def recent(self, *, experiment_id: str | None = None, limit: int = 500) -> list[Event]:
+        """The newest events (oldest→newest), optionally filtered to one
+        experiment. Bounded by the ring; `limit` caps the response."""
+        if experiment_id is None:
+            picked = list(self._recent)
+        else:
+            picked = [e for e in self._recent if e.experiment_id == experiment_id]
+        return picked[-limit:]
 
     def subscriber_count(self, channel: str) -> int:
         """Live subscriber count for a channel (test/introspection helper)."""

@@ -188,7 +188,9 @@ class WorkUnitRepository:
         """ISO timestamp of the most recent unit completion, or None. Cheap
         cadence signal: distinguishes a round-based driver BETWEEN rounds
         (recent) from a dead driver (stale) in the run-phase derivation."""
-        rows = self.db.execute("SELECT MAX(completed_at) AS m FROM work_units")
+        # results.completed_at, not work_units (which has no completion column
+        # — the 2026-07-06 property-test catch; a mocked unit test hid it).
+        rows = self.db.execute("SELECT MAX(completed_at) AS m FROM results")
         return rows[0]["m"] if rows and rows[0]["m"] else None
 
     def count_by_status(self) -> dict[str, int]:

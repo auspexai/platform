@@ -127,4 +127,43 @@ def build_router(
             headers=_SSE_HEADERS,
         )
 
+    def _event_json(e) -> dict:
+        return {
+            "seq": e.seq,
+            "type": e.type,
+            "experiment_id": e.experiment_id,
+            "data": e.data,
+            "at": e.at,
+        }
+
+    @router.get("/experiments/{experiment_id}/events/recent", include_in_schema=True)
+    async def experiment_events_recent(
+        experiment_id: str,
+        limit: int = 500,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ):
+        """UI fix C (2026-07-06): the bounded replay ring, so heartbeat views
+        REHYDRATE on mount instead of losing history to navigation. Same
+        tenant-privacy contract as the SSE twin (non-owner → 404)."""
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None or not _can_view(credential, experiment):
+            from auspexai_platform.api.experiments import _experiment_not_found
+
+            raise _experiment_not_found(experiment_id)
+        return {
+            "events": [
+                _event_json(e)
+                for e in event_bus.recent(experiment_id=experiment_id, limit=min(limit, 2000))
+            ]
+        }
+
+    @router.get("/events/recent", include_in_schema=True)
+    async def firehose_recent(
+        limit: int = 500,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ):
+        """Maintainer-only replay of the operator firehose ring."""
+        require_maintainer(credential)
+        return {"events": [_event_json(e) for e in event_bus.recent(limit=min(limit, 2000))]}
+
     return router
