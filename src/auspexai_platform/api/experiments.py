@@ -117,6 +117,10 @@ class ExperimentResponse(BaseModel):
     # NOT a new ExperimentStatus — a view-layer refinement; None where the status
     # already says it.
     run_phase: Annotated[str | None, ExposureTag.TENANT_SCOPED] = None
+    # Campaign UI fix B: the manifest's declared duration, surfaced so the
+    # dashboard can render elapsed/ETA progress for duration-mode runs
+    # (detail route only — one manifest parse; None elsewhere).
+    expected_duration_hours: Annotated[float | None, ExposureTag.TENANT_SCOPED] = None
     submitted_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
     started_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
     completed_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
@@ -1370,6 +1374,14 @@ def build_router(
             raise _experiment_not_found(experiment_id)
         resp = _to_response(experiment)
         resp.run_phase = _experiment_phase(experiment, per_job_factory, datetime.now(UTC))
+        m = manifest_repository.get(experiment.manifest_hash)
+        if m is not None:
+            try:
+                resp.expected_duration_hours = (m.manifest_json or {}).get(
+                    "expected_duration_hours"
+                )
+            except AttributeError:
+                pass
         return filter_for_credential(
             resp,
             credential,
