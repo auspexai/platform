@@ -394,6 +394,19 @@ class ReceiptIndexRepository:
         )
         return self._row_to_entry(rows[0]) if rows else None
 
+    def opted_in_account_ids(self, experiment_id: str) -> list[str]:
+        """Distinct accounts that (a) contributed to this experiment and (b) had
+        public_attribution ON at issue — the citation-consent snapshot (System B,
+        forward-only). The account-attribution surface for the DOI's contributor
+        list. Uses account_id_at_issue (survives worker unbind); NULL/T0 excluded."""
+        rows = self.db.execute(
+            "SELECT DISTINCT account_id_at_issue FROM receipt_index "
+            "WHERE experiment_id = ? AND public_attribution_at_issue = 1 "
+            "AND account_id_at_issue IS NOT NULL ORDER BY account_id_at_issue",
+            (experiment_id,),
+        )
+        return [r["account_id_at_issue"] for r in rows]
+
     def list_for_experiment(self, experiment_id: str) -> list[ReceiptIndexEntry]:
         """All receipts issued for one experiment, newest first.
 

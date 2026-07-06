@@ -137,6 +137,7 @@ def experiment_doi_metadata(
     description_html: str,
     creators: list[dict],
     related_urls: list[str],
+    contributors: list[str] | None = None,
 ) -> dict:
     """The RDM metadata shape for a metadata-only record."""
     from datetime import UTC, datetime
@@ -150,6 +151,13 @@ def experiment_doi_metadata(
         or [{"person_or_org": {"type": "organizational", "name": "AuspexAI Network"}}],
         "rights": [{"id": "cc-by-4.0"}],
         "publisher": "AuspexAI",
+        # Opted-in volunteer contributors (System B, forward-only consent snapshot).
+        # DataCite "contributors" with type Other — the citable, permanent public
+        # credit surface that replaces a standalone contributors page (USER 2026-07-06).
+        "contributors": [
+            {"person_or_org": {"type": "personal", "family_name": c}, "role": {"id": "other"}}
+            for c in (contributors or [])
+        ],
         "related_identifiers": [
             {"identifier": u, "scheme": "url", "relation_type": {"id": "issupplementedby"}}
             for u in related_urls

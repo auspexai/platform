@@ -54,6 +54,7 @@ def create_publications_router(
     attestation_repository,
     audit_repository,
     publication_repository: PublicationRepository,
+    receipt_index_repository=None,
     signing_key,
     credential_dep,
     zenodo_client_factory,
@@ -206,6 +207,17 @@ def create_publications_router(
             f"independently via the open AuspexAI tooling.</p>"
         )
         related = [u for u in ["https://auspexai.network/benchmarks.html", rekor_url] if u]
+        # F4 (USER 2026-07-06): opted-in volunteer contributors → the DOI's
+        # DataCite contributor list — the citable public credit surface. Consent
+        # is the per-receipt public_attribution_at_issue snapshot (forward-only);
+        # identity is the verified GitHub display_name, never a self-set name.
+        contributors: list[str] = []
+        if receipt_index_repository is not None:
+            for acct_id in receipt_index_repository.opted_in_account_ids(experiment_id):
+                acct = account_repository.get_by_id(acct_id)
+                name = getattr(acct, "display_name", None)
+                if name:
+                    contributors.append(name)
         try:
             minted = zenodo.mint_doi(
                 experiment_doi_metadata(
@@ -213,6 +225,7 @@ def create_publications_router(
                     description_html=description,
                     creators=[{"name": "AuspexAI Network"}],
                     related_urls=related,
+                    contributors=contributors,
                 )
             )
         except ZenodoError as e:

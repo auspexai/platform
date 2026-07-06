@@ -307,6 +307,7 @@ def create_app(
             attestation_repository=attestation_repository,
             audit_repository=audit_repository,
             publication_repository=publication_repository,
+            receipt_index_repository=receipt_index_repository,
             signing_key=receipt_signing_key,
             credential_dep=credential_dep,
             zenodo_client_factory=lambda: ZenodoClient(config.state_dir),

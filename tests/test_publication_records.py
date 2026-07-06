@@ -35,3 +35,30 @@ def test_record_roundtrip_and_doi_prereq(tmp_path):
     assert repo.has_benchmark_publication("exp-b") is False
     rows = repo.list_for_experiment("exp-a")
     assert len(rows) == 1 and rows[0].kind == "benchmark"
+
+
+def test_opted_in_contributors_query(tmp_path):
+    # Exercise the consent-filter SQL directly (bypassing FK-bound record()):
+    # only public_attribution_at_issue=1 AND non-null account_id_at_issue count,
+    # distinct.
+    from auspexai_platform.db.repositories.receipt_index import ReceiptIndexRepository
+
+    db = _db(tmp_path)
+    db.execute("PRAGMA foreign_keys=OFF")
+    rows = [
+        ("r1", "exp-a", "acct-x", 1),  # opted-in
+        ("r2", "exp-a", "acct-x", 1),  # dup account → one entry
+        ("r3", "exp-a", "acct-y", 1),  # opted-in
+        ("r4", "exp-a", "acct-z", 0),  # opted-out → excluded
+        ("r5", "exp-a", None, 1),  # anonymous/T0 → excluded
+        ("r6", "exp-b", "acct-w", 1),  # other experiment → excluded
+    ]
+    for rid, exp, acct, pub in rows:
+        db.execute(
+            "INSERT INTO receipt_index (receipt_id, experiment_id, worker_id, "
+            "worker_pubkey, issued_at, public_attribution_at_issue, account_id_at_issue) "
+            "VALUES (?, ?, 'w', 'p', '2026-07-06T00:00:00Z', ?, ?)",
+            (rid, exp, pub, acct),
+        )
+    got = ReceiptIndexRepository(db).opted_in_account_ids("exp-a")
+    assert got == ["acct-x", "acct-y"]
