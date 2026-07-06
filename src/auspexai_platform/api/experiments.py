@@ -269,7 +269,8 @@ def _experiment_phase(experiment, per_job_factory, now: datetime) -> str | None:
       submitted → awaiting_assessment (async auto-assessment hasn't run) | assessed
       approved  → provisioning (fresh, 0 units) · inert (old, 0 units = E14 stuck)
                   · queued (work pending, nothing started) · running
-                  · completing (every unit settled; the driver hasn't finalized)
+                  · completing (finalized — no more submissions can come)
+                  · stalled (settled + no activity — the driver stopped feeding)
     """
     status_val = getattr(experiment.status, "value", experiment.status)
     if status_val == ExperimentStatus.SUBMITTED.value:
@@ -296,7 +297,26 @@ def _experiment_phase(experiment, per_job_factory, now: datetime) -> str | None:
             else "provisioning"
         )
     if in_flight == 0 and pending == 0:
-        return "completing"  # every unit settled; the driver hasn't finalized
+        # "completing" was the 2026-07-04 campaign's most-reported legibility
+        # bug: round-based drivers sit all-settled ~93% of wall time, so the
+        # label read as perpetually-finishing on My Experiments, the experiment
+        # page, AND zeroed the console's running-count tiles. Honest split:
+        #   finalized            → completing (no more submissions can come)
+        #   settled + recent     → running    (between rounds)
+        #   settled + stale      → stalled    (the driver stopped feeding —
+        #                                      the E14 signal, surfaced)
+        if getattr(experiment, "submissions_finalized", False):
+            return "completing"
+        last = WorkUnitRepository(pj).latest_completion_at() if pj is not None else None
+        if last is not None:
+            last_dt = datetime.fromisoformat(last)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=UTC)
+            # 4x the stuck threshold: a half-hourly cadence (the longest we
+            # run) idles ~28 min between rounds — comfortably "running".
+            if (now - last_dt) <= timedelta(minutes=4 * ATTENTION_STUCK_MINUTES):
+                return "running"
+        return "stalled"
     if in_flight > 0 or completed > 0:
         return "running"
     return "queued"  # pending work, nothing started

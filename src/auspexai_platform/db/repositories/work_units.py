@@ -184,6 +184,13 @@ class WorkUnitRepository:
             )
         return [self._row_to_unit(r) for r in rows]
 
+    def latest_completion_at(self) -> str | None:
+        """ISO timestamp of the most recent unit completion, or None. Cheap
+        cadence signal: distinguishes a round-based driver BETWEEN rounds
+        (recent) from a dead driver (stale) in the run-phase derivation."""
+        rows = self.db.execute("SELECT MAX(completed_at) AS m FROM work_units")
+        return rows[0]["m"] if rows and rows[0]["m"] else None
+
     def count_by_status(self) -> dict[str, int]:
         """Return {status: count} aggregating over all units. Useful for the
         experiment progress view."""
