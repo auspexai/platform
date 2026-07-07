@@ -244,6 +244,44 @@ def settle_outcomes(state_dir: Path | None, apply_changes: bool, include_complet
         click.echo("\nRe-run with --apply to write these changes.")
 
 
+@main.command("refresh-hf-catalog")
+@_state_dir_option
+@click.option(
+    "--limit",
+    default=150,
+    show_default=True,
+    help="How many top-downloaded GGUF repos to scan (filtered to reputable publishers + instruct).",
+)
+def refresh_hf_catalog(state_dir: Path | None, limit: int) -> None:
+    """Refresh the HuggingFace provisionable catalog (D23).
+
+    Polls HF for popular GGUF instruct models across the full size range, sizes
+    each by its real quant file, and writes the cache read by
+    GET /api/v0/models/supported — so new HF uploads surface without a code edit.
+    Safe on a systemd timer: on ANY HF/network failure (or an all-filtered
+    result) the existing cache is left untouched and the endpoint keeps serving
+    it (or falls back to the curated seed). Never partial-writes.
+    """
+    from datetime import UTC, datetime
+
+    from auspexai_platform.hf_catalog import HfHttpBrowser, fetch_catalog, write_catalog
+
+    config = _resolve_config(state_dir)
+    try:
+        models = fetch_catalog(HfHttpBrowser(), limit=limit)
+    except Exception as exc:  # network / HF outage — never break the cache or the timer
+        click.echo(f"HF refresh failed ({exc}); cache left unchanged.")
+        return
+    if not models:
+        click.echo("no models fetched (HF returned nothing usable); cache left unchanged.")
+        return
+    fetched_at = datetime.now(UTC).isoformat()
+    write_catalog(config.hf_catalog_path, models, fetched_at=fetched_at)
+    click.echo(
+        f"wrote {len(models)} model(s) to {config.hf_catalog_path} (fetched_at={fetched_at})"
+    )
+
+
 # ----------------------------------------------------------------------------
 # attestation group (A2 — Rekor anchoring backfill)
 # ----------------------------------------------------------------------------

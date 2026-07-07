@@ -98,6 +98,12 @@ class Config:
         return self.state_dir / "coordinator.db"
 
     @property
+    def hf_catalog_path(self) -> Path:
+        """Cached HuggingFace provisionable catalog (D23), refreshed by the
+        `refresh-hf-catalog` timer and read by `GET /models/supported`."""
+        return self.state_dir / "hf_catalog.json"
+
+    @property
     def jobs_dir(self) -> Path:
         """Directory holding per-experiment SQLite DBs (M6c+). Each
         experiment's work_units + assignments + results live in their own

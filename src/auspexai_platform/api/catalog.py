@@ -18,12 +18,14 @@ attack surface the security review targeted. The request queues stay retired.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from auspexai_platform.auth.credential import Credential
 from auspexai_platform.db.repositories import WorkerRepository
+from auspexai_platform.hf_catalog import catalog_fetched_at, read_catalog
 from auspexai_platform.supported_models import supported_by_id
 from auspexai_platform.worker_status import heartbeat_cutoff
 
@@ -49,16 +51,23 @@ class SupportedEntry(BaseModel):
     fits_worker_count: int  # active workers big enough (curated + RAM known)
     ram_known_workers: int  # active workers that reported RAM (denominator honesty)
     status: str  # 'available' | 'runnable' | 'too_big' | 'unknown'
-    in_catalog: bool  # True = in the curated supported set (has sizing metadata)
+    in_catalog: bool  # True = in the provisionable set (has sizing metadata)
+    hf_repo: str | None = None  # provenance when the entry came from the HF poll
 
 
 class SupportedResponse(BaseModel):
     models: list[SupportedEntry]
     total_active_workers: int
     fleet_can_auto_acquire: bool  # ≥1 active worker pulls models on demand
+    catalog_source: str  # 'hf' (fresh poll) | 'curated' (static seed fallback)
+    catalog_fetched_at: str | None  # when the HF poll last refreshed the cache
 
 
-def build_router(credential_dep, worker_repository: WorkerRepository) -> APIRouter:
+def build_router(
+    credential_dep,
+    worker_repository: WorkerRepository,
+    hf_catalog_path: Path | None = None,
+) -> APIRouter:
     router = APIRouter()
 
     @router.get("/models/catalog", response_model=CatalogResponse, status_code=status.HTTP_200_OK)
@@ -134,8 +143,16 @@ def build_router(credential_dep, worker_repository: WorkerRepository) -> APIRout
 
         ram_known = [r for c in caps if (r := _ram(c)) is not None]
 
-        catalog = supported_by_id()  # {model_id: SupportedModel}
-        # UNION: everything on the fleet + the whole curated set (deduped).
+        # Provisionable set = the fresh HF poll if the cache is warm, else the
+        # curated static seed (the timer never ran, or HF was unreachable).
+        hf = read_catalog(hf_catalog_path) if hf_catalog_path else []
+        if hf:
+            catalog: dict = {m.model_id: m for m in hf}
+            catalog_source, fetched_at = "hf", catalog_fetched_at(hf_catalog_path)
+        else:
+            catalog = supported_by_id()
+            catalog_source, fetched_at = "curated", None
+        # UNION: everything on the fleet + the whole provisionable set (deduped).
         entries: list[SupportedEntry] = []
         for mid in set(present) | set(catalog):
             m = catalog.get(mid)
@@ -164,6 +181,7 @@ def build_router(credential_dep, worker_repository: WorkerRepository) -> APIRout
                     ram_known_workers=len(ram_known),
                     status=st,
                     in_catalog=m is not None,
+                    hf_repo=getattr(m, "hf_repo", None),
                 )
             )
         # Available first (most workers), then the provisionable menu by size.
@@ -180,6 +198,8 @@ def build_router(credential_dep, worker_repository: WorkerRepository) -> APIRout
             models=entries,
             total_active_workers=total_active,
             fleet_can_auto_acquire=auto_acquire_fleet,
+            catalog_source=catalog_source,
+            catalog_fetched_at=fetched_at,
         )
 
     return router

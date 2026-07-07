@@ -345,7 +345,9 @@ def create_app(
         tags=["system"],
     )
     app.include_router(
-        catalog_routes.build_router(credential_dep, worker_repository),
+        catalog_routes.build_router(
+            credential_dep, worker_repository, hf_catalog_path=config.hf_catalog_path
+        ),
         prefix="/api/v0",
         tags=["catalog"],
     )

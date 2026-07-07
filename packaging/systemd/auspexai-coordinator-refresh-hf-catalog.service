@@ -1,0 +1,30 @@
+[Unit]
+Description=AuspexAI coordinator — D23 refresh the HuggingFace provisionable catalog (poll HF for GGUF instruct models across sizes; cache for GET /models/supported)
+Documentation=https://github.com/auspexai/platform
+# Needs the network (queries huggingface.co). Ordered after the coordinator only
+# for tidy co-scheduling; it uses its own config + writes a cache file, not the DB.
+After=network-online.target auspexai-coordinator.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jason
+Group=jason
+# Same state dir as the coordinator daemon, so the cache lands where the running
+# API reads it (config.hf_catalog_path = <state_dir>/hf_catalog.json).
+Environment=AUSPEXAI_STATE_DIR=/var/lib/auspexai-coordinator
+EnvironmentFile=-/etc/auspexai/coordinator.env
+ExecStart=/opt/auspexai-coordinator/bin/auspexai-coordinator refresh-hf-catalog
+
+# Hardening — same shape as the other coordinator timers. WRITES only the cache
+# file (atomic temp+replace) into the coordinator state dir; makes outbound HTTPS.
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/auspexai-coordinator
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

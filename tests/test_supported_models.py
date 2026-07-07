@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from auspexai_platform.config import Config
+from auspexai_platform.hf_catalog import CatalogModel, write_catalog
 from auspexai_platform.supported_models import SUPPORTED_MODELS
 
 
@@ -28,6 +30,35 @@ def test_no_workers_shows_curated_set_as_unknown(client: TestClient, maintainer_
     assert got == {m.model_id for m in SUPPORTED_MODELS}
     assert all(m["status"] == "unknown" and m["in_catalog"] for m in body["models"])
     assert body["fleet_can_auto_acquire"] is False
+    assert body["catalog_source"] == "curated"  # no HF cache written → seed fallback
+
+
+def test_uses_hf_cache_when_present(
+    client: TestClient, config: Config, maintainer_token: str
+) -> None:
+    # A warm HF cache supersedes the curated seed as the provisionable set.
+    write_catalog(
+        config.hf_catalog_path,
+        [
+            CatalogModel(
+                "meta-llama-3.1-8b-instruct-q4",
+                "Meta Llama 3.1 8B Instruct",
+                "Meta",
+                8.0,
+                "Q4_K_M",
+                5.5,
+                "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+            )
+        ],
+        fetched_at="2026-07-07T12:00:00+00:00",
+    )
+    body = client.get("/api/v0/models/supported", headers=_mh(maintainer_token)).json()
+    assert body["catalog_source"] == "hf"
+    assert body["catalog_fetched_at"] == "2026-07-07T12:00:00+00:00"
+    by = _by_id(body)
+    assert by["meta-llama-3.1-8b-instruct-q4"]["hf_repo"].startswith("bartowski/")
+    # The curated-seed models are NOT the provisionable set when HF is warm.
+    assert "phi-3.5-mini-instruct-q4" not in by
 
 
 def test_present_model_is_available_and_counted(

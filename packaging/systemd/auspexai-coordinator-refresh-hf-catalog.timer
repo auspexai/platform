@@ -1,0 +1,16 @@
+[Unit]
+Description=AuspexAI coordinator D23 HuggingFace catalog refresh (daily; catches new model uploads so the provisionable menu stays fresh)
+Documentation=https://github.com/auspexai/platform
+
+[Timer]
+# Daily is plenty — new notable GGUF instruct models land on the order of days,
+# and a failed run leaves the last cache in place (the endpoint keeps serving it,
+# or falls back to the curated seed). Persistent catches up a missed run after
+# downtime; the randomized delay avoids hammering HF at a fixed second.
+OnBootSec=15min
+OnUnitActiveSec=1d
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
