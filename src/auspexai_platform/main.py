@@ -17,7 +17,9 @@ Composition order (one section per M-milestone):
 
 from __future__ import annotations
 
+import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
@@ -224,6 +226,22 @@ def create_app(
     # §9 #40a: content-addressed executor-package blob store (the courier).
     package_store = PackageStore(config.packages_dir)
 
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        # Startup: state is wired eagerly below, so nothing to do here.
+        yield
+        # Shutdown: release the per-job SQLite connections this app opened. The
+        # daemon holds them for its lifetime, but both SIGTERM (systemctl stop)
+        # and a TestClient __exit__ land here. Without it, every app instance
+        # leaks one open fd per experiment it touched — harmless for the single
+        # long-lived daemon, but across the nightly property soak (a fresh app
+        # per Hypothesis example) it exhausts the fd limit → OSError [Errno 24].
+        # This is the closure the per_job.py docstring already promises.
+        try:
+            per_job_factory.close_all()
+        except Exception:
+            logging.getLogger(__name__).exception("per_job_factory.close_all() failed on shutdown")
+
     app = FastAPI(
         title="AuspexAI Coordinator",
         version=__version__,
@@ -240,6 +258,7 @@ def create_app(
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=_lifespan,
     )
 
     # CORS — allow the operator console and any env-configured origins.
