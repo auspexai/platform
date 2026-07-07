@@ -108,13 +108,21 @@ class TestReceiptOutcomeRepository:
     ) -> None:
         worker_repository.enroll(worker_id="wkr-a", pubkey_hex="a" * 64)
         receipt_index_repository.record_no_receipt(
-            worker_id="wkr-a", result_id="res-1", experiment_id="e",
-            unit_id="u", outcome="no_receipt", reason="diverged_from_consensus",
+            worker_id="wkr-a",
+            result_id="res-1",
+            experiment_id="e",
+            unit_id="u",
+            outcome="no_receipt",
+            reason="diverged_from_consensus",
         )
         # A later abort-cascade write is a no-op (INSERT OR IGNORE).
         receipt_index_repository.record_no_receipt(
-            worker_id="wkr-a", result_id="res-1", experiment_id="e",
-            unit_id="u", outcome="experiment_terminal", reason="experiment_aborted",
+            worker_id="wkr-a",
+            result_id="res-1",
+            experiment_id="e",
+            unit_id="u",
+            outcome="experiment_terminal",
+            reason="experiment_aborted",
         )
         got = receipt_index_repository.get_result_outcome(worker_id="wkr-a", result_id="res-1")
         assert got.reason == "diverged_from_consensus"
@@ -177,10 +185,7 @@ class TestIssuanceMarkers:
         )
         assert len(outcome.issued_receipt_ids) == 2  # each observation earns one
         for wid, rid in (("wkr-1", "res-1"), ("wkr-2", "res-2")):
-            assert (
-                receipt_index_repository.get_result_outcome(worker_id=wid, result_id=rid)
-                is None
-            )
+            assert receipt_index_repository.get_result_outcome(worker_id=wid, result_id=rid) is None
 
 
 # ---- endpoint: 410 terminal vs 404 transient ----------------------------
@@ -189,8 +194,12 @@ class TestIssuanceMarkers:
 class TestEndpointTerminalVsTransient:
     def _signed_get(self, client, priv, pub, path):
         headers = sign_request(
-            privkey=priv, pubkey_hex=pub, method="GET",
-            path=path, authority=AUTHORITY, body=b"",
+            privkey=priv,
+            pubkey_hex=pub,
+            method="GET",
+            path=path,
+            authority=AUTHORITY,
+            body=b"",
         )
         return client.get(path, headers=headers)
 
@@ -201,11 +210,17 @@ class TestEndpointTerminalVsTransient:
         pub = priv.public_key().public_bytes_raw().hex()
         worker = worker_repository.enroll(worker_id="wkr-t", pubkey_hex=pub)
         client.app.state.receipt_index_repository.record_no_receipt(
-            worker_id=worker.worker_id, result_id="res-div", experiment_id="e",
-            unit_id="u", outcome="no_receipt", reason="diverged_from_consensus",
+            worker_id=worker.worker_id,
+            result_id="res-div",
+            experiment_id="e",
+            unit_id="u",
+            outcome="no_receipt",
+            reason="diverged_from_consensus",
         )
         resp = self._signed_get(
-            client, priv, pub,
+            client,
+            priv,
+            pub,
             f"/api/v0/workers/{worker.worker_id}/results/res-div/canonical-receipt",
         )
         assert resp.status_code == 410, resp.text
@@ -220,7 +235,9 @@ class TestEndpointTerminalVsTransient:
         pub = priv.public_key().public_bytes_raw().hex()
         worker = worker_repository.enroll(worker_id="wkr-t", pubkey_hex=pub)
         resp = self._signed_get(
-            client, priv, pub,
+            client,
+            priv,
+            pub,
             f"/api/v0/workers/{worker.worker_id}/results/res-pending/canonical-receipt",
         )
         assert resp.status_code == 404, resp.text
@@ -247,9 +264,14 @@ class TestSettleTerminalExperiment:
         wu_repo.submit_batch([{"unit_id": "u-open", "payload": {}}], replication_target=3)
         wu_repo.mark_in_progress("u-open")
         ResultRepository(per_job_db).insert(
-            result_id="res-open", unit_id="u-open", worker_id="wkr-1",
-            worker_pubkey_hex="1" * 64, exit_code=0, payload={"a": 1},
-            worker_signature="s", completed_at=datetime(2026, 5, 22, 10, 0, tzinfo=UTC),
+            result_id="res-open",
+            unit_id="u-open",
+            worker_id="wkr-1",
+            worker_pubkey_hex="1" * 64,
+            exit_code=0,
+            payload={"a": 1},
+            worker_signature="s",
+            completed_at=datetime(2026, 5, 22, 10, 0, tzinfo=UTC),
         )
 
         out = settle_terminal_experiment(

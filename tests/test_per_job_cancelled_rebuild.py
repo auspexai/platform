@@ -68,7 +68,10 @@ def test_rebuild_accepts_cancelled_and_preserves_data_and_fks(tmp_path: Path) ->
     assert row["pinned_worker_id"] == "wkr-x"  # all columns copied
 
     # Child FK row + referential integrity preserved.
-    assert db.execute("SELECT unit_id FROM assignments WHERE assignment_id = 'a1'")[0]["unit_id"] == "u1"
+    assert (
+        db.execute("SELECT unit_id FROM assignments WHERE assignment_id = 'a1'")[0]["unit_id"]
+        == "u1"
+    )
     assert db.execute("PRAGMA foreign_key_check") == []
     # foreign_keys re-enabled after the rebuild.
     assert db.execute("PRAGMA foreign_keys")[0][0] == 1
@@ -92,6 +95,4 @@ def test_rebuild_is_idempotent(tmp_path: Path) -> None:
     assert sql_after_first == sql_after_second
     assert "'cancelled'" in sql_after_second
     # No stray work_units_new left behind.
-    assert not db.execute(
-        "SELECT name FROM sqlite_master WHERE name = 'work_units_new'"
-    )
+    assert not db.execute("SELECT name FROM sqlite_master WHERE name = 'work_units_new'")
