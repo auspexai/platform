@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from auspexai_platform.auth.credential import Credential
 from auspexai_platform.db.repositories import WorkerRepository
-from auspexai_platform.supported_models import SUPPORTED_MODELS
+from auspexai_platform.supported_models import supported_by_id
 from auspexai_platform.worker_status import heartbeat_cutoff
 
 
@@ -42,13 +42,14 @@ class SupportedEntry(BaseModel):
     model_id: str
     display_name: str
     family: str
-    param_b: float
+    param_b: float | None  # None for fleet-present models outside the curated set
     quant: str
-    approx_ram_gb: float
-    served_worker_count: int  # active workers serving it right now (green dot)
-    fits_worker_count: int  # active workers big enough to serve it (RAM known)
+    approx_ram_gb: float | None  # None when the model isn't in the curated catalog
+    on_worker_count: int  # active workers that have it available now (the green dot)
+    fits_worker_count: int  # active workers big enough (curated + RAM known)
     ram_known_workers: int  # active workers that reported RAM (denominator honesty)
-    status: str  # 'served' | 'runnable' | 'too_big' | 'unknown'
+    status: str  # 'available' | 'runnable' | 'too_big' | 'unknown'
+    in_catalog: bool  # True = in the curated supported set (has sizing metadata)
 
 
 class SupportedResponse(BaseModel):
@@ -90,19 +91,22 @@ def build_router(credential_dep, worker_repository: WorkerRepository) -> APIRout
     async def get_supported(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> SupportedResponse:
-        """The TOP-DOWN catalog: every model the network SUPPORTS, whether or not
-        it's loaded on a worker right now — so a researcher sees their full menu,
-        with the live fleet overlaid. `status` per model:
-          - `served`   — ≥1 active worker is serving it now (the green dot);
-          - `runnable` — not served, but the fleet could run it (an auto-acquire
-                         worker exists, and — where RAM is reported — ≥1 is big
-                         enough);
-          - `too_big`  — RAM is reported by ≥1 worker and NONE is big enough;
-          - `unknown`  — not served and no worker reported RAM, so capacity can't
-                         be judged (never rendered as 'can't run').
-        RAM (`ram_total_gb`) is frequently null on real heartbeats, so it is
-        strictly null-safe: a worker that doesn't report RAM is counted in
-        neither `fits` nor `too_big`, only in the honest denominator."""
+        """The Requests-page catalog = the fleet's REAL inventory PLUS the curated
+        provisionable set (union, deduped). Two honest layers:
+          - `available` — present on ≥1 active worker RIGHT NOW
+            (`capabilities["models"]`), so no pull needed (the green dot). This
+            INCLUDES models a worker holds that aren't in the curated set — the
+            page reflects what the fleet actually has, not just the vetted menu;
+          - `runnable`  — in the curated set, not on any worker, and the fleet
+            could pull it (an auto-acquire worker exists; where RAM is reported,
+            ≥1 is big enough);
+          - `too_big`   — in the curated set, not present, RAM reported by ≥1
+            worker and none is big enough (needs a bigger worker);
+          - `unknown`   — in the curated set, not present, no worker reported RAM.
+        RAM is strictly null-safe (a worker not reporting RAM is in neither
+        `fits` nor `too_big`). `served_models` is empty on real heartbeats, so
+        `capabilities["models"]` = 'present/available' — that's what the green
+        dot means."""
         if not (
             credential.is_researcher() or credential.is_account() or credential.is_maintainer()
         ):
@@ -115,14 +119,14 @@ def build_router(credential_dep, worker_repository: WorkerRepository) -> APIRout
         total_active = len(caps)
         auto_acquire_fleet = any(c.get("auto_acquire") is True for c in caps)
 
-        # Per-model tallies over the active fleet.
-        served: dict[str, int] = {}
+        # What each active worker actually HAS (present/available inventory).
+        present: dict[str, int] = {}
         for c in caps:
             have = c.get("models")
             if isinstance(have, list):
                 for mid in have:
                     if isinstance(mid, str):
-                        served[mid] = served.get(mid, 0) + 1
+                        present[mid] = present.get(mid, 0) + 1
 
         def _ram(c: dict) -> float | None:
             v = c.get("ram_total_gb")
@@ -130,35 +134,48 @@ def build_router(credential_dep, worker_repository: WorkerRepository) -> APIRout
 
         ram_known = [r for c in caps if (r := _ram(c)) is not None]
 
+        catalog = supported_by_id()  # {model_id: SupportedModel}
+        # UNION: everything on the fleet + the whole curated set (deduped).
         entries: list[SupportedEntry] = []
-        for m in SUPPORTED_MODELS:
-            served_n = served.get(m.model_id, 0)
-            fits_n = sum(1 for r in ram_known if r >= m.approx_ram_gb)
-            if served_n > 0:
-                st = "served"
+        for mid in set(present) | set(catalog):
+            m = catalog.get(mid)
+            on_n = present.get(mid, 0)
+            fits_n = sum(1 for r in ram_known if r >= m.approx_ram_gb) if m else 0
+            if on_n > 0:
+                st = "available"  # it's on a worker — reflect reality regardless of catalog
+            elif m is None:
+                st = "unknown"  # unreachable (a non-curated id only enters via `present`)
             elif ram_known and fits_n == 0:
-                st = "too_big"  # someone reported RAM and nobody is big enough
+                st = "too_big"
             elif auto_acquire_fleet and (fits_n > 0 or not ram_known):
-                st = "runnable"  # the fleet can pull it (RAM unknown ⇒ give benefit of doubt)
+                st = "runnable"  # RAM unknown ⇒ benefit of the doubt
             else:
                 st = "unknown"
             entries.append(
                 SupportedEntry(
-                    model_id=m.model_id,
-                    display_name=m.display_name,
-                    family=m.family,
-                    param_b=m.param_b,
-                    quant=m.quant,
-                    approx_ram_gb=m.approx_ram_gb,
-                    served_worker_count=served_n,
+                    model_id=mid,
+                    display_name=m.display_name if m else mid,
+                    family=m.family if m else "",
+                    param_b=m.param_b if m else None,
+                    quant=m.quant if m else "",
+                    approx_ram_gb=m.approx_ram_gb if m else None,
+                    on_worker_count=on_n,
                     fits_worker_count=fits_n,
                     ram_known_workers=len(ram_known),
                     status=st,
+                    in_catalog=m is not None,
                 )
             )
-        # Served first (most workers), then by ascending size — the natural menu.
-        _rank = {"served": 0, "runnable": 1, "unknown": 2, "too_big": 3}
-        entries.sort(key=lambda e: (_rank[e.status], -e.served_worker_count, e.param_b))
+        # Available first (most workers), then the provisionable menu by size.
+        _rank = {"available": 0, "runnable": 1, "unknown": 2, "too_big": 3}
+        entries.sort(
+            key=lambda e: (
+                _rank[e.status],
+                -e.on_worker_count,
+                e.param_b if e.param_b is not None else 999.0,
+                e.model_id,
+            )
+        )
         return SupportedResponse(
             models=entries,
             total_active_workers=total_active,

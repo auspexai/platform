@@ -58,6 +58,14 @@ SUPPORTED_MODELS: tuple[SupportedModel, ...] = (
     SupportedModel("llama-3.2-3b-instruct-q4", "Llama 3.2 · 3B", "Llama", 3.0, "Q4_K_M", 3.6),
     SupportedModel("qwen2.5-3b-instruct-q4", "Qwen2.5 · 3B", "Qwen", 3.0, "Q4_K_M", 3.6),
     SupportedModel("phi-3.5-mini-instruct-q4", "Phi-3.5 mini · 3.8B", "Phi", 3.8, "Q4_K_M", 4.2),
+    # ── mid tier (fits a ~8 GB worker; may be too_big for smaller ones) ──
+    SupportedModel("mistral-7b-instruct-q4", "Mistral · 7B", "Mistral", 7.0, "Q4_K_M", 5.0),
+    SupportedModel("qwen2.5-7b-instruct-q4", "Qwen2.5 · 7B", "Qwen", 7.0, "Q4_K_M", 5.0),
+    SupportedModel("llama-3.1-8b-instruct-q4", "Llama 3.1 · 8B", "Llama", 8.0, "Q4_K_M", 5.6),
+    # ── large tier (needs a bigger worker than the current fleet) ──
+    SupportedModel("qwen2.5-14b-instruct-q4", "Qwen2.5 · 14B", "Qwen", 14.0, "Q4_K_M", 9.0),
+    SupportedModel("qwen2.5-32b-instruct-q4", "Qwen2.5 · 32B", "Qwen", 32.0, "Q4_K_M", 20.0),
+    SupportedModel("llama-3.3-70b-instruct-q4", "Llama 3.3 · 70B", "Llama", 70.0, "Q4_K_M", 42.0),
 )
 
 
