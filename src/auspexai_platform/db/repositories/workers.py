@@ -408,6 +408,26 @@ class WorkerRepository:
                 out.append(r["worker_id"])
         return out
 
+    def active_capabilities(self, *, heartbeat_cutoff: datetime) -> list[dict]:
+        """Parsed `capabilities` of every ACTIVE worker (same predicate as
+        `count_active`) — the raw material for the top-down supported-models
+        overlay (`GET /models/supported`): which supported models are served
+        now (`models`), which the fleet could pull (`auto_acquire`), and whether
+        a worker is big enough (`ram_total_gb`, often null — treat as unknown,
+        never as 'too small'). Identity-free; returns the capability dicts only."""
+        rows = self.db.execute(
+            "SELECT capabilities_json FROM workers "
+            "WHERE retired_at IS NULL AND quarantined_at IS NULL AND paused_at IS NULL "
+            "AND last_heartbeat_at IS NOT NULL AND last_heartbeat_at >= ?",
+            (heartbeat_cutoff.isoformat(),),
+        )
+        out: list[dict] = []
+        for r in rows:
+            caps = json.loads(r["capabilities_json"] or "{}")
+            if isinstance(caps, dict):
+                out.append(caps)
+        return out
+
     def count_auto_acquire(self, *, heartbeat_cutoff: datetime) -> int:
         """Count active workers that have opted into M3 lazy auto-acquire — they
         can run ANY model whose manifest carries hf coords by pulling it in-line
