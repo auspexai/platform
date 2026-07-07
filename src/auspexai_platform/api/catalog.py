@@ -117,11 +117,14 @@ def build_router(
         `capabilities["models"]` = 'present/available' — that's what the green
         dot means."""
         if not (
-            credential.is_researcher() or credential.is_account() or credential.is_maintainer()
+            credential.is_researcher()
+            or credential.is_account()
+            or credential.is_maintainer()
+            or credential.is_worker()  # workers consult the catalog to pick what to install
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="researcher, account, or maintainer credential required",
+                detail="researcher, account, maintainer, or worker credential required",
             )
         cutoff = heartbeat_cutoff(datetime.now(UTC))
         caps = worker_repository.active_capabilities(heartbeat_cutoff=cutoff)
