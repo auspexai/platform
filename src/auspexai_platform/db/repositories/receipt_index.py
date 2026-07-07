@@ -38,6 +38,22 @@ class ReceiptIndexEntry:
     account_id_at_issue: str | None = None  # 0041: account snapshot, survives worker unbind
 
 
+@dataclass(frozen=True)
+class ReceiptOutcome:
+    """One row of the receipt_outcomes sibling table (0057) — a submitted
+    (worker, result) pair that will NEVER receive a canonical receipt. The
+    negative counterpart to ReceiptIndexEntry; kept in a separate table so it
+    never contaminates the trust-accounting queries that read receipt_index."""
+
+    worker_id: str
+    result_id: str
+    experiment_id: str
+    unit_id: str | None
+    outcome: str  # 'no_receipt' | 'experiment_terminal'
+    reason: str | None
+    recorded_at: str | None = None
+
+
 class ReceiptIndexRepository:
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -393,6 +409,63 @@ class ReceiptIndexRepository:
             (worker_id, result_id),
         )
         return self._row_to_entry(rows[0]) if rows else None
+
+    # ---- receipt_outcomes (D22-B): terminal "no receipt will ever issue" ----
+
+    def record_no_receipt(
+        self,
+        *,
+        worker_id: str,
+        result_id: str,
+        experiment_id: str,
+        unit_id: str | None,
+        outcome: str,
+        reason: str | None = None,
+    ) -> None:
+        """Mark a submitted (worker, result) pair as terminally receipt-less
+        (0057). `outcome` is 'no_receipt' (consensus reached, this replica was
+        not selected — quorum disagreed / outlier) or 'experiment_terminal'
+        (the experiment went terminal before the unit reached consensus).
+
+        Idempotent (INSERT OR IGNORE on the UNIQUE (worker_id, result_id)), so
+        re-finalization and a re-run of the settle sweep are both no-ops — the
+        FIRST terminal reason recorded wins, which is fine since both are
+        terminal. Best-effort at the call site: like record_divergence, a write
+        failure here never blocks unit completion or the abort transition."""
+        self.db.execute(
+            """
+            INSERT OR IGNORE INTO receipt_outcomes
+              (worker_id, result_id, experiment_id, unit_id, outcome, reason)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (worker_id, result_id, experiment_id, unit_id, outcome, reason),
+        )
+
+    def get_result_outcome(self, *, worker_id: str, result_id: str) -> ReceiptOutcome | None:
+        """The terminal no-receipt outcome for a (worker, result) pair, or None
+        if none is recorded (→ the caller treats absence as 'not decided yet',
+        a transient 404). The canonical-receipt endpoint checks receipt_index
+        first (issued → 200), then this (present → 410 receipt_will_not_issue)."""
+        rows = self.db.execute(
+            """
+            SELECT worker_id, result_id, experiment_id, unit_id, outcome, reason, recorded_at
+            FROM receipt_outcomes
+            WHERE worker_id = ? AND result_id = ?
+            """,
+            (worker_id, result_id),
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return ReceiptOutcome(
+            worker_id=r["worker_id"],
+            result_id=r["result_id"],
+            experiment_id=r["experiment_id"],
+            unit_id=r["unit_id"],
+            outcome=r["outcome"],
+            reason=r["reason"],
+            recorded_at=r["recorded_at"],
+        )
 
     def opted_in_account_ids(self, experiment_id: str) -> list[str]:
         """Distinct accounts that (a) contributed to this experiment and (b) had

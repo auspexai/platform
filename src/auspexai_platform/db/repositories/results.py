@@ -235,6 +235,14 @@ class ResultRepository:
             after_result_id=after_result_id,
         )
 
+    def all_result_refs(self) -> list[tuple[str, str, str]]:
+        """(worker_id, result_id, unit_id) for every result in this per-job DB —
+        the lightweight projection the D22-B settle/backfill sweep uses to decide
+        which results still need a terminal receipt-outcome marker, without
+        hydrating full Result models (or paginating) across a whole experiment."""
+        rows = self.db.execute("SELECT worker_id, result_id, unit_id FROM results")
+        return [(r["worker_id"], r["result_id"], r["unit_id"]) for r in rows]
+
     def list_active_payloads(self) -> list[Result]:
         """Every result that still holds its payload (not yet aged off) — the
         candidate set the age-off sweep computes horizons over."""

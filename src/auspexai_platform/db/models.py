@@ -121,12 +121,21 @@ class WorkUnitStatus(StrEnum):
     path drives the rest:
       pending → in_progress (≥1 assignment outstanding) → completed
                                                        \\→ failed
+                                                       \\→ cancelled
+
+    CANCELLED (D22-B) is the terminal state for a unit whose experiment went
+    terminal (aborted/archived) before the unit reached consensus — distinct
+    from FAILED (a code/schema fault, D16.1 §7). Like FAILED, the scheduler
+    offers only PENDING/IN_PROGRESS, so a cancelled unit is never re-offered.
+    Added to the per-job work_units CHECK via a one-time table rebuild
+    (per_job._ensure_work_units_cancelled_status).
     """
 
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class WorkerStatus(StrEnum):

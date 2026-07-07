@@ -751,16 +751,49 @@ def build_router(
             worker_id=worker_id, result_id=result_id
         )
         if entry is None:
+            # D22-B: distinguish TERMINAL from TRANSIENT so the worker's M7-tail
+            # backfill loop stops polling a receipt that will never come. A
+            # receipt_outcomes marker (0057) means no receipt was, or ever will
+            # be, issued for this (worker, result) — the unit reached consensus
+            # without selecting this replica (non-consensus / outlier — a VALID
+            # state, firewall #1, not a failure), or the experiment went terminal
+            # before consensus. 410 Gone. Absence of a marker means genuinely
+            # not-yet-decided → 404, transient (the worker keeps polling).
+            outcome = receipt_index_repository.get_result_outcome(
+                worker_id=worker_id, result_id=result_id
+            )
+            if outcome is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_410_GONE,
+                    detail={
+                        "error": {
+                            "code": "receipt_will_not_issue",
+                            "message": (
+                                f"no canonical receipt will issue for "
+                                f"worker={worker_id} result={result_id} "
+                                f"({outcome.reason or outcome.outcome}) — the "
+                                f"result remains valid, recorded, and exportable; "
+                                f"there is simply no consensus receipt for it"
+                            ),
+                            "details": {
+                                "outcome": outcome.outcome,
+                                "reason": outcome.reason,
+                                "terminal": True,
+                            },
+                        }
+                    },
+                )
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={
                     "error": {
                         "code": "receipt_not_issued",
                         "message": (
-                            f"no receipt issued for worker={worker_id} "
-                            f"result={result_id} — likely the unit's quorum "
-                            f"disagreed, or M7c issuance hasn't fired yet"
+                            f"no receipt issued yet for worker={worker_id} "
+                            f"result={result_id} — consensus/issuance may not "
+                            f"have fired yet; retry"
                         ),
+                        "details": {"terminal": False},
                     }
                 },
             )

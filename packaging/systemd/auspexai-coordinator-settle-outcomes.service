@@ -1,0 +1,31 @@
+[Unit]
+Description=AuspexAI coordinator — D22-B settle terminal experiments' receipt outcomes (cancel open units + mark receiptless results so workers stop polling)
+Documentation=https://github.com/auspexai/platform
+# Runs against the same state dir as the coordinator; ordered after it so the
+# daemon is up (the sweep uses its own DB connection, but co-scheduling is cleaner).
+After=network-online.target auspexai-coordinator.service
+Wants=auspexai-coordinator.service
+
+[Service]
+Type=oneshot
+User=jason
+Group=jason
+# Match the coordinator daemon's environment EXACTLY: same state dir (so it reads
+# the same control + per-job DBs) and the same operational receipts mode.
+Environment=AUSPEXAI_STATE_DIR=/var/lib/auspexai-coordinator
+Environment=AUSPEXAI_RECEIPTS_MODE=operational
+EnvironmentFile=-/etc/auspexai/coordinator.env
+ExecStart=/opt/auspexai-coordinator/bin/auspexai-coordinator settle-outcomes --apply
+
+# Hardening — same shape as auspexai-coordinator-settle.service. The sweep WRITES
+# (settles units + writes receipt_outcomes markers) into the coordinator state dir.
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/auspexai-coordinator
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

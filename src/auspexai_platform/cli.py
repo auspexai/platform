@@ -192,6 +192,58 @@ def settle(state_dir: Path | None, apply_changes: bool) -> None:
         click.echo("\nRe-run with --apply to settle these units.")
 
 
+@main.command("settle-outcomes")
+@_state_dir_option
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Actually cancel open units + write terminal receipt-outcome markers. Default is a dry-run.",
+)
+@click.option(
+    "--include-completed/--no-include-completed",
+    default=True,
+    help="Also backfill markers for the non-consensus/outlier results of COMPLETED experiments (the historical backlog). On by default.",
+)
+def settle_outcomes(state_dir: Path | None, apply_changes: bool, include_completed: bool) -> None:
+    """Settle terminal experiments' receipt outcomes (D22-B).
+
+    For ABORTED/ARCHIVED experiments: cancel still-open units and mark every
+    result that earned no receipt as terminally receipt-less, so the worker's
+    canonical-receipt backfill loop STOPS polling (instead of a perpetual 404).
+    For COMPLETED experiments: backfill the same markers for non-consensus /
+    outlier results — VALID data (firewall #1), just receipt-less. Idempotent;
+    DRY-RUN by default. This is BOTH the one-time backfill of the pre-D22-B
+    backlog AND the recurring guard (safe on a systemd timer alongside settle).
+    """
+    from auspexai_platform.scheduler.teardown import settle_all_terminal_experiments
+    from auspexai_platform.services import build_coordinator_services
+
+    config = _resolve_config(state_dir)
+    svc = build_coordinator_services(config)
+    results = settle_all_terminal_experiments(
+        experiment_repository=svc.experiment_repository,
+        per_job_factory=svc.per_job_factory,
+        receipt_index_repository=svc.receipt_index_repository,
+        include_completed=include_completed,
+        apply=apply_changes,
+    )
+    verb = "settled" if apply_changes else "would settle"
+    total_units = sum(r.units_cancelled for r in results)
+    total_results = sum(r.results_marked for r in results)
+    click.echo(
+        f"{verb}: {len(results)} experiment(s) — {total_units} open unit(s) "
+        f"cancelled, {total_results} receiptless result(s) marked terminal."
+    )
+    for r in results:
+        click.echo(
+            f"  {r.experiment_id}  · units_cancelled={r.units_cancelled} "
+            f"results_marked={r.results_marked}"
+        )
+    if not apply_changes and results:
+        click.echo("\nRe-run with --apply to write these changes.")
+
+
 # ----------------------------------------------------------------------------
 # attestation group (A2 — Rekor anchoring backfill)
 # ----------------------------------------------------------------------------

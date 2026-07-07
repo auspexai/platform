@@ -342,6 +342,36 @@ def issue_receipts_for_completed_unit(
                     r.worker_id,
                 )
 
+    def _mark_receiptless(receiptless: list[Result], *, reason: str) -> None:
+        """D22-B: record the terminal 'no canonical receipt will issue' outcome
+        (0057) for results that did not earn one, so the worker's M7-tail
+        backfill loop STOPS polling instead of a perpetual 404.
+
+        NON-CONSENSUS IS A VALID STATE (firewall #1, observe-all). This marks
+        only the RECEIPT as terminal — the result stays valid data, remains
+        recorded (divergence_index) and D19-exportable. It is NOT a failure.
+        Never fires for observe-only/process_only units (every replica earns an
+        observation receipt there, so this set is empty). Best-effort: never
+        blocks unit completion."""
+        if receipt_index_repo is None:
+            return
+        for r in receiptless:
+            try:
+                receipt_index_repo.record_no_receipt(
+                    worker_id=r.worker_id,
+                    result_id=r.result_id,
+                    experiment_id=experiment.experiment_id,
+                    unit_id=work_unit.unit_id,
+                    outcome="no_receipt",
+                    reason=reason,
+                )
+            except Exception:
+                logger.exception(
+                    "receipt_outcomes record failed for unit %s result %s",
+                    work_unit.unit_id,
+                    r.result_id,
+                )
+
     if not outcome.agreed:
         logger.warning(
             "unit %s: no consensus under %s — no receipts issued "
@@ -351,6 +381,10 @@ def issue_receipts_for_completed_unit(
             work_unit.replication_target,
             len(results),
         )
+        # Non-consensus: a valid state, not a failure — but no consensus receipt
+        # will ever issue for these results, so mark them terminal-receiptless
+        # (the worker stops polling; the data stays recorded + exportable).
+        _mark_receiptless(results, reason="non_consensus")
         return ReceiptIssuanceOutcome(
             issued_receipt_ids=[], agreement=outcome, agreeing_result_ids=[]
         )
@@ -470,6 +504,13 @@ def issue_receipts_for_completed_unit(
             outcome.agreeing_workers,
             work_unit.replication_target,
         )
+
+    # Consensus formed, but any outliers (tolerance replicas outside the
+    # envelope) earn no receipt. They are valid diverged observations
+    # (recorded above in divergence_index, D19-exportable) — mark only their
+    # RECEIPT terminal so the worker stops polling. Empty for exact-agreement
+    # and observe-only units.
+    _mark_receiptless(outliers, reason="diverged_from_consensus")
 
     return ReceiptIssuanceOutcome(
         issued_receipt_ids=issued,

@@ -1872,7 +1872,7 @@ def build_router(
         experiment_id: str,
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> ExperimentResponse:
-        return _transition(
+        response = _transition(
             experiment_id=experiment_id,
             new_status=ExperimentStatus.ABORTED,
             credential=credential,
@@ -1882,6 +1882,30 @@ def build_router(
             audit_repository=audit_repository,
             event_bus=event_bus,
         )
+        # D22-B teardown cascade: the status flip alone leaves open units
+        # in_progress forever and every collected result without a terminal
+        # signal, so workers poll canonical-receipt 404s that never resolve.
+        # Cancel the open units and mark receiptless results terminal so the
+        # worker's M7-tail loop stops. Best-effort — never undo a successful
+        # abort if the cascade hits a snag (the settle sweep is the backstop).
+        if per_job_factory is not None and receipt_index_repository is not None:
+            try:
+                from auspexai_platform.scheduler.teardown import (
+                    settle_terminal_experiment,
+                )
+
+                settle_terminal_experiment(
+                    experiment_id=experiment_id,
+                    experiment_status=ExperimentStatus.ABORTED,
+                    per_job_factory=per_job_factory,
+                    receipt_index_repository=receipt_index_repository,
+                )
+            except Exception:
+                logger.exception(
+                    "D22-B abort cascade failed for %s; run the settle sweep",
+                    experiment_id,
+                )
+        return response
 
     @router.post(
         "/experiments/{experiment_id}/actions/archive",

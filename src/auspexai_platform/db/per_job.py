@@ -29,7 +29,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from auspexai_platform.db.database import Database
+from auspexai_platform.db.database import Database, DatabaseError
 
 # Per-job DB schema. M6c added `work_units`; M6d adds `assignments` and
 # `results`. The constant is idempotent (CREATE TABLE IF NOT EXISTS) so
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS work_units (
     completions_so_far   INTEGER NOT NULL DEFAULT 0,
     created_at           TEXT    NOT NULL,
     pinned_worker_id     TEXT,
-    CHECK (status IN ('pending', 'in_progress', 'completed', 'failed'))
+    CHECK (status IN ('pending', 'in_progress', 'completed', 'failed', 'cancelled'))
 );
 
 CREATE INDEX IF NOT EXISTS work_units_status_idx ON work_units(status);
@@ -182,6 +182,7 @@ class PerJobDatabaseFactory:
             _ensure_results_served_weights_columns(db)
             _ensure_results_ran_under_column(db)
             _ensure_work_units_pin_column(db)
+            _ensure_work_units_cancelled_status(db)
             _ensure_unit_consensus_table(db)
             self._cache[experiment_id] = db
             return db
@@ -209,6 +210,7 @@ class PerJobDatabaseFactory:
             _ensure_results_served_weights_columns(db)
             _ensure_results_ran_under_column(db)
             _ensure_work_units_pin_column(db)
+            _ensure_work_units_cancelled_status(db)
             _ensure_unit_consensus_table(db)
             self._cache[experiment_id] = db
             return db
@@ -291,6 +293,68 @@ def _ensure_work_units_pin_column(db: Database) -> None:
     (M4-tail pin / force-assign). Part of PER_JOB_SCHEMA_SQL for new DBs; this
     converges existing per-job DBs. NULL = unpinned (every existing unit)."""
     _add_columns_idempotent(db, "work_units", (("pinned_worker_id", "TEXT"),))
+
+
+def _ensure_work_units_cancelled_status(db: Database) -> None:
+    """D22-B: add 'cancelled' to the per-job `work_units.status` CHECK. Part of
+    PER_JOB_SCHEMA_SQL for new DBs; existing DBs baked the old 4-value CHECK into
+    the table definition and SQLite cannot alter a CHECK in place — so this does
+    the one-time 12-step table rebuild (create-new → copy → drop → rename). It is
+    idempotent (skips once the CHECK already lists 'cancelled') and columns are
+    hardcoded to the canonical shape, so `_ensure_work_units_pin_column` MUST run
+    first (it does — see get/get_or_create) to guarantee `pinned_worker_id`.
+
+    FK-safe: FKs are disabled around the swap (autocommit connection, so the
+    PRAGMA takes effect outside the transaction), and the child tables reference
+    `work_units(unit_id)` BY NAME — the rename preserves that, and every unit_id
+    is copied, so `PRAGMA foreign_key_check` stays clean. Runs under the factory
+    lock before the DB is handed out, so no concurrent access races the swap."""
+    table_sql = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_units'"
+    )
+    if not table_sql or "'cancelled'" in (table_sql[0]["sql"] or ""):
+        return  # fresh DB (already has it) or already rebuilt — idempotent no-op
+
+    # Autocommit connection (isolation_level=None): no active transaction here, so
+    # the foreign_keys PRAGMA takes effect (it is a silent no-op mid-transaction).
+    db.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with db.transaction() as cur:
+            cur.execute(
+                """
+                CREATE TABLE work_units_new (
+                    unit_id              TEXT    PRIMARY KEY,
+                    payload_json         TEXT    NOT NULL,
+                    status               TEXT    NOT NULL DEFAULT 'pending',
+                    replication_target   INTEGER NOT NULL DEFAULT 3,
+                    completions_so_far   INTEGER NOT NULL DEFAULT 0,
+                    created_at           TEXT    NOT NULL,
+                    pinned_worker_id     TEXT,
+                    CHECK (status IN ('pending', 'in_progress', 'completed', 'failed', 'cancelled'))
+                )
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO work_units_new
+                    (unit_id, payload_json, status, replication_target,
+                     completions_so_far, created_at, pinned_worker_id)
+                SELECT unit_id, payload_json, status, replication_target,
+                       completions_so_far, created_at, pinned_worker_id
+                FROM work_units
+                """
+            )
+            cur.execute("DROP TABLE work_units")
+            cur.execute("ALTER TABLE work_units_new RENAME TO work_units")
+            cur.execute("CREATE INDEX IF NOT EXISTS work_units_status_idx ON work_units(status)")
+        violations = db.execute("PRAGMA foreign_key_check")
+        if violations:
+            raise DatabaseError(
+                f"work_units CHECK rebuild left {len(violations)} FK violation(s): "
+                f"{[tuple(v) for v in violations[:3]]}"
+            )
+    finally:
+        db.execute("PRAGMA foreign_keys = ON")
 
 
 def _ensure_unit_consensus_table(db: Database) -> None:

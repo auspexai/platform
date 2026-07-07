@@ -161,6 +161,24 @@ class WorkUnitRepository:
             just_failed = cur.rowcount == 1
         return self.get_by_unit_id(unit_id), just_failed
 
+    def mark_cancelled(self, unit_id: str) -> tuple[WorkUnit | None, bool]:
+        """D22-B teardown cascade: take a non-terminal unit TERMINAL (→ 'cancelled')
+        because its experiment went terminal (aborted/archived) before the unit
+        reached consensus. Only touches PENDING/IN_PROGRESS units — never overrides
+        a unit that already reached 'completed' (good replicas settled it) or
+        'failed' (a code/schema fault stands on its own record). Race-safe +
+        idempotent via the status guard; returns (unit, just_cancelled) so a
+        re-run of the cascade is a no-op. Distinct from mark_failed: cancellation
+        is a lifecycle consequence, not a fault."""
+        with self.db.transaction() as cur:
+            cur.execute(
+                "UPDATE work_units SET status = 'cancelled' "
+                "WHERE unit_id = ? AND status IN ('pending', 'in_progress')",
+                (unit_id,),
+            )
+            just_cancelled = cur.rowcount == 1
+        return self.get_by_unit_id(unit_id), just_cancelled
+
     # ---- reads ----
 
     def get_by_unit_id(self, unit_id: str) -> WorkUnit | None:

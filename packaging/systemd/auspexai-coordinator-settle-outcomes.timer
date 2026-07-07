@@ -1,0 +1,16 @@
+[Unit]
+Description=AuspexAI coordinator D22-B settle-outcomes sweep (every 15 min; idempotent no-op when nothing is terminal-yet-unmarked)
+Documentation=https://github.com/auspexai/platform
+
+[Timer]
+# The abort route settles synchronously, so this is a backstop for anything that
+# went terminal without the cascade (a crash mid-abort, a pre-D22-B experiment)
+# and a slow drip that keeps the historical backlog drained. Cheap when there is
+# nothing new to settle (idempotent INSERT OR IGNORE + status-guarded updates).
+OnBootSec=8min
+OnUnitActiveSec=15min
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target
