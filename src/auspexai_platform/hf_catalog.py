@@ -44,8 +44,8 @@ _HF_API = "https://huggingface.co"
 # Non-instruct / non-text-gen / non-research noise the download-sorted GGUF feed
 # drags in (multimodal, embeddings, and the roleplay/uncensored/base long tail).
 _EXCLUDE_RE = re.compile(
-    r"embed|rerank|-vl\b|-vl-|vision|whisper|clip|bge-|sd[-.]|flux|diffusion|tts|stt"
-    r"|uncensored|abliterated|heretic|roleplay|-rp\b|erp\b|nsfw|-base\b",
+    r"embed|rerank|vlm|-vl\b|-vl-|vision|whisper|clip|bge-|sd[-.]|flux|diffusion|tts|stt"
+    r"|image|-edit|ltx|-video|uncensored|abliterated|heretic|roleplay|-rp\b|erp\b|nsfw|-base\b",
     re.IGNORECASE,
 )
 # The download-sorted GGUF firehose is dominated by hobbyist merges. Restrict to
