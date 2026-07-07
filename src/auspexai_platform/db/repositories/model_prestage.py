@@ -175,6 +175,45 @@ class ModelPrestageRepository:
                 best = cand
         return best
 
+    def abandon_stale_requested(self, *, older_than: datetime, apply: bool) -> int:
+        """Flip `requested` directives requested before `older_than` to
+        `abandoned` — so the worker STOPS re-polling a directive it can never
+        fulfil (model gone from HF, too big, disk full). The `abandoned` status
+        exists in the schema (0020) for exactly this and nothing set it before;
+        this is the guard against the D22-B-shaped perpetual re-poll. Returns the
+        count (accurate in dry-run and apply)."""
+        where = "status = 'requested' AND requested_at < ?"
+        if not apply:
+            rows = self.db.execute(
+                f"SELECT COUNT(*) AS n FROM model_prestage WHERE {where}",
+                (older_than.isoformat(),),
+            )
+            return int(rows[0]["n"]) if rows else 0
+        rows = self.db.execute(
+            f"UPDATE model_prestage SET status = 'abandoned' WHERE {where} RETURNING prestage_id",
+            (older_than.isoformat(),),
+        )
+        return len(rows)
+
+    def reap_dead_worker_rows(self, *, heartbeat_cutoff: datetime, apply: bool) -> int:
+        """DELETE prestage rows whose worker has not heartbeat since
+        `heartbeat_cutoff` (or is gone from `workers` entirely) — reaps orphaned
+        dead-weight rows AND unblocks re-staging (the `UNIQUE(model,worker)` row
+        is what blocks a fresh `create`) if the worker ever returns. A worker with
+        a recent heartbeat keeps all its rows. Returns the count."""
+        where = "worker_id NOT IN (SELECT worker_id FROM workers WHERE last_heartbeat_at >= ?)"
+        if not apply:
+            rows = self.db.execute(
+                f"SELECT COUNT(*) AS n FROM model_prestage WHERE {where}",
+                (heartbeat_cutoff.isoformat(),),
+            )
+            return int(rows[0]["n"]) if rows else 0
+        rows = self.db.execute(
+            f"DELETE FROM model_prestage WHERE {where} RETURNING prestage_id",
+            (heartbeat_cutoff.isoformat(),),
+        )
+        return len(rows)
+
     @staticmethod
     def _row(row) -> PrestageDirective:
         return PrestageDirective(

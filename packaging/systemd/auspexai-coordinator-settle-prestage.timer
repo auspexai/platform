@@ -1,0 +1,16 @@
+[Unit]
+Description=AuspexAI coordinator A11 model_prestage reaper (daily; idempotent no-op when nothing is stale or orphaned)
+Documentation=https://github.com/auspexai/platform
+
+[Timer]
+# Daily is plenty — prestage churn is low and the table is bounded by
+# UNIQUE(model,worker); this just abandons genuinely-stuck 'requested' rows
+# (default >7d) and reaps rows for long-gone workers (default >30d). Cheap when
+# there's nothing to do (guarded COUNT + status/heartbeat-scoped writes).
+OnBootSec=12min
+OnUnitActiveSec=1d
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -244,6 +244,72 @@ def settle_outcomes(state_dir: Path | None, apply_changes: bool, include_complet
         click.echo("\nRe-run with --apply to write these changes.")
 
 
+@main.command("settle-prestage")
+@_state_dir_option
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Actually reap dead-worker rows + abandon stale 'requested' directives. Default is a dry-run.",
+)
+@click.option(
+    "--stale-requested-days",
+    default=7,
+    show_default=True,
+    help="Flip 'requested' directives older than this to 'abandoned' (stops the perpetual re-poll).",
+)
+@click.option(
+    "--dead-worker-days",
+    default=30,
+    show_default=True,
+    help="Reap prestage rows for workers with no heartbeat in this many days.",
+)
+def settle_prestage(
+    state_dir: Path | None,
+    apply_changes: bool,
+    stale_requested_days: int,
+    dead_worker_days: int,
+) -> None:
+    """Reap the model_prestage table (A11 — persistent-artifact reaper).
+
+    Two bounded sweeps, mirroring `settle-outcomes`: (1) DELETE rows for workers
+    with no heartbeat in --dead-worker-days — reaping orphaned dead-weight rows
+    and unblocking re-staging if the worker returns; (2) flip `requested`
+    directives older than --stale-requested-days to `abandoned` (the schema's
+    dead status), so a worker STOPS re-polling a directive it can never fulfil —
+    the D22-B-shaped leak. Idempotent; DRY-RUN by default; safe on a systemd
+    timer. See `persistent_artifact_reaper_audit.md`.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from auspexai_platform.db.database import Database
+    from auspexai_platform.db.migrations import MigrationRunner
+    from auspexai_platform.db.repositories.model_prestage import ModelPrestageRepository
+
+    config = _resolve_config(state_dir)
+    now = datetime.now(UTC)
+    dead_cut = now - timedelta(days=dead_worker_days)
+    stale_cut = now - timedelta(days=stale_requested_days)
+    db = Database(config.control_db_path)
+    try:
+        MigrationRunner(db).apply_all()  # idempotent; ensures the table exists
+        repo = ModelPrestageRepository(db)
+        # Reap dead-worker rows FIRST, so the stale-requested count reflects only
+        # LIVE workers stuck on an unfulfillable directive (the interesting case).
+        reaped = repo.reap_dead_worker_rows(heartbeat_cutoff=dead_cut, apply=apply_changes)
+        abandoned = repo.abandon_stale_requested(older_than=stale_cut, apply=apply_changes)
+    finally:
+        db.close()
+    verb_r = "reaped" if apply_changes else "would reap"
+    verb_a = "abandoned" if apply_changes else "would abandon"
+    click.echo(
+        f"{verb_r} {reaped} dead-worker row(s) (no heartbeat >{dead_worker_days}d); "
+        f"{verb_a} {abandoned} stale 'requested' directive(s) (>{stale_requested_days}d)."
+    )
+    if not apply_changes and (reaped or abandoned):
+        click.echo("\nRe-run with --apply to write these changes.")
+
+
 @main.command("refresh-hf-catalog")
 @_state_dir_option
 @click.option(
