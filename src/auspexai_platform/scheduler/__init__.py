@@ -432,6 +432,19 @@ def worker_satisfies(
     # Real-execution experiment → only provisioned-mode workers (consensus safety).
     if not worker_runs_provisioned(worker):
         return False
+    # Top-down fleet-fit: a worker is eligible only if its RAM can actually SERVE
+    # each required model — whether it holds the model or would auto-acquire it. The
+    # coordinator sized the models from HF at submit (`model_ram_gb`); excluding a
+    # too-small worker here means a too-big model is never routed to it (where it
+    # would fail at load / refuse). Unsized models (no HF coords) and workers that
+    # don't report RAM pass through — the worker's own acquire guard is the backstop.
+    model_ram_gb = required_capabilities.get("model_ram_gb") or {}
+    worker_ram = worker.capabilities.get("ram_total_gb")
+    if isinstance(worker_ram, (int, float)) and model_ram_gb:
+        for mid in required_models:
+            fp = model_ram_gb.get(mid)
+            if isinstance(fp, (int, float)) and worker_ram < fp:
+                return False
     if worker.capabilities.get("auto_acquire") is True:
         return True
     have = worker.capabilities.get("models", [])

@@ -1035,3 +1035,72 @@ def test_worker_satisfies_features_dimension():
     assert worker_satisfies(worker_with_features(["other_feature"]), req) is False
     # No features requirement ⇒ the dimension is inert (back-compat).
     assert worker_satisfies(worker_with_features(None), {"models": ["m-a"]}) is True
+
+
+# ---- top-down fleet-fit: RAM-gated routing ----------------------------------
+
+
+def _worker_ram(worker_id: str, models, ram_gb, *, auto_acquire: bool = False) -> Worker:
+    caps: dict = {"os": "linux", "execute_tenant_code": "provisioned"}
+    if models is not None:
+        caps["models"] = models
+    if ram_gb is not None:
+        caps["ram_total_gb"] = ram_gb
+    if auto_acquire:
+        caps["auto_acquire"] = True
+    return Worker(
+        worker_id=worker_id,
+        pubkey_hex="a" * 64,
+        trust_tier=TrustTier.T2_TRUSTED,
+        capabilities=caps,
+        registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+
+
+def test_worker_satisfies_ram_gate_excludes_too_small_worker():
+    # The coordinator sized the model at submit (model_ram_gb). A worker that HOLDS
+    # the model but whose RAM can't serve it is NOT eligible — a too-big model is
+    # never routed to it.
+    req = {"models": ["big-model"], "model_ram_gb": {"big-model": 20.0}}
+    assert worker_satisfies(_worker_ram("w-small", ["big-model"], 7.44), req) is False
+    assert worker_satisfies(_worker_ram("w-big", ["big-model"], 24.0), req) is True
+
+
+def test_worker_satisfies_ram_gate_excludes_too_small_auto_acquire():
+    # An auto-acquire worker too small for the model must NOT be eligible either —
+    # it would pull it (now blocked by the worker guard) and fail at load.
+    req = {"models": ["big-model"], "model_ram_gb": {"big-model": 20.0}}
+    assert worker_satisfies(_worker_ram("w-aa", None, 7.44, auto_acquire=True), req) is False
+    assert worker_satisfies(_worker_ram("w-aa2", None, 24.0, auto_acquire=True), req) is True
+
+
+def test_worker_satisfies_ram_gate_backstop_when_unsized_or_ram_unknown():
+    # Backstop: an UNSIZED model (no model_ram_gb) or a worker that doesn't report
+    # RAM can't be gated here → passes (the worker's own acquire guard catches it).
+    assert worker_satisfies(_worker_ram("w1", ["m"], 7.44), {"models": ["m"]}) is True
+    sized = {"models": ["m"], "model_ram_gb": {"m": 20.0}}
+    assert worker_satisfies(_worker_ram("w2", ["m"], None), sized) is True
+
+
+def test_derive_required_capabilities_sizes_models():
+    from auspexai_platform.api.experiments import _derive_required_capabilities
+
+    class _FakeSizer:
+        def footprint_gb(self, repo, filename):
+            return 20.34 if repo and filename else None
+
+    manifest = {
+        "models": [
+            {
+                "id": "big-q4",
+                "local_weights_required": True,
+                "hf_repo": "org/big-GGUF",
+                "hf_filename": "big-Q4.gguf",
+            }
+        ]
+    }
+    req = _derive_required_capabilities(manifest, sizer=_FakeSizer())
+    assert req["models"] == ["big-q4"]
+    assert req["model_ram_gb"] == {"big-q4": 20.34}
+    # No sizer → no model_ram_gb (backward-compatible).
+    assert "model_ram_gb" not in _derive_required_capabilities(manifest)

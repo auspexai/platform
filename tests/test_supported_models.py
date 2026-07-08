@@ -151,3 +151,41 @@ def test_runnable_reports_repl_capacity_fits_1_of_2(
     assert m["status"] == "runnable"
     assert m["fits_worker_count"] == 1  # repl-1 only
     assert m["ram_known_workers"] == 2
+
+
+def test_present_unmenued_model_sized_from_worker_report_available(
+    client: TestClient, maintainer_token: str, worker_repository
+) -> None:
+    # The gemma-3-1b/smollm2 fix: a model NOT in the HF menu but PRESENT with a
+    # worker-reported on-disk size is sized from that report — small → available.
+    caps = {
+        "models": ["my-byom-1b-q4"],
+        "model_sizes": {"my-byom-1b-q4": 1_000_000_000},  # 1 GB on disk
+        "ram_total_gb": 7.44,
+        "auto_acquire": True,
+    }
+    _heartbeat(worker_repository, "wkr-p", caps)
+    m = _by_id(client.get("/api/v0/models/supported", headers=_mh(maintainer_token)).json())[
+        "my-byom-1b-q4"
+    ]
+    assert m["status"] == "available"  # sized from the worker report, fits, present
+    assert m["approx_ram_gb"] == round(1.0 * 1.2, 2)  # footprint surfaced (was None/unknown before)
+
+
+def test_present_unmenued_too_big_from_worker_report(
+    client: TestClient, maintainer_token: str, worker_repository
+) -> None:
+    # The deepseek-v4 case: present + unmenued, but the worker-reported size is huge
+    # → now provably too_big (was "unknown" when the coordinator had no size).
+    caps = {
+        "models": ["deepseek-v4-gguf-q4"],
+        "model_sizes": {"deepseek-v4-gguf-q4": 156_000_000_000},  # 156 GB
+        "ram_total_gb": 7.44,
+        "auto_acquire": True,
+    }
+    _heartbeat(worker_repository, "wkr-q", caps)
+    m = _by_id(client.get("/api/v0/models/supported", headers=_mh(maintainer_token)).json())[
+        "deepseek-v4-gguf-q4"
+    ]
+    assert m["status"] == "too_big"
+    assert m["fits_worker_count"] == 0

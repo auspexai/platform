@@ -29,6 +29,11 @@ from auspexai_platform.hf_catalog import catalog_fetched_at, read_catalog
 from auspexai_platform.supported_models import supported_by_id
 from auspexai_platform.worker_status import heartbeat_cutoff
 
+# Load-footprint multiplier over a GGUF file's on-disk bytes (KV-cache/context/
+# runtime). Matches hf_catalog._LOAD_OVERHEAD and the worker's hf_browse, so the
+# coordinator's fit math agrees everywhere.
+_LOAD_OVERHEAD = 1.2
+
 
 class CatalogEntry(BaseModel):
     model_id: str
@@ -157,19 +162,20 @@ def build_router(
             catalog = supported_by_id()
             catalog_source, fetched_at = "curated", None
 
-        def _ready_count(mid: str, model) -> int:
-            """Workers that HOLD the model on disk AND whose RAM FITS it — the only
-            honest 'serve-ready now'. Presence alone is not enough."""
-            if model is None:
-                return 0
-            return sum(
-                1
-                for c in caps
-                if isinstance(c.get("models"), list)
-                and mid in c["models"]
-                and (r := _ram(c)) is not None
-                and r >= model.approx_ram_gb
-            )
+        # Worker-reported on-disk footprint {model_id: gb} — the "what's actually
+        # staged" size source (for present models the HF catalog didn't size, e.g. a
+        # manually-staged BYOM model). The coordinator's HF sizing is the primary
+        # source; this is the supplement, so a present model is still sized even
+        # when it's outside the provisionable menu.
+        reported_gb: dict[str, float] = {}
+        for c in caps:
+            sizes = c.get("model_sizes")
+            if isinstance(sizes, dict):
+                for mid_s, b in sizes.items():
+                    if isinstance(mid_s, str) and isinstance(b, (int, float)) and b > 0:
+                        reported_gb[mid_s] = max(
+                            reported_gb.get(mid_s, 0.0), (b / 1e9) * _LOAD_OVERHEAD
+                        )
 
         # UNION: everything on the fleet + the whole provisionable set (deduped).
         entries: list[SupportedEntry] = []
@@ -177,24 +183,37 @@ def build_router(
             m = catalog.get(mid)
             on_n = present.get(mid, 0)  # workers that hold the FILE on disk (informational only)
             # Runnability is decided SOLELY by RAM-fit — NEVER by disk presence (you
-            # can download anything; loading it is what needs the RAM). So:
-            #  - an UNSIZED model (not in the sized catalog) can't be confirmed to fit
-            #    any worker → `unknown`, even if a stray file sits on a worker's disk;
-            #  - a SIZED model whose footprint fits no worker → `too_big`, even if it
-            #    is stranded on a too-small worker's disk;
+            # can download anything; loading it is what needs the RAM). The footprint
+            # comes from the HF catalog (primary) or the worker-reported on-disk size
+            # (supplement for present-but-unmenued models). So:
+            #  - a model with NO known footprint → `unknown` (can't confirm a fit),
+            #    even if a stray file sits on a worker's disk;
+            #  - a model whose footprint fits no worker's RAM → `too_big`, even if
+            #    stranded on a too-small worker's disk;
             #  - `available` requires a worker that HOLDS it AND FITS it (serve-ready);
             #  - `runnable` = fits ≥1 worker but isn't staged there yet.
             # `fits_worker_count` is the repl-capacity signal (fits 1 ⇒ repl-1 only).
-            fits_n = sum(1 for r in ram_known if r >= m.approx_ram_gb) if m else 0
-            ready_n = _ready_count(mid, m)
-            if m is None or not ram_known:
+            footprint = m.approx_ram_gb if m is not None else reported_gb.get(mid)
+            if footprint is None or not ram_known:
+                fits_n = 0
+                ready_n = 0
                 st = "unknown"  # footprint unknown, or no worker reports RAM → can't confirm
-            elif fits_n == 0:
-                st = "too_big"  # fits no worker's RAM, presence notwithstanding
-            elif ready_n > 0:
-                st = "available"  # fits AND already staged on a fitting worker
             else:
-                st = "runnable"  # fits ≥1 worker; needs acquiring/staging to run
+                fits_n = sum(1 for r in ram_known if r >= footprint)
+                ready_n = sum(
+                    1
+                    for c in caps
+                    if isinstance(c.get("models"), list)
+                    and mid in c["models"]
+                    and (r := _ram(c)) is not None
+                    and r >= footprint
+                )
+                if fits_n == 0:
+                    st = "too_big"  # fits no worker's RAM, presence notwithstanding
+                elif ready_n > 0:
+                    st = "available"  # fits AND already staged on a fitting worker
+                else:
+                    st = "runnable"  # fits ≥1 worker; needs acquiring/staging to run
             entries.append(
                 SupportedEntry(
                     model_id=mid,
@@ -202,7 +221,11 @@ def build_router(
                     family=m.family if m else "",
                     param_b=m.param_b if m else None,
                     quant=m.quant if m else "",
-                    approx_ram_gb=m.approx_ram_gb if m else None,
+                    approx_ram_gb=(
+                        m.approx_ram_gb
+                        if m is not None
+                        else (round(footprint, 2) if footprint is not None else None)
+                    ),
                     on_worker_count=on_n,
                     fits_worker_count=fits_n,
                     ram_known_workers=len(ram_known),

@@ -70,6 +70,7 @@ from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
 from auspexai_platform.feature_schema import validate_feature_schema
 from auspexai_platform.maintenance import projected_raw_age_off
+from auspexai_platform.model_sizes import ModelSizer
 from auspexai_platform.pre_registration import (
     build_deviation_predicate,
     build_pre_registration_predicate,
@@ -505,17 +506,28 @@ def _extract_manifest_identity(manifest: dict[str, Any]) -> tuple[str, str]:
     return tenant_id, experiment_id
 
 
-def _derive_required_capabilities(manifest: dict[str, Any]) -> dict[str, list[str]]:
+# Shared, cache-backed model sizer (top-down fleet-fit): sizes each experiment's
+# required models from HF at submit so the scheduler can RAM-gate routing.
+_MODEL_SIZER = ModelSizer()
+
+
+def _derive_required_capabilities(manifest: dict[str, Any], sizer=None) -> dict[str, Any]:
     """M1 (#30): a worker must locally hold every model the manifest marks
     `local_weights_required` (BYOM, §5.8). Keyed by the worker store model_id
     (`<repo-slug>-<quant>`, exact match for hash-agreement consensus). Empty ⇒ no
     requirement (every worker eligible). The manifest stays opaque otherwise.
 
+    Top-down fleet-fit: when a `sizer` (ModelSizer) is given, size each required
+    model from HF (coords in the manifest) and record `model_ram_gb` — the
+    scheduler then RAM-gates routing so a model is never offered to a worker too
+    small to serve it. Sized models only; one with no HF coords is left unsized
+    (the worker-side acquire guard is the backstop).
+
     v0.2 M1 `features`: a seeded-sampling experiment additionally requires
     workers whose build declares the `generation_policy` feature — a volunteer
     fleet never rolls atomically, and a pre-M1 broker would burn every unit
     with params_rejected at request time instead of refusing cleanly."""
-    required: dict[str, list[str]] = {}
+    required: dict[str, Any] = {}
     models = manifest.get("models")
     if isinstance(models, list):
         model_ids = [
@@ -525,6 +537,16 @@ def _derive_required_capabilities(manifest: dict[str, Any]) -> dict[str, list[st
         ]
         if model_ids:
             required["models"] = model_ids
+            if sizer is not None:
+                by_id = {m["id"]: m for m in models if isinstance(m, dict) and m.get("id")}
+                ram = {}
+                for mid in model_ids:
+                    m = by_id.get(mid) or {}
+                    fp = sizer.footprint_gb(m.get("hf_repo"), m.get("hf_filename"))
+                    if fp is not None:
+                        ram[mid] = fp
+                if ram:
+                    required["model_ram_gb"] = ram
     determinism = manifest.get("inference_determinism")
     declared_temp = determinism.get("temperature", 0) if isinstance(determinism, dict) else 0
     try:
@@ -1091,7 +1113,9 @@ def build_router(
                 tenant_id=manifest_tenant,
                 tenant_experiment_label=manifest_label,
                 manifest_hash=manifest.manifest_hash,
-                required_capabilities=_derive_required_capabilities(body.manifest),
+                required_capabilities=_derive_required_capabilities(
+                    body.manifest, sizer=_MODEL_SIZER
+                ),
                 requires_real_execution=bool(body.manifest.get("requires_real_execution")),
                 # The runner — for an account-run public starter this is the only
                 # link back to the researcher; for a tenant owner it's their account.
