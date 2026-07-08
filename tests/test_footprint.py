@@ -11,6 +11,7 @@ from auspexai_platform.db.repositories import ResultRepository
 from auspexai_platform.footprint import (
     FOOTPRINT_SCHEMA_VERSION,
     INDEPENDENCE_BASIS_ACCOUNT,
+    FootprintBasisMismatchError,
     FootprintRecomputeError,
     assemble_governance_footprint,
     assert_footprint_recomputable,
@@ -94,6 +95,30 @@ def test_assert_footprint_recomputable_passes_and_raises():
     bad = {"integrity_basis": {"counts": {INTEGRITY_BASIS_EXACT: 99}}}
     with pytest.raises(FootprintRecomputeError):
         assert_footprint_recomputable(bad, entries, diverged)
+
+
+def test_assert_footprint_recomputable_receipt_basis_self_check():
+    """AUD-30 coordinator self-check: with a quorum map, a unit whose asserted
+    basis diverges from its receipt-derived basis is refused at sign time — even
+    when the aggregate COUNT check passes."""
+    entries = [_entry("u1", INTEGRITY_BASIS_EXACT)]
+    diverged: list[DivergedUnitEntry] = []
+    good = {"integrity_basis": {"counts": integrity_basis_counts(entries, diverged)}}
+
+    # Receipt quorum says 1 agreeing worker → process_only, NOT the within_cell_exact
+    # the entry asserts. Counts match (so FootprintRecomputeError would NOT fire),
+    # but the per-unit self-check catches the drift.
+    with pytest.raises(FootprintBasisMismatchError):
+        assert_footprint_recomputable(
+            good, entries, diverged, quorum_by_unit={"u1": (1, "builtin_hash_agreement")}
+        )
+
+    # Consistent quorum (2 agreeing, hash-agreement → within_cell_exact) passes.
+    assert_footprint_recomputable(
+        good, entries, diverged, quorum_by_unit={"u1": (2, "builtin_hash_agreement")}
+    )
+    # No quorum map → the check is skipped (legacy/test callers), no raise.
+    assert_footprint_recomputable(good, entries, diverged)
 
 
 class TestIndependence:

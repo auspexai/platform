@@ -55,6 +55,23 @@ class FootprintRecomputeError(Exception):
         )
 
 
+class FootprintBasisMismatchError(Exception):
+    """A unit's asserted integrity_basis diverges from the basis RE-DERIVED from its
+    receipt's quorum_agreement — refuse to sign (AUD-30 coordinator self-check).
+    Catches drift between classification and the footprint in the coordinator's own
+    processing chain (a later transform / refactor mutating a label but not the
+    underlying quorum)."""
+
+    def __init__(self, unit_id: str, asserted: str | None, derived: str) -> None:
+        self.unit_id = unit_id
+        self.asserted = asserted
+        self.derived = derived
+        super().__init__(
+            f"integrity_basis for unit {unit_id!r} diverges: asserted={asserted!r} "
+            f"receipt-derived={derived!r}"
+        )
+
+
 def integrity_basis_counts(entries, diverged_units) -> dict[str, int]:
     """Recomputable: the per-result corroboration-basis distribution over the
     attested set. Consensus entries carry their basis; each diverged unit counts
@@ -253,14 +270,39 @@ def assemble_governance_footprint(
     return footprint
 
 
-def assert_footprint_recomputable(footprint, entries, diverged_units) -> None:
+def assert_footprint_recomputable(
+    footprint, entries, diverged_units, *, quorum_by_unit=None
+) -> None:
     """F6 sign-time guard: a fresh recount of integrity_basis over the attested set
     must equal the footprint's claim, or refuse to sign (the consumer-side SDK then
     re-checks independently against the signed predicate). No-op when there is no
-    footprint."""
+    footprint.
+
+    AUD-30: when `quorum_by_unit` ({unit_id: (agreeing_workers, method)}, sourced
+    from the per-job receipts) is supplied, ADDITIONALLY re-derive each entry's
+    basis from that authoritative quorum and require it matches the asserted label —
+    the count recount alone only checks label-vs-aggregate self-consistency, so
+    drift between classification and the footprint in the coordinator's own chain
+    would otherwise pass. Skipped when the map is absent (legacy/test callers); the
+    SDK re-derives independently on the consumer side regardless."""
     if not footprint:
         return
     claimed = ((footprint.get("integrity_basis") or {}).get("counts")) or {}
     recounted = integrity_basis_counts(entries, diverged_units)
     if {k: claimed.get(k, 0) for k in recounted} != recounted:
         raise FootprintRecomputeError(claimed=claimed, recounted=recounted)
+    if quorum_by_unit:
+        # Local import: footprint ← attestation would cycle at module scope.
+        from auspexai_platform.receipts.attestation import classify_consensus_basis
+
+        for e in entries or []:
+            if e.integrity_basis is None:
+                continue
+            quorum = quorum_by_unit.get(e.unit_id)
+            if quorum is None:
+                continue  # can't ground this unit's basis → leave to the count check
+            derived = classify_consensus_basis(quorum[0], quorum[1])
+            if derived != e.integrity_basis:
+                raise FootprintBasisMismatchError(
+                    unit_id=e.unit_id, asserted=e.integrity_basis, derived=derived
+                )

@@ -134,6 +134,14 @@ def _check_view_authz(credential: Credential, experiment) -> None:
         return
     if credential.is_researcher() and credential.tenant_id == experiment.tenant_id:
         return
+    # AUD-36 (A9 audit): a Tier-1 account may inspect its own run's work-units —
+    # mirror experiments.py _can_view (it ran under a public tenant it doesn't own).
+    if (
+        credential.is_account()
+        and credential.account_id is not None
+        and experiment.submitted_by_account_id == credential.account_id
+    ):
+        return
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail={

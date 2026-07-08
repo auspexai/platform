@@ -113,9 +113,18 @@ class WorkUnitRepository:
                 "WHERE unit_id = ?",
                 (unit_id,),
             )
+            # AUD-32 (A9 audit): only a still-open unit may flip to 'completed'. The
+            # prior `status != 'completed'` guard let a TERMINAL 'failed'/'cancelled'
+            # unit be resurrected to 'completed' by a late conforming replica —
+            # minting receipts + attestation for a unit mark_failed intends to keep
+            # escalated. Restrict the flip to pending/in_progress. (The bump above is
+            # unguarded so an extra replica on an already-'completed' unit is still
+            # recorded as a durable replica, as before — it just cannot re-fire the
+            # transition.)
             cur.execute(
                 "UPDATE work_units SET status = 'completed' "
-                "WHERE unit_id = ? AND status != 'completed' AND completions_so_far >= replication_target",
+                "WHERE unit_id = ? AND status IN ('pending', 'in_progress') "
+                "AND completions_so_far >= replication_target",
                 (unit_id,),
             )
             just_completed = cur.rowcount == 1

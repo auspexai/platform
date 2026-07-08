@@ -147,3 +147,21 @@ def test_start_requires_an_account(client, maintainer_token) -> None:
     # A maintainer token has no account_id → can't self-link.
     r = client.post("/api/v0/accounts/orcid/start", headers=_mh(maintainer_token))
     assert r.status_code == 403
+
+
+def test_create_orcid_state_reaps_abandoned_states(account_repository: AccountRepository) -> None:
+    """AUD-38: an abandoned (never-consumed) state older than the window is reaped
+    opportunistically when the next state is created — the table is classified
+    REAPED-on-expiry but was previously only deleted on a matching consume."""
+    account_repository.create(account_id="acct-r", idp=IdentityProvider.GITHUB, idp_sub="gh-r")
+    db = account_repository.db
+    with db.transaction() as cur:
+        cur.execute(
+            "INSERT INTO orcid_oauth_states (state, account_id, created_at) VALUES (?, ?, ?)",
+            ("stale", "acct-r", "2020-01-01T00:00:00+00:00"),
+        )
+    # Creating a fresh state triggers the opportunistic reap of the stale row.
+    account_repository.create_orcid_state("fresh", "acct-r")
+    states = {r["state"] for r in db.execute("SELECT state FROM orcid_oauth_states")}
+    assert "stale" not in states  # reaped
+    assert "fresh" in states  # the new one survives

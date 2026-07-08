@@ -243,6 +243,14 @@ class ResultRepository:
         rows = self.db.execute("SELECT worker_id, result_id, unit_id FROM results")
         return [(r["worker_id"], r["result_id"], r["unit_id"]) for r in rows]
 
+    def result_worker_pubkeys(self) -> dict[str, str]:
+        """{result_id: worker_pubkey_hex (lower)} — the lightweight projection the
+        settle sweep uses (AUD-33) to match a result against the AUTHORITATIVE
+        per-job receipts (which bind worker_pubkey), so a dropped best-effort
+        receipt_index write is not mistaken for 'no receipt'."""
+        rows = self.db.execute("SELECT result_id, worker_pubkey_hex FROM results")
+        return {r["result_id"]: (r["worker_pubkey_hex"] or "").lower() for r in rows}
+
     def list_active_payloads(self) -> list[Result]:
         """Every result that still holds its payload (not yet aged off) — the
         candidate set the age-off sweep computes horizons over."""

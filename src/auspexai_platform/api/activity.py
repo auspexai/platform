@@ -410,7 +410,14 @@ def build_router(
     def _can_view(credential: Credential, experiment) -> bool:
         if credential.is_maintainer():
             return True
-        return credential.is_researcher() and credential.tenant_id == experiment.tenant_id
+        if credential.is_researcher() and credential.tenant_id == experiment.tenant_id:
+            return True
+        # AUD-36 (A9 audit): a Tier-1 account may view its own run's activity.
+        return (
+            credential.is_account()
+            and credential.account_id is not None
+            and experiment.submitted_by_account_id == credential.account_id
+        )
 
     @router.get(
         "/experiments/{experiment_id}/activity",

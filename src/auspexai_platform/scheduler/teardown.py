@@ -38,6 +38,8 @@ from auspexai_platform.db.repositories.receipt_index import ReceiptIndexReposito
 from auspexai_platform.db.repositories.results import ResultRepository
 from auspexai_platform.db.repositories.unit_consensus import UnitConsensusRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
+from auspexai_platform.receipts.models import decode_cbor
+from auspexai_platform.receipts.repository import ReceiptRepository
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,24 @@ class SettleResult:
     experiment_id: str
     units_cancelled: int
     results_marked: int
+
+
+def _per_job_receipted_pubkeys_by_unit(per_job_db) -> dict[str, set[str]]:
+    """AUD-33: {unit_id: {worker_pubkey_hex}} covered by an AUTHORITATIVE per-job
+    receipt (decoded from the receipt body, which binds worker_pubkey). The settle
+    sweep consults this BEFORE concluding a result earned no receipt — the
+    control-DB receipt_index is a best-effort cache whose write can silently drop
+    (issuance is best-effort; `receipts rebuild-index` is the documented recovery),
+    so trusting it alone turns a recoverable 404 into a permanent false 410."""
+    out: dict[str, set[str]] = {}
+    for rec in ReceiptRepository(per_job_db).list_all():
+        try:
+            pubkey = decode_cbor(rec.receipt_body_cbor).worker_pubkey.hex().lower()
+        except Exception:
+            continue
+        for uid in rec.work_unit_ids:
+            out.setdefault(uid, set()).add(pubkey)
+    return out
 
 
 def _mark_receiptless_results(
@@ -75,13 +95,22 @@ def _mark_receiptless_results(
     `apply=False` counts what WOULD be marked without writing (dry-run)."""
     results_repo = ResultRepository(per_job_db)
     consensus_repo = UnitConsensusRepository(per_job_db)
+    # AUD-33: authoritative per-job receipt coverage + result→pubkey, so a dropped
+    # best-effort index write is never mistaken for a genuine no-receipt.
+    receipted = _per_job_receipted_pubkeys_by_unit(per_job_db)
+    result_pubkey = results_repo.result_worker_pubkeys()
     marked = 0
     for worker_id, result_id, unit_id in results_repo.all_result_refs():
-        # Positive receipt already exists → nothing terminal to record.
+        # Positive receipt already exists (cache) → nothing terminal to record.
         if (
             receipt_index_repository.get_for_worker_result(worker_id=worker_id, result_id=result_id)
             is not None
         ):
+            continue
+        # AUD-33: authoritative check — a real per-job receipt for this result's
+        # (unit, worker) means it DID earn a receipt; the index cache just missed it.
+        pubkey = result_pubkey.get(result_id)
+        if pubkey and pubkey in receipted.get(unit_id, set()):
             continue
         # Already resolved terminal → no-op (keeps counts + dry-run honest).
         if (
@@ -110,6 +139,91 @@ def _mark_receiptless_results(
             except Exception:
                 logger.exception(
                     "settle: receipt_outcomes write failed exp=%s result=%s",
+                    experiment_id,
+                    result_id,
+                )
+                continue
+        marked += 1
+    return marked
+
+
+_TERMINAL_UNIT_STATES = (WorkUnitStatus.FAILED, WorkUnitStatus.CANCELLED)
+
+
+def _mark_terminal_unit_receiptless_results(
+    *,
+    experiment_id: str,
+    per_job_db,
+    receipt_index_repository: ReceiptIndexRepository,
+    only_unit_id: str | None = None,
+    apply: bool = True,
+) -> int:
+    """AUD-27 (A9 audit): mark receiptless results of TERMINAL units (failed /
+    cancelled) as terminally receipt-less, even while the EXPERIMENT itself is
+    still active (APPROVED/PAUSED).
+
+    A unit taken to 'failed' (a certified schema violation, D16.1 §7) never
+    reaches 'completed', so already-submitted results from OTHER workers on that
+    unit never earn a receipt — and, absent a receipt_outcomes marker, would poll
+    canonical-receipt 404 forever (the D22-B leak class reopened on the mark_failed
+    path). mark_failed leaves the experiment APPROVED, so `settle_all_terminal_
+    experiments`' status-scoped sweep never reaches these.
+
+    Scoped strictly to TERMINAL units: results of pending/in_progress units are
+    NEVER touched (they may still legitimately earn a receipt), so this is safe to
+    run against an active experiment. `only_unit_id` limits it to a single unit
+    (the mark_failed hot path). Idempotent + best-effort, mirroring
+    `_mark_receiptless_results`."""
+    work_units_repo = WorkUnitRepository(per_job_db)
+    terminal_status: dict[str, WorkUnitStatus] = {}
+    for st in _TERMINAL_UNIT_STATES:
+        for unit in work_units_repo.list_all(status=st):
+            if only_unit_id is None or unit.unit_id == only_unit_id:
+                terminal_status[unit.unit_id] = st
+    if not terminal_status:
+        return 0
+    results_repo = ResultRepository(per_job_db)
+    consensus_repo = UnitConsensusRepository(per_job_db)
+    # AUD-33: authoritative per-job receipt coverage (see _mark_receiptless_results).
+    receipted = _per_job_receipted_pubkeys_by_unit(per_job_db)
+    result_pubkey = results_repo.result_worker_pubkeys()
+    marked = 0
+    for worker_id, result_id, unit_id in results_repo.all_result_refs():
+        st = terminal_status.get(unit_id)
+        if st is None:
+            continue
+        if (
+            receipt_index_repository.get_for_worker_result(worker_id=worker_id, result_id=result_id)
+            is not None
+        ):
+            continue
+        pubkey = result_pubkey.get(result_id)
+        if pubkey and pubkey in receipted.get(unit_id, set()):
+            continue
+        if (
+            receipt_index_repository.get_result_outcome(worker_id=worker_id, result_id=result_id)
+            is not None
+        ):
+            continue
+        # A consensus row means this replica was a valid non-consensus observation;
+        # otherwise the reason is the unit's terminal state (never pejorative).
+        if consensus_repo.get(unit_id) is not None:
+            outcome, reason = "no_receipt", "diverged_from_consensus"
+        else:
+            outcome, reason = "no_receipt", f"unit_{st.value}"
+        if apply:
+            try:
+                receipt_index_repository.record_no_receipt(
+                    worker_id=worker_id,
+                    result_id=result_id,
+                    experiment_id=experiment_id,
+                    unit_id=unit_id,
+                    outcome=outcome,
+                    reason=reason,
+                )
+            except Exception:
+                logger.exception(
+                    "settle: terminal-unit receipt_outcomes write failed exp=%s result=%s",
                     experiment_id,
                     result_id,
                 )
@@ -223,6 +337,33 @@ def settle_all_terminal_experiments(
                     SettleResult(
                         experiment_id=exp.experiment_id,
                         units_cancelled=units_cancelled,
+                        results_marked=results_marked,
+                    )
+                )
+
+    # AUD-27: a still-ACTIVE experiment (APPROVED/PAUSED) can carry terminal
+    # (failed/cancelled) units whose already-submitted results are stranded
+    # receiptless — mark_failed leaves the experiment APPROVED, so the status-
+    # scoped sweep above never reaches them. Sweep terminal units here, scoped so
+    # in-flight results of pending/in_progress units are untouched. (The mark_failed
+    # call site marks them immediately too; this is the durable backstop that also
+    # catches stragglers submitting after the unit went terminal.)
+    for status in (ExperimentStatus.APPROVED, ExperimentStatus.PAUSED):
+        for exp in experiment_repository.list_all(status=status):
+            per_job_db = per_job_factory.get(exp.experiment_id)
+            if per_job_db is None:
+                continue
+            results_marked = _mark_terminal_unit_receiptless_results(
+                experiment_id=exp.experiment_id,
+                per_job_db=per_job_db,
+                receipt_index_repository=receipt_index_repository,
+                apply=apply,
+            )
+            if results_marked:
+                out.append(
+                    SettleResult(
+                        experiment_id=exp.experiment_id,
+                        units_cancelled=0,
                         results_marked=results_marked,
                     )
                 )

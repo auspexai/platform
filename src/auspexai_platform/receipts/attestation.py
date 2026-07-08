@@ -220,6 +220,17 @@ def _unit_consensus_methods(per_job_db) -> dict[str, str]:
     return out
 
 
+def unit_quorum_by_unit(per_job_db) -> dict[str, tuple[int, str]]:
+    """{unit_id: (agreeing_workers, method)} from the per-job receipts — the
+    AUTHORITATIVE quorum used to re-derive integrity_basis for the AUD-30 sign-time
+    self-check (`assert_footprint_recomputable`). Pairs `_unit_agreeing_workers`
+    (the immutable agreeing count) with `_unit_consensus_methods` (the immutable
+    reducer method); a consensus unit missing a method defaults to hash-agreement."""
+    agreeing = _unit_agreeing_workers(per_job_db)
+    methods = _unit_consensus_methods(per_job_db)
+    return {uid: (aw, methods.get(uid, HASH_AGREEMENT_METHOD)) for uid, aw in agreeing.items()}
+
+
 class IncompleteAttestationSetError(Exception):
     """The collected attestation entries do not cover every consensus unit
     that holds an issued receipt — signing this set would put the coordinator's
@@ -483,6 +494,7 @@ def build_result_set_attestation(
     diverged_units: list[DivergedUnitEntry] | None = None,
     governance_footprint: dict | None = None,
     pre_registration: dict | None = None,
+    quorum_by_unit: dict[str, tuple[int, str]] | None = None,
 ) -> ResultSetAttestation:
     """Build + COSE-sign (+ Rekor-anchor) the result-set attestation. Pure given
     its inputs — the same set yields a byte-identical root, so the endpoint can
@@ -561,7 +573,9 @@ def build_result_set_attestation(
     if schema_version >= 1 and governance_footprint is not None:
         from auspexai_platform.footprint import assert_footprint_recomputable
 
-        assert_footprint_recomputable(governance_footprint, ordered, diverged_ordered)
+        assert_footprint_recomputable(
+            governance_footprint, ordered, diverged_ordered, quorum_by_unit=quorum_by_unit
+        )
         predicate["governance_footprint"] = governance_footprint
     predicate_cbor = cbor2.dumps(predicate, canonical=True)
     statement_kwargs: dict = {}

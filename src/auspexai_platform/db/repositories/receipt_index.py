@@ -359,8 +359,14 @@ class ReceiptIndexRepository:
         Permissive units carry no bundle, so they don't count."""
         if not equal_trust_enabled:
             rows = self.db.execute(
+                # AUD-37 (A9 audit): dedup by (experiment_id, unit_id), NOT the bare
+                # unit_id. unit_ids are tenant-chosen and collide across experiments,
+                # so a global DISTINCT under-counts distinct corroborations of
+                # like-named units (unfairly delaying T1→T2). experiment_id is
+                # regex-locked without '/', so the concat is unambiguous.
                 """
-                SELECT COUNT(DISTINCT COALESCE(ri.unit_id, ri.receipt_id)) AS units,
+                SELECT COUNT(DISTINCT ri.experiment_id || '/' ||
+                             COALESCE(ri.unit_id, ri.receipt_id)) AS units,
                        COUNT(DISTINCT e.tenant_id) AS tenants
                 FROM receipt_index ri
                 INNER JOIN experiments e ON e.experiment_id = ri.experiment_id
@@ -379,12 +385,16 @@ class ReceiptIndexRepository:
             """
             SELECT COUNT(DISTINCT unit) AS units, COUNT(DISTINCT tenant) AS tenants
             FROM (
-                SELECT COALESCE(ri.unit_id, ri.receipt_id) AS unit, e.tenant_id AS tenant
+                -- AUD-37: key by (experiment_id, unit_id) so cross-experiment unit_id
+                -- collisions don't collapse; both legs use the same key so an account
+                -- that both agreed and diverged on one (exp,unit) still counts once.
+                SELECT ri.experiment_id || '/' || COALESCE(ri.unit_id, ri.receipt_id) AS unit,
+                       e.tenant_id AS tenant
                 FROM receipt_index ri
                 INNER JOIN experiments e ON e.experiment_id = ri.experiment_id
                 WHERE ri.account_id_at_issue = ? AND ri.ran_under_strict = 1
                 UNION
-                SELECT di.unit_id AS unit, e.tenant_id AS tenant
+                SELECT di.experiment_id || '/' || di.unit_id AS unit, e.tenant_id AS tenant
                 FROM divergence_index di
                 INNER JOIN experiments e ON e.experiment_id = di.experiment_id
                 WHERE di.account_id_at_issue = ? AND di.ran_under_strict = 1

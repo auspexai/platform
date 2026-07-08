@@ -289,15 +289,25 @@ def create_publications_router(
             return {"raw": {}, "note": "raw transit buffer not configured"}
         import time as _time
 
-        items = raw_transit.collect_experiment(experiment_id=experiment_id, now=_time.monotonic())
+        signed = raw_transit.collect_experiment_signed(
+            experiment_id=experiment_id, now=_time.monotonic()
+        )
+        # `raw` stays the flat {result_id: text} map (backward-compatible); AUD-26
+        # adds a parallel `signatures` map so the driver can verify each item's
+        # detached worker signature independently of the coordinator.
+        raw = {rid: it["raw"] for rid, it in signed.items()}
+        signatures = {
+            rid: {"raw_signature": it["raw_signature"], "worker_pubkey": it["worker_pubkey"]}
+            for rid, it in signed.items()
+        }
         audit_repository.append(
             actor_class=CredentialClass.RESEARCHER,
             action="raw_content.collected",
             resource_type="experiment",
             resource_id=experiment_id,
-            payload={"count": len(items)},
+            payload={"count": len(raw)},
         )
-        return {"raw": items, "count": len(items)}
+        return {"raw": raw, "signatures": signatures, "count": len(raw)}
 
     @router.get("/experiments/{experiment_id}/publications")
     async def list_publications(
@@ -307,7 +317,11 @@ def create_publications_router(
         """Console + R-D surface: the experiment's publication records.
         Maintainer sees all; a researcher sees their own experiment's."""
         experiment = experiment_repository.get_by_id(experiment_id)
-        is_maintainer = getattr(credential, "credential_class", None) == CredentialClass.MAINTAINER
+        # AUD-29 (A9 audit): the Credential class field is `.kind`, not
+        # `credential_class` — the old getattr always returned None, so the
+        # maintainer branch was dead code and a maintainer token 404'd on every
+        # experiment's publications (the console G6 panel). Use the real predicate.
+        is_maintainer = credential.is_maintainer()
         if experiment is None or not (
             is_maintainer or credential.tenant_id == experiment.tenant_id
         ):

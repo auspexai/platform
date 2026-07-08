@@ -56,6 +56,7 @@ from auspexai_platform.receipts.attestation import (
     collect_result_set_entries,
     merkle_root,
     receipt_map_from_per_job,
+    unit_quorum_by_unit,
 )
 from auspexai_platform.receipts.repository import ReceiptRepository
 from auspexai_platform.receipts.signing import SigningKey
@@ -556,6 +557,8 @@ def build_router(
             diverged_units=diverged,
             governance_footprint=footprint,
             pre_registration=_prereg_ref(experiment_id),
+            # AUD-30: re-derive each unit's basis from the receipts at sign time.
+            quorum_by_unit=(unit_quorum_by_unit(per_job_db) if per_job_db is not None else None),
         )
 
         # A1 lazy canonicalize-on-read: persist a freshly-built FINAL attestation
@@ -841,6 +844,8 @@ def build_router(
                     if governance_footprint_builder is not None
                     else None
                 ),
+                # AUD-30: per_job_db is non-None here (guarded above).
+                quorum_by_unit=unit_quorum_by_unit(per_job_db),
             )
             try:
                 return attestation_repository.insert(

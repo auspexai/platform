@@ -34,6 +34,9 @@ from auspexai_platform.db.models import (
 # 5 minutes: long enough for the caller to round-trip the exchange + binder
 # call, short enough that a leaked token has tight blast radius.
 DEFAULT_BINDING_TTL = timedelta(minutes=5)
+# AUD-38: the ORCID OAuth-state consume window; also the opportunistic-reap TTL in
+# create_orcid_state (a state older than this can never be consumed successfully).
+_ORCID_STATE_MAX_AGE_SECONDS = 600
 
 
 class AccountNotFoundError(Exception):
@@ -303,15 +306,26 @@ class AccountRepository:
     # ---- ORCID OAuth link flow (D8) ----
 
     def create_orcid_state(self, state: str, account_id: str) -> None:
-        """Store a single-use ORCID OAuth state bound to an account."""
-        now = datetime.now(UTC).isoformat()
+        """Store a single-use ORCID OAuth state bound to an account.
+
+        AUD-38: opportunistically reap states older than the consume window. An
+        abandoned handshake (tab closed / authorization denied / ORCID unreachable)
+        is otherwise only deleted on a matching `consume`, so stale rows would
+        accumulate without bound — the persistence registry classifies this table
+        REAPED-on-expiry, and this makes that true without a dedicated timer. A
+        state older than the window can never consume successfully anyway."""
+        now = datetime.now(UTC)
+        cutoff = (now - timedelta(seconds=_ORCID_STATE_MAX_AGE_SECONDS)).isoformat()
         with self.db.transaction() as cur:
+            cur.execute("DELETE FROM orcid_oauth_states WHERE created_at < ?", (cutoff,))
             cur.execute(
                 "INSERT INTO orcid_oauth_states (state, account_id, created_at) VALUES (?, ?, ?)",
-                (state, account_id, now),
+                (state, account_id, now.isoformat()),
             )
 
-    def consume_orcid_state(self, state: str, *, max_age_seconds: int = 600) -> str | None:
+    def consume_orcid_state(
+        self, state: str, *, max_age_seconds: int = _ORCID_STATE_MAX_AGE_SECONDS
+    ) -> str | None:
         """Pop a state, returning its account_id if present and not expired —
         single-use: the row is deleted regardless. None if unknown or too old."""
         rows = self.db.execute(

@@ -151,3 +151,28 @@ def test_one_controller_many_pubkeys_is_bounded_per_account(db: Database):
 
 def test_corroboration_summary_zero_for_unknown_account(db: Database):
     assert ReceiptIndexRepository(db).account_corroboration_summary("acct-none") == (0, 0)
+
+
+def test_same_unit_id_across_experiments_counts_separately(db: Database):
+    """AUD-37: unit_ids are tenant-chosen and collide across experiments — the
+    corroboration count must key by (experiment_id, unit_id), so corroborating a
+    like-named unit in two DIFFERENT experiments is 2 units of breadth, not 1."""
+    accounts, tenants, workers, experiments, manifests, receipts = _repos(db)
+    accounts.create(account_id="acct-1", idp=IdentityProvider.GITHUB, idp_sub="100")
+    tenants.register(tenant_id="tenant-a", maintainer_pubkey="aa" * 32)
+    exp1 = _exp(manifests, experiments, tenant_id="tenant-a", label="exp-1")
+    exp2 = _exp(manifests, experiments, tenant_id="tenant-a", label="exp-2")
+    workers.enroll(worker_id="wkr-1", pubkey_hex="cc" * 32)
+    workers.bind_account("wkr-1", account_id="acct-1", trust_tier=TrustTier.T1_AUTHENTICATED)
+
+    for i, exp in enumerate((exp1, exp2)):
+        receipts.record(
+            receipt_id=f"rcpt-{i}",
+            experiment_id=exp.experiment_id,
+            worker_id="wkr-1",
+            worker_pubkey="cc" * 32,
+            result_id=f"res-{i}",
+            unit_id="u-0",  # SAME name, DIFFERENT experiments
+        )
+
+    assert receipts.account_corroboration_summary("acct-1")[0] == 2

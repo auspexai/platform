@@ -197,10 +197,19 @@ def make_credential_dependency(
                 raise _auth_failure(
                     InvalidTokenError("maintainer token is not valid or has expired")
                 )
-            effective_login = matched_login or None
-            proxy_login = request.headers.get("X-Maintainer-Login")
-            if proxy_login and effective_login:
-                effective_login = proxy_login
+            # AUD-28 (A9 audit): X-Maintainer-Login is a TRUSTED-PROXY attribution
+            # header — the operator console holds the login-less SERVICE/root token
+            # and names the individual maintainer behind each proxied request so the
+            # audit log attributes it to a person, not "the console". Honor it ONLY
+            # for that login-less token. A PER-MAINTAINER token (`token issue`) is
+            # already bound to its owner; letting its holder set the header would let
+            # them rewrite audit actor_identifier to any login — defeating the
+            # non-repudiation that per-maintainer tokens exist to provide. So a
+            # bound token always attributes to its OWN login, header ignored.
+            if matched_login:
+                effective_login = matched_login
+            else:
+                effective_login = request.headers.get("X-Maintainer-Login") or None
             return Credential.maintainer(maintainer_login=effective_login)
 
         if signature_input_header:

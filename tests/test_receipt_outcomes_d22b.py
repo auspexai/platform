@@ -32,7 +32,11 @@ from auspexai_platform.db.repositories import ReceiptIndexRepository, WorkerRepo
 from auspexai_platform.db.repositories.results import ResultRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.receipts import ReceiptRepository, issue_receipts_for_completed_unit
-from auspexai_platform.scheduler.teardown import settle_terminal_experiment
+from auspexai_platform.scheduler.teardown import (
+    _mark_terminal_unit_receiptless_results,
+    settle_all_terminal_experiments,
+    settle_terminal_experiment,
+)
 
 AUTHORITY = "testserver"
 
@@ -302,3 +306,241 @@ def _signing_key():
     from auspexai_platform.receipts import SigningKey
 
     return SigningKey._from_private(Ed25519PrivateKey.generate())
+
+
+# ---- AUD-27 / AUD-32: mark_failed leak + no terminal-unit resurrection -------
+
+
+class TestMarkFailedReceiptless:
+    """AUD-27: a failed unit's already-submitted results earn terminal
+    receipt_outcomes markers, scoped so other units' in-flight results (which may
+    still legitimately earn a receipt) are untouched."""
+
+    def test_marks_failed_unit_results_only(
+        self,
+        receipt_index_repository: ReceiptIndexRepository,
+        worker_repository: WorkerRepository,
+        per_job_factory: PerJobDatabaseFactory,
+    ) -> None:
+        worker_repository.enroll(worker_id="wkr-A", pubkey_hex="a" * 64)
+        worker_repository.enroll(worker_id="wkr-B", pubkey_hex="b" * 64)
+        exp_id = "exp-markfail"
+        per_job_db = per_job_factory.get_or_create(exp_id)
+        wu = WorkUnitRepository(per_job_db)
+        rr = ResultRepository(per_job_db)
+
+        # A unit that will be failed, with a conforming result already submitted by
+        # another worker (the stranded result the D22-B contract must resolve).
+        wu.submit_batch([{"unit_id": "u-fail", "payload": {}}], replication_target=3)
+        wu.mark_in_progress("u-fail")
+        rr.insert(
+            result_id="res-fail",
+            unit_id="u-fail",
+            worker_id="wkr-A",
+            worker_pubkey_hex="a" * 64,
+            exit_code=0,
+            payload={"ok": 1},
+            worker_signature="s",
+            completed_at=datetime(2026, 7, 8, 10, 0, tzinfo=UTC),
+        )
+        # An unrelated in-progress unit whose result must NOT be marked terminal.
+        wu.submit_batch([{"unit_id": "u-open", "payload": {}}], replication_target=3)
+        wu.mark_in_progress("u-open")
+        rr.insert(
+            result_id="res-open",
+            unit_id="u-open",
+            worker_id="wkr-B",
+            worker_pubkey_hex="b" * 64,
+            exit_code=0,
+            payload={"ok": 1},
+            worker_signature="s",
+            completed_at=datetime(2026, 7, 8, 10, 0, tzinfo=UTC),
+        )
+
+        wu.mark_failed("u-fail")
+        marked = _mark_terminal_unit_receiptless_results(
+            experiment_id=exp_id,
+            per_job_db=per_job_db,
+            receipt_index_repository=receipt_index_repository,
+            only_unit_id="u-fail",
+        )
+        assert marked == 1
+        fail_marker = receipt_index_repository.get_result_outcome(
+            worker_id="wkr-A", result_id="res-fail"
+        )
+        assert fail_marker is not None and fail_marker.reason == "unit_failed"
+        # Scope safety: the still-in-progress unit's result stays unresolved (404,
+        # transient) — it may yet earn a receipt.
+        assert (
+            receipt_index_repository.get_result_outcome(worker_id="wkr-B", result_id="res-open")
+            is None
+        )
+
+        # Idempotent: a second pass marks nothing new.
+        assert (
+            _mark_terminal_unit_receiptless_results(
+                experiment_id=exp_id,
+                per_job_db=per_job_db,
+                receipt_index_repository=receipt_index_repository,
+                only_unit_id="u-fail",
+            )
+            == 0
+        )
+
+
+class TestSettleSweepFailedUnits:
+    """AUD-27: the recurring settle sweep also resolves failed units under a
+    still-APPROVED experiment — mark_failed leaves the experiment APPROVED, so the
+    status-scoped legs never reach it. This is the durable backstop for stragglers."""
+
+    def test_approved_experiment_failed_unit_swept(
+        self,
+        approved_experiment,
+        experiment_repository,
+        receipt_index_repository: ReceiptIndexRepository,
+        worker_repository: WorkerRepository,
+        per_job_factory: PerJobDatabaseFactory,
+    ) -> None:
+        worker_repository.enroll(worker_id="wkr-A", pubkey_hex="a" * 64)
+        _, _, experiment, _ = approved_experiment
+        per_job_db = per_job_factory.get_or_create(experiment.experiment_id)
+        wu = WorkUnitRepository(per_job_db)
+        rr = ResultRepository(per_job_db)
+        wu.submit_batch([{"unit_id": "u-fail", "payload": {}}], replication_target=3)
+        wu.mark_in_progress("u-fail")
+        rr.insert(
+            result_id="res-fail",
+            unit_id="u-fail",
+            worker_id="wkr-A",
+            worker_pubkey_hex="a" * 64,
+            exit_code=0,
+            payload={"ok": 1},
+            worker_signature="s",
+            completed_at=datetime(2026, 7, 8, 10, 0, tzinfo=UTC),
+        )
+        wu.mark_failed("u-fail")
+
+        results = settle_all_terminal_experiments(
+            experiment_repository=experiment_repository,
+            per_job_factory=per_job_factory,
+            receipt_index_repository=receipt_index_repository,
+        )
+        assert any(
+            r.experiment_id == experiment.experiment_id and r.results_marked == 1 for r in results
+        )
+        marker = receipt_index_repository.get_result_outcome(
+            worker_id="wkr-A", result_id="res-fail"
+        )
+        assert marker is not None and marker.reason == "unit_failed"
+
+
+class TestIncrementCompletionsNoResurrect:
+    """AUD-32: a late conforming replica must not resurrect a terminal unit to
+    'completed' (which would mint receipts/attestation for an escalated unit)."""
+
+    def test_failed_unit_not_flipped_to_completed(
+        self, per_job_factory: PerJobDatabaseFactory
+    ) -> None:
+        per_job_db = per_job_factory.get_or_create("exp-aud32")
+        wu = WorkUnitRepository(per_job_db)
+        wu.submit_batch([{"unit_id": "u-1", "payload": {}}], replication_target=1)
+        wu.mark_in_progress("u-1")
+        wu.mark_failed("u-1")
+        assert wu.get_by_unit_id("u-1").status == WorkUnitStatus.FAILED
+
+        # A late conforming replica arrives: completions bump, but NO flip.
+        updated, just_completed = wu.increment_completions("u-1")
+        assert just_completed is False
+        assert updated.status == WorkUnitStatus.FAILED
+
+    def test_pending_unit_still_completes(self, per_job_factory: PerJobDatabaseFactory) -> None:
+        # Control: the happy path is unchanged — a still-open unit at target flips.
+        per_job_db = per_job_factory.get_or_create("exp-aud32-ok")
+        wu = WorkUnitRepository(per_job_db)
+        wu.submit_batch([{"unit_id": "u-ok", "payload": {}}], replication_target=1)
+        wu.mark_in_progress("u-ok")
+        updated, just_completed = wu.increment_completions("u-ok")
+        assert just_completed is True
+        assert updated.status == WorkUnitStatus.COMPLETED
+
+
+# ── AUD-33: authoritative per-job receipt check (dropped index ≠ no receipt) ────
+
+
+def _insert_per_job_receipt(per_job_db, *, unit_id, worker_pubkey_hex, receipt_id):
+    from auspexai_platform.receipts.models import (
+        QuorumAgreement,
+        Receipt,
+        ResultHashAnchor,
+        TimeWindow,
+        encode_cbor,
+    )
+    from auspexai_platform.receipts.repository import ReceiptRepository
+
+    receipt = Receipt(
+        version="0.1",
+        tenant_id="t",
+        experiment_id="e",
+        worker_pubkey=bytes.fromhex(worker_pubkey_hex),
+        work_unit_ids=[unit_id],
+        time_window=TimeWindow(
+            start=datetime(2026, 7, 8, 10, 0, tzinfo=UTC),
+            end=datetime(2026, 7, 8, 10, 1, tzinfo=UTC),
+        ),
+        quorum_agreement=QuorumAgreement(
+            replication_factor=2, agreeing_workers=2, method="builtin_exact_hash_agreement"
+        ),
+        result_hash_anchors=[
+            ResultHashAnchor(
+                rekor_log_index=0, rekor_entry_uuid="lab-mode-no-rekor", result_sha256="a" * 64
+            )
+        ],
+    )
+    ReceiptRepository(per_job_db).insert(
+        receipt_id=receipt_id,
+        work_unit_ids=[unit_id],
+        cose_signed_blob=b"cose-bytes",
+        receipt_body_cbor=encode_cbor(receipt),
+        signing_key_pubkey_hex="b" * 64,
+    )
+
+
+def test_settle_does_not_terminalize_result_with_authoritative_per_job_receipt(
+    receipt_index_repository: ReceiptIndexRepository,
+    worker_repository: WorkerRepository,
+    per_job_factory: PerJobDatabaseFactory,
+) -> None:
+    """AUD-33: a result that earned a REAL per-job receipt whose best-effort
+    receipt_index write was dropped must NOT be marked no_receipt by the sweep —
+    that would manufacture a permanent false 410 despite the recoverable receipt."""
+    exp_id = "exp-aud33"
+    wpub = "c" * 64
+    worker_repository.enroll(worker_id="wkr-r", pubkey_hex=wpub)
+    per_job_db = per_job_factory.get_or_create(exp_id)
+    wu = WorkUnitRepository(per_job_db)
+    rr = ResultRepository(per_job_db)
+    wu.submit_batch([{"unit_id": "u-1", "payload": {}}], replication_target=2)
+    rr.insert(
+        result_id="res-r",
+        unit_id="u-1",
+        worker_id="wkr-r",
+        worker_pubkey_hex=wpub,
+        exit_code=0,
+        payload={"ok": 1},
+        worker_signature="s",
+        completed_at=datetime(2026, 7, 8, 10, 0, tzinfo=UTC),
+    )
+    # A real per-job receipt exists for (u-1, wpub) — but NO receipt_index entry
+    # (the best-effort cache write dropped).
+    _insert_per_job_receipt(per_job_db, unit_id="u-1", worker_pubkey_hex=wpub, receipt_id="rcpt-1")
+
+    from auspexai_platform.scheduler.teardown import _mark_receiptless_results
+
+    n = _mark_receiptless_results(
+        experiment_id=exp_id,
+        experiment_status=ExperimentStatus.ABORTED,
+        per_job_db=per_job_db,
+        receipt_index_repository=receipt_index_repository,
+    )
+    assert n == 0  # the authoritative per-job receipt was honored — no false terminal
+    assert receipt_index_repository.get_result_outcome(worker_id="wkr-r", result_id="res-r") is None

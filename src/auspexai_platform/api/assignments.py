@@ -89,8 +89,9 @@ from auspexai_platform.receipts.attestation import (
     collect_diverged_units,
     collect_result_set_entries,
     receipt_map_from_per_job,
+    unit_quorum_by_unit,
 )
-from auspexai_platform.result_signature import verify_result_signature
+from auspexai_platform.result_signature import verify_raw_signature, verify_result_signature
 from auspexai_platform.scheduler import (
     CONTAINMENT_STRICT,
     Scheduler,
@@ -98,6 +99,7 @@ from auspexai_platform.scheduler import (
     reoffer_eligible,
 )
 from auspexai_platform.scheduler.conductor import plan_prestage_for_worker
+from auspexai_platform.scheduler.teardown import _mark_terminal_unit_receiptless_results
 from auspexai_platform.weights import served_weights_verdict
 from auspexai_platform.worker_status import heartbeat_cutoff
 
@@ -152,6 +154,13 @@ class ResultSubmissionRequest(BaseModel):
     # the worker actually ran under. Absent ⇒ pre-v2 (un-rolled worker); the
     # containment guard then falls back to the worker's reported capability.
     ran_under: str | None = Field(default=None, max_length=64)
+    # AUD-26: D20 raw model text travels OUTSIDE the signed `payload` — new workers
+    # send it here with its own detached `raw_signature` (over sha256(raw) bound to
+    # unit+worker). The coordinator verifies the detached sig, then parks raw in the
+    # ephemeral transit buffer; it never enters the signed/stored payload, so the
+    # result signature verifies on export. Absent ⇒ non-capture or pre-fix worker.
+    raw_response: str | None = Field(default=None)
+    raw_signature: str | None = Field(default=None, min_length=1)
 
 
 class RefuseRequest(BaseModel):
@@ -681,7 +690,11 @@ def build_router(
             # bound; the heartbeat value is fleet-wide last-beat best-effort.
             snapshot_digests = body.served_weights if is_v1_result else served_digests
             snapshot = {
-                "worker_version": caps.get("version"),
+                # AUD-34 (A9 audit): the worker transmits its build under the
+                # capabilities key `worker_version` (detect.py) — reading `version`
+                # (a key the worker never sends) silently dropped the reproducibility
+                # triple's worker-software leg from every result's environment.
+                "worker_version": caps.get("worker_version"),
                 "ollama_version": caps.get("ollama_version"),
                 "served_models": caps.get("served_models"),
                 "served_model_digests": snapshot_digests,  # M3 reproducibility leg
@@ -763,7 +776,43 @@ def build_router(
             manifest_fs is not None and (manifest_fs.manifest_json.get("capture") or {}).get("raw")
         )
         _raw_text: str | None = None
-        if capture_raw and isinstance(body.payload, dict) and "raw_response" in body.payload:
+        _raw_sig: str | None = None
+        if capture_raw and body.raw_response is not None:
+            # AUD-26: new worker — raw arrives OUT of the signed payload with a
+            # detached signature. Authenticate it before parking (never park
+            # unauthenticated model text); the signed/stored payload is untouched,
+            # so its worker signature verifies on export.
+            if not (
+                body.raw_signature
+                and verify_raw_signature(
+                    worker_pubkey=body.worker_pubkey,
+                    signature_b64=body.raw_signature,
+                    unit_id=unit_id,
+                    raw_response=body.raw_response,
+                )
+            ):
+                assignments_repo.mark_refused(
+                    assignment_id=assignment.assignment_id,
+                    kind="raw_signature_invalid",
+                    reason="detached raw_signature does not verify over the raw content",
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail={
+                        "error": {
+                            "code": "raw_signature_invalid",
+                            "message": "raw_response present but raw_signature is missing/invalid",
+                        }
+                    },
+                )
+            _raw_text = body.raw_response
+            _raw_sig = body.raw_signature
+        elif capture_raw and isinstance(body.payload, dict) and "raw_response" in body.payload:
+            # LEGACY (pre-AUD-26 worker): raw was signed INSIDE the payload. Pop it
+            # so conformance + storage exclude it. NOTE: the stored signature was
+            # taken over the FULL payload, so such a bundle's worker signature will
+            # NOT verify on export — the AUD-26 defect, now confined to un-rolled
+            # workers; a worker roll (out-of-payload raw) resolves it.
             popped = body.payload.pop("raw_response")
             if isinstance(popped, str):
                 _raw_text = popped  # parked in the transit buffer after result_id is minted
@@ -801,6 +850,27 @@ def build_router(
                     # Terminal for the UNIT, not just this worker (a code fault is
                     # systematic — every worker runs the same certified executor).
                     work_units_repo.mark_failed(unit_id)
+                    # AUD-27: the unit is now terminal but the EXPERIMENT stays
+                    # APPROVED, so already-submitted results from other workers on
+                    # this unit will never earn a receipt. Record their terminal
+                    # receipt_outcomes markers now (the D22-B every-result-gets-a-
+                    # receipt-or-terminal-outcome contract) so they don't poll
+                    # canonical-receipt 404 forever. Best-effort; the recurring
+                    # settle sweep is the durable backstop for any straggler.
+                    if receipt_index_repository is not None:
+                        try:
+                            _mark_terminal_unit_receiptless_results(
+                                experiment_id=experiment_id,
+                                per_job_db=per_job_db,
+                                receipt_index_repository=receipt_index_repository,
+                                only_unit_id=unit_id,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "mark_failed: receiptless sweep failed exp=%s unit=%s",
+                                experiment_id,
+                                unit_id,
+                            )
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail={
@@ -836,8 +906,10 @@ def build_router(
             ran_under=body.ran_under,
         )
         assignments_repo.attach_result(assignment.assignment_id, result.result_id)
-        # D20: park the stripped raw in the ephemeral transit buffer keyed by the
-        # now-minted result_id — never persisted, R3-collectable during the run.
+        # D20: park the raw in the ephemeral transit buffer keyed by the now-minted
+        # result_id — never persisted, R3-collectable during the run. AUD-26: also
+        # park the detached signature + worker pubkey so the R3 driver can verify the
+        # worker actually produced the collected raw.
         if _raw_text is not None and raw_transit is not None:
             import time as _time
 
@@ -845,6 +917,8 @@ def build_router(
                 experiment_id=experiment_id,
                 result_id=result.result_id,
                 raw_text=_raw_text,
+                raw_signature=_raw_sig,
+                worker_pubkey=body.worker_pubkey,
                 now=_time.monotonic(),
             )
         updated_unit, just_completed = work_units_repo.increment_completions(unit_id)
@@ -1184,6 +1258,8 @@ def _maybe_emit_completion_attestation(
                 else None
             ),
             pre_registration=prereg.predicate_ref() if prereg is not None else None,
+            # AUD-30: re-derive each unit's basis from the receipts at sign time.
+            quorum_by_unit=unit_quorum_by_unit(per_job_db),
         )
         if attestation_repository is not None:
             try:
@@ -1273,7 +1349,15 @@ def finalize_completed_unit(
         experiment = experiment_repository.get_by_id(experiment_id)
         results = ResultRepository(per_job_db).list_for_unit(unit_id)
         receipt_repo = ReceiptRepository(per_job_db)
-        if experiment is not None:
+        # AUD-32 (A9 audit): never issue receipts/attestation for a unit whose
+        # experiment already went terminal (aborted/archived) — the abort cascade
+        # cancels + marks those receiptless instead. Defense-in-depth beside the
+        # increment_completions flip guard; issuance must be grounded in an ACTIVE
+        # experiment, not merely a non-None one.
+        if experiment is not None and experiment.status not in (
+            ExperimentStatus.ABORTED,
+            ExperimentStatus.ARCHIVED,
+        ):
             # C7: resolve the signed manifest so the reducer dispatch can read a
             # within_cell_tolerance envelope (None ⇒ the default hash-agreement).
             manifest_record = (

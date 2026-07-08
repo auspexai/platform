@@ -7,6 +7,7 @@ surface on E14; BYOT ⇒ flag + accept.
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
@@ -14,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from auspexai_platform.auth.signature import sign_request
+from auspexai_platform.result_signature import canonical_raw_bytes, verify_result_signature
 from tests._result_helpers import sign_result_body
 
 AUTHORITY = "testserver"
@@ -317,3 +319,145 @@ def test_certified_violation_rejected_unit_failed_and_alerted(
     assert attention.status_code == 200, attention.text
     reasons = [x["reason"] for x in attention.json()["experiments"] if x["experiment_id"] == exp_id]
     assert any("feature_schema violations" in r for r in reasons)
+
+
+# ── AUD-26: D20 raw travels OUT of the signed payload, signed on its own ───────
+
+
+def _approve_with_capture_unit(client, mh, priv, pub, exp_label, unit_id):
+    """Like _approve_with_unit but the manifest DECLARES `capture: {raw: True}`."""
+    submit = _submit_manifest(
+        client,
+        priv,
+        pub,
+        {
+            "tenant_id": "byot-tenant",
+            "experiment_id": exp_label,
+            "schema_version": "0.3",
+            "replication_factor": 1,
+            "feature_schema": SCHEMA,
+            "capture": {"raw": True},
+        },
+    ).json()
+    exp_id = submit["experiment_id"]
+    manifest_hash = submit["manifest_hash"]
+    assert (
+        client.post(f"/api/v0/experiments/{exp_id}/actions/approve", headers=mh).status_code == 200
+    )
+    r = _signed(
+        client,
+        method="POST",
+        path=f"/api/v0/experiments/{exp_id}/work-units",
+        privkey=priv,
+        pubkey_hex=pub,
+        json_body={
+            "work_units": [
+                {
+                    "schema_version": "0.1",
+                    "unit_id": unit_id,
+                    "tenant_id": "byot-tenant",
+                    "experiment_id": exp_label,
+                    "manifest_sha256": manifest_hash,
+                    "created_at": "2026-06-29T00:00:00Z",
+                    "payload": {"input": 5},
+                }
+            ]
+        },
+    )
+    assert r.status_code == 201, r.text
+    return exp_id
+
+
+def _submit_result_raw(client, wid, wpriv, wpub, unit_id, payload, raw, *, raw_sig=None):
+    if raw_sig is None:
+        raw_sig = base64.b64encode(
+            wpriv.sign(canonical_raw_bytes(unit_id=unit_id, worker_pubkey=wpub, raw_response=raw))
+        ).decode()
+    return _signed(
+        client,
+        method="POST",
+        path=f"/api/v0/workers/{wid}/assignments/{unit_id}/result",
+        privkey=wpriv,
+        pubkey_hex=wpub,
+        json_body={
+            "unit_id": unit_id,
+            "worker_pubkey": wpub,
+            "completed_at": "2026-06-29T12:00:00+00:00",
+            "exit_code": 0,
+            "payload": payload,
+            "worker_signature": sign_result_body(
+                wpriv,
+                wpub,
+                unit_id=unit_id,
+                completed_at="2026-06-29T12:00:00+00:00",
+                exit_code=0,
+                payload=payload,
+            ),
+            "raw_response": raw,
+            "raw_signature": raw_sig,
+        },
+    )
+
+
+def test_raw_capture_out_of_payload_stored_signature_verifies(
+    client: TestClient, maintainer_token: str, per_job_factory
+) -> None:
+    """AUD-26: raw arrives OUT of the signed payload with a valid detached
+    signature → accepted; the STORED payload has no raw_response and its worker
+    signature verifies (the export break the audit found is gone)."""
+    from auspexai_platform.db.repositories.results import ResultRepository
+
+    mh = {"Authorization": f"Bearer {maintainer_token}"}
+    priv, pub = _register_tenant(client, mh)
+    exp_id = _approve_with_capture_unit(client, mh, priv, pub, "cap-ok", "u-cap")
+    wpriv, wpub, wid = _enroll_worker(client)
+    _signed(
+        client,
+        method="GET",
+        path=f"/api/v0/workers/{wid}/assignments",
+        privkey=wpriv,
+        pubkey_hex=wpub,
+    )
+    raw = "the model emitted some untrusted §7 text"
+    r = _submit_result_raw(client, wid, wpriv, wpub, "u-cap", {"out": 10, "tag": "ok"}, raw)
+    assert r.status_code == 201, r.text
+
+    per_job_db = per_job_factory.get(exp_id)
+    stored = ResultRepository(per_job_db).list_for_unit("u-cap")
+    assert len(stored) == 1
+    row = stored[0]
+    assert "raw_response" not in row.payload  # raw never entered the stored payload
+    assert verify_result_signature(
+        worker_pubkey=row.worker_pubkey_hex,
+        signature_b64=row.worker_signature,
+        unit_id="u-cap",
+        completed_at=row.completed_at,
+        exit_code=row.exit_code,
+        payload=row.payload,
+        schema_version=row.schema_version,
+        served_weights=row.served_weights,
+        ran_under=row.ran_under,
+    )  # the export-time worker-signature check now passes
+
+
+def test_raw_capture_invalid_detached_signature_rejected(
+    client: TestClient, maintainer_token: str
+) -> None:
+    """AUD-26: unauthenticated raw is never parked — a bad detached signature is a
+    422, not a silent accept."""
+    mh = {"Authorization": f"Bearer {maintainer_token}"}
+    priv, pub = _register_tenant(client, mh)
+    _approve_with_capture_unit(client, mh, priv, pub, "cap-bad", "u-bad")
+    wpriv, wpub, wid = _enroll_worker(client)
+    _signed(
+        client,
+        method="GET",
+        path=f"/api/v0/workers/{wid}/assignments",
+        privkey=wpriv,
+        pubkey_hex=wpub,
+    )
+    r = _submit_result_raw(
+        client, wid, wpriv, wpub, "u-bad", {"out": 10, "tag": "ok"}, "real raw", raw_sig="AAAA"
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["error"]["code"] == "raw_signature_invalid"

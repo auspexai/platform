@@ -93,7 +93,16 @@ def build_router(
     def _can_view(credential: Credential, experiment) -> bool:
         if credential.is_maintainer():
             return True
-        return credential.is_researcher() and credential.tenant_id == experiment.tenant_id
+        if credential.is_researcher() and credential.tenant_id == experiment.tenant_id:
+            return True
+        # AUD-36 (A9 audit): mirror experiments.py _can_view — a Tier-1 account that
+        # RAN this experiment (under a public tenant it doesn't own) may inspect its
+        # own run's sub-resources, not just the experiment detail.
+        return (
+            credential.is_account()
+            and credential.account_id is not None
+            and experiment.submitted_by_account_id == credential.account_id
+        )
 
     @router.get("/experiments/{experiment_id}/events", include_in_schema=True)
     async def experiment_events(

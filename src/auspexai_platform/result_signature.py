@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 from datetime import datetime
 from typing import Any
@@ -101,6 +102,43 @@ def verify_result_signature(
     )
     try:
         pubkey.verify(signature, sig_input)
+        return True
+    except InvalidSignature:
+        return False
+
+
+def canonical_raw_bytes(*, unit_id: str, worker_pubkey: str, raw_response: str) -> bytes:
+    """AUD-26: the DETACHED raw-content signature body. Byte-for-byte mirror of the
+    worker's `auspexai_worker.signing.result.canonical_raw_bytes` — binds
+    `sha256(raw_response)` to the unit + worker so the coordinator authenticates
+    D20 raw text at ingest WITHOUT it ever entering the signed/stored result
+    payload (keeping the result signature verifiable on export)."""
+    body = {
+        "unit_id": unit_id,
+        "worker_pubkey": worker_pubkey.lower(),
+        "raw_response_sha256": hashlib.sha256(raw_response.encode("utf-8")).hexdigest(),
+    }
+    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def verify_raw_signature(
+    *, worker_pubkey: str, signature_b64: str, unit_id: str, raw_response: str
+) -> bool:
+    """True iff `signature_b64` is a valid Ed25519 signature by `worker_pubkey`
+    over the detached raw-content body for `raw_response`. Malformed input ⇒ False
+    (never raises)."""
+    try:
+        pubkey = Ed25519PublicKey.from_public_bytes(bytes.fromhex(worker_pubkey.lower()))
+        signature = base64.b64decode(signature_b64, validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    try:
+        pubkey.verify(
+            signature,
+            canonical_raw_bytes(
+                unit_id=unit_id, worker_pubkey=worker_pubkey, raw_response=raw_response
+            ),
+        )
         return True
     except InvalidSignature:
         return False
