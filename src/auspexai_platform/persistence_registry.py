@@ -57,8 +57,10 @@ CONTROL_DB_PERSISTENCE: dict[str, Persistence] = {
         "tenant application records — permanent, bounded by #applications"
     ),
     "workers": _grows(
-        "worker roster / identity — permanent attribution record, bounded by total-workers-ever "
-        "(a churn-scoped roster reaper is a NAMED future candidate — see the audit doc, not a leak)"
+        "worker roster / identity — permanent; a delete-reaper is VERIFIED not warranted (2026-07-07): "
+        "a withdrawn worker's pubkey lives in retired_keys to BLOCK re-enrollment (M7a), so deleting it "
+        "would re-open a withdrawn key (a security regression); 'offline' is computed from the heartbeat "
+        "(no stale-roster growth surface); live 0 reapable. Bounded by real workers, negligible"
     ),
     "vouches": _grows("the vouch / trust graph — permanent, bounded by #vouches"),
     "experiments": _grows(
