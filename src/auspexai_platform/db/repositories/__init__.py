@@ -12,6 +12,7 @@ etc.) by M6. Splitting now keeps the surface manageable.
 from auspexai_platform.db.repositories.accounts import AccountRepository
 from auspexai_platform.db.repositories.assessment_policy import AssessmentPolicyRepository
 from auspexai_platform.db.repositories.assignments import AssignmentRepository
+from auspexai_platform.db.repositories.anchor_outcomes import AnchorOutcomeRepository
 from auspexai_platform.db.repositories.attestations import AttestationRepository
 from auspexai_platform.db.repositories.audit import AuditRepository
 from auspexai_platform.db.repositories.certified_profiles import CertifiedProfileRepository
@@ -48,6 +49,7 @@ __all__ = [
     "AccountRepository",
     "AssessmentPolicyRepository",
     "AssignmentRepository",
+    "AnchorOutcomeRepository",
     "AttestationRepository",
     "AuditRepository",
     "CertifiedProfileRepository",

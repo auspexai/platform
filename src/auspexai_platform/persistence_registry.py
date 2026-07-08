@@ -70,6 +70,10 @@ CONTROL_DB_PERSISTENCE: dict[str, Persistence] = {
     "receipt_outcomes": _grows(
         "D22-B terminal receipt-outcome markers — bounded by #results; permanent"
     ),
+    "anchor_outcomes": _grows(
+        "Rekor anchor retry/terminal state (A11) — bounded by #anchorable artifacts; "
+        "transient rows self-clear on success, terminal rows are the permanent un-anchorable record"
+    ),
     "divergence_index": _grows(
         "divergence events (firewall #1 signal) — bounded by #results; permanent"
     ),
