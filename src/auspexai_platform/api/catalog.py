@@ -101,21 +101,22 @@ def build_router(
         credential: Credential = Depends(credential_dep),  # noqa: B008
     ) -> SupportedResponse:
         """The Requests-page catalog = the fleet's REAL inventory PLUS the curated
-        provisionable set (union, deduped). Two honest layers:
-          - `available` — present on ≥1 active worker RIGHT NOW
-            (`capabilities["models"]`), so no pull needed (the green dot). This
-            INCLUDES models a worker holds that aren't in the curated set — the
-            page reflects what the fleet actually has, not just the vetted menu;
-          - `runnable`  — in the curated set, not on any worker, and the fleet
-            could pull it (an auto-acquire worker exists; where RAM is reported,
-            ≥1 is big enough);
-          - `too_big`   — in the curated set, not present, RAM reported by ≥1
-            worker and none is big enough (needs a bigger worker);
-          - `unknown`   — in the curated set, not present, no worker reported RAM.
-        RAM is strictly null-safe (a worker not reporting RAM is in neither
-        `fits` nor `too_big`). `served_models` is empty on real heartbeats, so
-        `capabilities["models"]` = 'present/available' — that's what the green
-        dot means."""
+        provisionable set (union, deduped).
+
+        RUNNABILITY IS DECIDED SOLELY BY RAM-FIT — NEVER by disk presence. You can
+        download anything; loading it is what needs the RAM (the 156 GB-on-a-7 GB-
+        mayhem class). So presence only refines "ready now" AMONG models that fit:
+          - `available` — a worker HOLDS it on disk AND its RAM FITS it → serve-ready
+            now (the green dot);
+          - `runnable`  — its footprint fits ≥1 worker's RAM but it isn't staged on a
+            fitting worker yet (needs acquiring/staging);
+          - `too_big`   — its footprint fits NO worker's RAM — even if a stray file is
+            stranded on a too-small worker's disk;
+          - `unknown`   — footprint unverifiable: not in the sized catalog, OR no
+            active worker reports RAM (can't confirm a fit either way).
+        `fits_worker_count` is the repl-capacity signal (fits 1 ⇒ repl-1 only, not
+        the whole fleet). `on_worker_count` reports disk presence — informational
+        only, it does NOT drive runnability. RAM is strictly null-safe."""
         if not (
             credential.is_researcher()
             or credential.is_account()
@@ -155,22 +156,45 @@ def build_router(
         else:
             catalog = supported_by_id()
             catalog_source, fetched_at = "curated", None
+
+        def _ready_count(mid: str, model) -> int:
+            """Workers that HOLD the model on disk AND whose RAM FITS it — the only
+            honest 'serve-ready now'. Presence alone is not enough."""
+            if model is None:
+                return 0
+            return sum(
+                1
+                for c in caps
+                if isinstance(c.get("models"), list)
+                and mid in c["models"]
+                and (r := _ram(c)) is not None
+                and r >= model.approx_ram_gb
+            )
+
         # UNION: everything on the fleet + the whole provisionable set (deduped).
         entries: list[SupportedEntry] = []
         for mid in set(present) | set(catalog):
             m = catalog.get(mid)
-            on_n = present.get(mid, 0)
+            on_n = present.get(mid, 0)  # workers that hold the FILE on disk (informational only)
+            # Runnability is decided SOLELY by RAM-fit — NEVER by disk presence (you
+            # can download anything; loading it is what needs the RAM). So:
+            #  - an UNSIZED model (not in the sized catalog) can't be confirmed to fit
+            #    any worker → `unknown`, even if a stray file sits on a worker's disk;
+            #  - a SIZED model whose footprint fits no worker → `too_big`, even if it
+            #    is stranded on a too-small worker's disk;
+            #  - `available` requires a worker that HOLDS it AND FITS it (serve-ready);
+            #  - `runnable` = fits ≥1 worker but isn't staged there yet.
+            # `fits_worker_count` is the repl-capacity signal (fits 1 ⇒ repl-1 only).
             fits_n = sum(1 for r in ram_known if r >= m.approx_ram_gb) if m else 0
-            if on_n > 0:
-                st = "available"  # it's on a worker — reflect reality regardless of catalog
-            elif m is None:
-                st = "unknown"  # unreachable (a non-curated id only enters via `present`)
-            elif ram_known and fits_n == 0:
-                st = "too_big"
-            elif auto_acquire_fleet and (fits_n > 0 or not ram_known):
-                st = "runnable"  # RAM unknown ⇒ benefit of the doubt
+            ready_n = _ready_count(mid, m)
+            if m is None or not ram_known:
+                st = "unknown"  # footprint unknown, or no worker reports RAM → can't confirm
+            elif fits_n == 0:
+                st = "too_big"  # fits no worker's RAM, presence notwithstanding
+            elif ready_n > 0:
+                st = "available"  # fits AND already staged on a fitting worker
             else:
-                st = "unknown"
+                st = "runnable"  # fits ≥1 worker; needs acquiring/staging to run
             entries.append(
                 SupportedEntry(
                     model_id=mid,
