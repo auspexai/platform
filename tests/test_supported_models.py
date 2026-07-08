@@ -189,3 +189,20 @@ def test_present_unmenued_too_big_from_worker_report(
     ]
     assert m["status"] == "too_big"
     assert m["fits_worker_count"] == 0
+
+
+def test_fit_gates_on_usable_budget_not_raw_ram(
+    client: TestClient, maintainer_token: str, worker_repository
+) -> None:
+    # The Jetson bug: a model fits raw ram_total (7.44) but NOT the usable serve
+    # budget (5.44). It must read too_big — the coordinator gates on what the worker
+    # will actually SERVE, so it never advertises a fit the worker refuses at load.
+    caps = {"ram_total_gb": 7.44, "usable_memory_gb": 5.44, "auto_acquire": True}
+    _heartbeat(worker_repository, "wkr-jetson", caps)
+    by = _by_id(client.get("/api/v0/models/supported", headers=_mh(maintainer_token)).json())
+    # gemma-2-2b-it-q4 ~2.4 GB fits 5.44; qwen2.5-14b ~9 GB doesn't; mistral-7b ~5 GB fits.
+    assert by["qwen2.5-14b-instruct-q4"]["status"] == "too_big"  # 9 > 5.44
+    assert by["gemma-2-2b-it-q4"]["status"] == "runnable"  # 2.4 fits the usable budget
+    # A model in the 5.44-7.44 gap (mistral 5.0) fits usable; llama-3.1-8b (5.6) does NOT.
+    assert by["mistral-7b-instruct-q4"]["status"] == "runnable"  # 5.0 <= 5.44
+    assert by["llama-3.1-8b-instruct-q4"]["status"] == "too_big"  # 5.6 > 5.44 (but < 7.44 raw)

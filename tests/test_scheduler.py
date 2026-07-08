@@ -1104,3 +1104,28 @@ def test_derive_required_capabilities_sizes_models():
     assert req["model_ram_gb"] == {"big-q4": 20.34}
     # No sizer → no model_ram_gb (backward-compatible).
     assert "model_ram_gb" not in _derive_required_capabilities(manifest)
+
+
+def test_worker_satisfies_ram_gate_uses_usable_budget_not_raw_ram():
+    # The routing gate compares against usable_memory_gb (the serve budget), not raw
+    # ram_total — a Jetson with 7.44 raw but 5.44 usable is NOT eligible for an 8B
+    # model (footprint 5.91), so it's never routed a model it would refuse at load.
+    req = {"models": ["m8b"], "model_ram_gb": {"m8b": 5.91}}
+
+    def _w(wid, ram_total, usable):
+        return Worker(
+            worker_id=wid,
+            pubkey_hex="a" * 64,
+            trust_tier=TrustTier.T2_TRUSTED,
+            capabilities={
+                "os": "linux",
+                "execute_tenant_code": "provisioned",
+                "models": ["m8b"],
+                "ram_total_gb": ram_total,
+                "usable_memory_gb": usable,
+            },
+            registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+
+    assert worker_satisfies(_w("jetson", 7.44, 5.44), req) is False  # 5.91 > usable 5.44
+    assert worker_satisfies(_w("mac", 24.0, 22.0), req) is True  # fits the usable budget

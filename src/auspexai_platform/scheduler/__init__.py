@@ -439,7 +439,12 @@ def worker_satisfies(
     # would fail at load / refuse). Unsized models (no HF coords) and workers that
     # don't report RAM pass through — the worker's own acquire guard is the backstop.
     model_ram_gb = required_capabilities.get("model_ram_gb") or {}
-    worker_ram = worker.capabilities.get("ram_total_gb")
+    # Gate on the worker's usable SERVE budget (ram_total - headroom), not raw
+    # ram_total — else we'd route a model the worker then refuses at load (an 8B-q4
+    # on a unified 8 GB box). Fall back to ram_total for pre-fleet-fit workers.
+    worker_ram = worker.capabilities.get("usable_memory_gb")
+    if not isinstance(worker_ram, (int, float)):
+        worker_ram = worker.capabilities.get("ram_total_gb")
     if isinstance(worker_ram, (int, float)) and model_ram_gb:
         for mid in required_models:
             fp = model_ram_gb.get(mid)

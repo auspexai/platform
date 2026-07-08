@@ -147,8 +147,15 @@ def build_router(
                         present[mid] = present.get(mid, 0) + 1
 
         def _ram(c: dict) -> float | None:
-            v = c.get("ram_total_gb")
-            return float(v) if isinstance(v, (int, float)) else None
+            # The worker's usable SERVE budget (ram_total - OS/runtime headroom) is the
+            # honest fit threshold — gate on it, not raw ram_total, so the catalog says
+            # "fits" only where the worker will actually serve. Fall back to ram_total
+            # for pre-fleet-fit workers that don't report a usable budget yet.
+            for key in ("usable_memory_gb", "ram_total_gb"):
+                v = c.get(key)
+                if isinstance(v, (int, float)):
+                    return float(v)
+            return None
 
         ram_known = [r for c in caps if (r := _ram(c)) is not None]
 
