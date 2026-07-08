@@ -310,6 +310,54 @@ def settle_prestage(
         click.echo("\nRe-run with --apply to write these changes.")
 
 
+@main.command("reap-orphan-jobs")
+@_state_dir_option
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Actually delete orphan per-job DB files (+ -wal/-shm). Default is a dry-run.",
+)
+@click.option(
+    "--grace-hours",
+    default=24,
+    show_default=True,
+    help="Skip orphan files younger than this (guards a create-order race).",
+)
+def reap_orphan_jobs_cmd(state_dir: Path | None, apply_changes: bool, grace_hours: int) -> None:
+    """Reap orphaned per-job DB files (A11 — persistent-artifact reaper).
+
+    Removes `jobs/<eid>.db` (+ -wal/-shm) whose experiment_id has NO row in the
+    experiments table — genuinely-dead files (experiments are never deleted, so a
+    fileless id has no live reference). Per-job DBs for experiments that EXIST are
+    the permanent research record and are NEVER touched. A grace window guards a
+    create-order race. Idempotent; DRY-RUN by default; safe on a systemd timer.
+    See `persistent_artifact_reaper_audit.md`.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from auspexai_platform.db.database import Database
+    from auspexai_platform.db.migrations import MigrationRunner
+    from auspexai_platform.maintenance import reap_orphan_jobs
+
+    config = _resolve_config(state_dir)
+    db = Database(config.control_db_path)
+    try:
+        MigrationRunner(db).apply_all()  # idempotent; ensures the experiments table exists
+        report = reap_orphan_jobs(
+            config.jobs_dir,
+            db,
+            now=datetime.now(UTC),
+            grace=timedelta(hours=grace_hours),
+            apply=apply_changes,
+        )
+    finally:
+        db.close()
+    click.echo(report.summary())
+    if not apply_changes and report.removed:
+        click.echo("\nRe-run with --apply to delete these.")
+
+
 @main.command("refresh-hf-catalog")
 @_state_dir_option
 @click.option(

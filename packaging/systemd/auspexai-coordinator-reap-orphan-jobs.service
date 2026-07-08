@@ -1,0 +1,28 @@
+[Unit]
+Description=AuspexAI coordinator — A11 reap orphaned per-job DB files (jobs/<eid>.db with no experiment row)
+Documentation=https://github.com/auspexai/platform
+After=network-online.target auspexai-coordinator.service
+Wants=auspexai-coordinator.service
+
+[Service]
+Type=oneshot
+User=jason
+Group=jason
+# Same state dir as the coordinator daemon (reads experiments from the control
+# DB; deletes orphan files under <state_dir>/jobs).
+Environment=AUSPEXAI_STATE_DIR=/var/lib/auspexai-coordinator
+EnvironmentFile=-/etc/auspexai/coordinator.env
+ExecStart=/opt/auspexai-coordinator/bin/auspexai-coordinator reap-orphan-jobs --apply
+
+# Hardening — same shape as auspexai-coordinator-settle-prestage.service. DELETES
+# orphaned per-job DB files (+ -wal/-shm) inside the coordinator state dir.
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/auspexai-coordinator
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

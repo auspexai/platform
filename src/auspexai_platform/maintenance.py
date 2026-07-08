@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from auspexai_platform.config import Config
@@ -468,3 +468,61 @@ def _regime3_resume(svc, exp) -> None:
         resource_id=exp.experiment_id,
         payload={"trigger": "corroborating_capacity_recovered"},
     )
+
+
+# ---------------------------------------------------------------------------
+# A11 — orphan per-job DB file reaper
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OrphanJobsReport:
+    apply: bool
+    removed: list[str] = field(default_factory=list)  # experiment_ids whose files were reaped
+    skipped_recent: int = 0  # orphans inside the grace window (left for now)
+
+    def summary(self) -> str:
+        verb = "removed" if self.apply else "would remove"
+        s = f"orphan per-job DB(s): {verb} {len(self.removed)}"
+        if self.skipped_recent:
+            s += f"; {self.skipped_recent} recent orphan(s) within grace, left"
+        for eid in self.removed:
+            s += f"\n  - {eid}.db (+ -wal/-shm)"
+        return s
+
+
+def reap_orphan_jobs(
+    jobs_dir: Path,
+    control_db: Database,
+    *,
+    now: datetime,
+    grace: timedelta,
+    apply: bool,
+) -> OrphanJobsReport:
+    """Remove per-job DB files (+ their -wal/-shm sidecars) whose experiment_id
+    has NO row in the experiments table AND whose file is older than `grace`.
+
+    Per-job DB files are the permanent research record for an experiment that
+    EXISTS (grows-by-design); this only touches ORPHANS — files for an
+    experiment_id with no row, which is genuinely dead (experiments are never
+    deleted in-code, so a fileless id has no live reference). The grace window
+    guards a create-order race (file written, experiment INSERT still in flight).
+    DRY-RUN by default. See `persistent_artifact_reaper_audit.md`."""
+    report = OrphanJobsReport(apply=apply)
+    if not jobs_dir.exists():
+        return report
+    live = {r["experiment_id"] for r in control_db.execute("SELECT experiment_id FROM experiments")}
+    cutoff = now - grace
+    for db_path in sorted(jobs_dir.glob("*.db")):
+        if db_path.stem in live:
+            continue  # the experiment exists → its per-job DB is the permanent record
+        mtime = datetime.fromtimestamp(db_path.stat().st_mtime, tz=UTC)
+        if mtime > cutoff:
+            report.skipped_recent += 1  # too fresh — could be an in-flight create
+            continue
+        if apply:
+            db_path.unlink(missing_ok=True)
+            db_path.with_name(db_path.name + "-wal").unlink(missing_ok=True)
+            db_path.with_name(db_path.name + "-shm").unlink(missing_ok=True)
+        report.removed.append(db_path.stem)
+    return report

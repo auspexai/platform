@@ -1,0 +1,16 @@
+[Unit]
+Description=AuspexAI coordinator A11 orphan per-job DB reaper (daily; idempotent no-op when there are no orphans)
+Documentation=https://github.com/auspexai/platform
+
+[Timer]
+# Daily is plenty — orphans arise rarely (a create-order race, or an experiment
+# row removed out-of-band). Cheap when there's nothing to do (one control-DB
+# read + a jobs/ glob). Grace window (default 24h) means a fresh file is never
+# reaped, so co-running with the coordinator is safe.
+OnBootSec=18min
+OnUnitActiveSec=1d
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
