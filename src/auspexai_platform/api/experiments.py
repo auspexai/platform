@@ -39,9 +39,9 @@ from pydantic import BaseModel, Field
 
 from auspexai_platform.assessment import assess_envelope, decide
 from auspexai_platform.auth.credential import Credential, CredentialClass
-from auspexai_platform.completion import reached_unit_cap
 from auspexai_platform.auth.dependency import require_maintainer
 from auspexai_platform.certification import certified_match
+from auspexai_platform.completion import reached_unit_cap
 from auspexai_platform.db.models import (
     INTEGRITY_POLICY_REPLICATION,
     ExperimentStatus,
