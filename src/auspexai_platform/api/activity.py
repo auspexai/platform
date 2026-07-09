@@ -172,6 +172,30 @@ def _liveness_note(
 
     if status_val == ExperimentStatus.PAUSED.value:
         if by_val == CredentialClass.SYSTEM.value:
+            # STRUCTURAL vs transient below-floor pause. When the eligible fleet holds
+            # FEWER capable workers than the floor, the workers already online can never
+            # lift the hold (e.g. a repl-2 model only one worker in the fleet can serve).
+            # It recovers only from NEW capacity or a lower floor — so DON'T promise the
+            # transient "log a worker back in" recovery, which won't help here.
+            if (
+                capable_worker_count is not None
+                and floor is not None
+                and capable_worker_count < floor
+            ):
+                if capable_worker_count == 0:
+                    return (
+                        "Paused by the coordinator: no online worker can serve your "
+                        "model, so its units can't be corroborated. It resumes "
+                        "automatically once a worker that can serve your model joins."
+                    )
+                return (
+                    f"Paused by the coordinator: only {capable_worker_count} eligible "
+                    f"worker(s) can serve your model — fewer than the replication floor "
+                    f"of {floor}, so its units can't be corroborated on the current "
+                    "fleet. Logging an idle worker back in won't help; it needs another "
+                    "worker that can serve your model, or lower the experiment's "
+                    f"replication floor to {capable_worker_count}."
+                )
             return (
                 f"Paused by the coordinator: each unit needs {floor} corroborating "
                 "workers, but the eligible fleet is short right now. It auto-resumes "

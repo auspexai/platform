@@ -426,3 +426,40 @@ class TestExperimentActivity:
         )
         assert resp.status_code == 200, resp.text
         assert "diverged_unit_count" not in resp.json()
+
+
+class _PausedExp:
+    """Minimal stand-in for the pure `_liveness_note` unit tests below."""
+
+    def __init__(self, floor: int) -> None:
+        from auspexai_platform.auth.credential import CredentialClass
+        from auspexai_platform.db.models import ExperimentStatus
+
+        self.status = ExperimentStatus.PAUSED
+        self.last_action_by_class = CredentialClass.SYSTEM
+        self.replication_floor = floor
+        self.replication_target = floor
+
+
+def test_liveness_note_structural_pause_says_it_will_not_auto_resume():
+    """A SYSTEM pause where the eligible fleet holds FEWER capable workers than the
+    floor is structural — no returning worker can lift it. The note must NOT promise
+    an auto-resume; it must name the shortfall and the fix (lower the floor / add a
+    worker)."""
+    from auspexai_platform.api.activity import _liveness_note
+
+    note = _liveness_note(_PausedExp(floor=2), run_phase=None, capable_worker_count=1)
+    assert "only 1" in note
+    assert "floor of 2" in note
+    assert "won't help" in note  # names why the transient recovery doesn't apply
+    assert "auto-resumes" not in note  # must not promise the transient recovery
+
+
+def test_liveness_note_transient_pause_still_promises_auto_resume():
+    """When the fleet HAS >= floor capable workers (a transient dip — a worker went
+    offline), the note keeps the self-healing 'auto-resumes' wording."""
+    from auspexai_platform.api.activity import _liveness_note
+
+    note = _liveness_note(_PausedExp(floor=2), run_phase=None, capable_worker_count=2)
+    assert "auto-resumes" in note
+    assert "corroborating workers" in note

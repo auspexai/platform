@@ -198,3 +198,26 @@ def unit_max_achievable_replication(
     }
     uncontributed = sum(1 for w in eligible if w.worker_id not in done)
     return unit.completions_so_far + uncontributed
+
+
+def eligible_capable_count(
+    experiment,
+    *,
+    worker_repository: WorkerRepository,
+    now: datetime,
+) -> int:
+    """The number of SCHEDULABLE workers eligible to serve this experiment AT ALL — the
+    fleet's structural ceiling on any unit's replication. When it is below the
+    experiment's replication_floor, a below-floor regime-3 pause is STRUCTURAL: no worker
+    returning can lift it (there simply aren't enough workers that can serve the model),
+    so the pause will never auto-resume — as opposed to a transient dip a logged-out
+    worker returning would fix. Same eligibility basis as `unit_fleet_exhausted`."""
+    schedulable = _schedulable_workforce(worker_repository.list_all(), now=now)
+    eligible = _eligible(
+        schedulable,
+        experiment.required_capabilities or {},
+        experiment.replication_target,
+        requires_real_execution=experiment.requires_real_execution,
+        required_containment=experiment.required_containment,
+    )
+    return len(eligible)

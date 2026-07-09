@@ -384,7 +384,7 @@ def settle_sweep(
             if starved is not None:
                 report.paused.append(starved)
                 if apply:
-                    _regime3_pause(svc, exp, starved)
+                    _regime3_pause(svc, exp, starved, now=now)
 
         # PAUSED-by-the-sweep experiments: resume once corroborating capacity recovers (regime 3).
         for exp in svc.experiment_repository.list_all(status=ExperimentStatus.PAUSED):
@@ -420,11 +420,17 @@ def settle_sweep(
     return report
 
 
-def _regime3_pause(svc, exp, starved: SettledUnit) -> None:
+def _regime3_pause(svc, exp, starved: SettledUnit, *, now: datetime) -> None:
     """C14 regime 3: SYSTEM-pause an experiment whose unit cannot reach the floor with the
     current fleet. Mirrors `_maybe_auto_complete` (SYSTEM-actor status transition + audit);
     `last_action_by_class=SYSTEM` marks it for the sweep's auto-resume. Idempotent: a racing
-    operator transition (e.g. abort) just no-ops."""
+    operator transition (e.g. abort) just no-ops.
+
+    Records whether the starvation is STRUCTURAL — the eligible fleet holds fewer capable
+    workers than the floor, so no returning worker can ever lift the hold (it will never
+    auto-resume) — vs a transient dip, so the audit log / operator can tell them apart."""
+    from auspexai_platform.scheduler.capacity import eligible_capable_count
+
     try:
         svc.experiment_repository.update_status(
             exp.experiment_id,
@@ -433,6 +439,8 @@ def _regime3_pause(svc, exp, starved: SettledUnit) -> None:
         )
     except InvalidStatusTransitionError:
         return
+    capable = eligible_capable_count(exp, worker_repository=svc.worker_repository, now=now)
+    structural = capable < starved.floor
     svc.audit_repository.append(
         actor_class=CredentialClass.SYSTEM,
         actor_identifier="settle-sweep",
@@ -440,10 +448,16 @@ def _regime3_pause(svc, exp, starved: SettledUnit) -> None:
         resource_type="experiment",
         resource_id=exp.experiment_id,
         payload={
-            "trigger": "insufficient_corroborating_capacity",
+            "trigger": (
+                "structural_under_replication"
+                if structural
+                else "insufficient_corroborating_capacity"
+            ),
             "unit_id": starved.unit_id,
             "need": starved.floor,
             "have": starved.achieved,
+            "eligible_capable_workers": capable,
+            "structural": structural,
         },
     )
 

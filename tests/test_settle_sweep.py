@@ -7,6 +7,7 @@ achieved replication, running the SAME post-completion path as a normal completi
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
@@ -350,6 +351,15 @@ def test_regime3_pauses_below_floor_then_resumes_when_capacity_recovers(
     assert any(p.unit_id == "u-r3" for p in report.paused), report.summary()
     assert report.settled == []
     assert client.get(f"/api/v0/experiments/{exp_id}", headers=mh).json()["status"] == "paused"
+
+    # The pause audit distinguishes STRUCTURAL starvation (only 1 capable worker in the
+    # fleet, below floor 2) from a transient dip — so the operator can tell them apart.
+    rows = db.execute("SELECT payload FROM audit_log WHERE action = 'experiment.regime3_pause'")
+    payloads = [json.loads(r["payload"]) for r in rows]
+    assert any(
+        p.get("structural") is True and p.get("eligible_capable_workers") == 1 for p in payloads
+    ), payloads
+    assert any(p.get("trigger") == "structural_under_replication" for p in payloads)
 
     # A SECOND worker enrolls — the floor (2) is achievable again → RESUME.
     _enroll_worker(client)
