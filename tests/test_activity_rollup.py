@@ -463,3 +463,51 @@ def test_liveness_note_transient_pause_still_promises_auto_resume():
     note = _liveness_note(_PausedExp(floor=2), run_phase=None, capable_worker_count=2)
     assert "auto-resumes" in note
     assert "corroborating workers" in note
+
+
+class _ApprovedExp:
+    """Minimal stand-in for the `_run_phase` / capped-note unit tests."""
+
+    def __init__(self, max_units: int | None) -> None:
+        from auspexai_platform.db.models import ExperimentStatus
+
+        self.status = ExperimentStatus.APPROVED
+        self.max_units = max_units
+
+
+def test_run_phase_capped_when_all_done_within_a_round_of_max_units():
+    """A run that hit its max_units cap (all done, nothing in flight, unit count within
+    a final round of the cap) reads as `capped`, not `running`/stalled."""
+    from auspexai_platform.api.activity import _run_phase
+
+    rp = lambda exp, **kw: _run_phase(exp, in_flight_count=0, pending_count=0, **kw)  # noqa: E731
+    # 498/500 done → capped
+    assert rp(_ApprovedExp(500), completions_total=498, total_units=498) == "capped"
+    # mid-run, momentarily idle far below the cap → running (a real stall, not capped)
+    assert rp(_ApprovedExp(500), completions_total=200, total_units=200) == "running"
+    # no cap set → never capped
+    assert rp(_ApprovedExp(None), completions_total=498, total_units=498) == "running"
+    # tiny cap (<= 2*margin) is not eligible → a short run doesn't read capped
+    assert rp(_ApprovedExp(30), completions_total=28, total_units=28) == "running"
+    # still work pending → not capped even at the cap
+    assert (
+        _run_phase(
+            _ApprovedExp(500),
+            in_flight_count=0,
+            pending_count=3,
+            completions_total=495,
+            total_units=498,
+        )
+        == "running"
+    )
+
+
+def test_liveness_note_capped_explains_and_offers_wrapup():
+    """The capped note names the cap, says it's NOT a stall, and offers both wrap-up
+    paths (complete it / raise the cap)."""
+    from auspexai_platform.api.activity import _liveness_note
+
+    note = _liveness_note(_ApprovedExp(500), run_phase="capped", capable_worker_count=2)
+    assert "500-unit cap" in note
+    assert "NOT a stall" in note
+    assert "Complete it" in note and "raise" in note

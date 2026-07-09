@@ -104,16 +104,25 @@ def _queue_rank(
     return None, None
 
 
+# A run that hits its max_units cap stops at the last full round that fit under the
+# cap, so its final submitted-unit count sits within one round of max_units (never
+# exactly at it). Treat "within a round of the cap, all done" as capped. A generous
+# per-round allowance; the guard below keeps a genuinely-short run from reading capped.
+_CAP_ROUND_MARGIN = 24
+
+
 def _run_phase(
     experiment,
     *,
     in_flight_count: int,
     pending_count: int,
     completions_total: int,
+    total_units: int = 0,
 ) -> str | None:
     """Derived, presentation-only phase that distinguishes an APPROVED experiment
     that is *queued* (nothing in flight, work still pending) from one actively
-    *running* (D12).
+    *running* (D12), and one that has *reached its max_units cap* (a clean end, not
+    a stalled driver).
 
     This is NOT a new ExperimentStatus — the scheduler and the terminal-state
     guards are untouched. `APPROVED` is overloaded for both "queued behind a busy
@@ -125,6 +134,20 @@ def _run_phase(
     if status_val == ExperimentStatus.PAUSED.value:
         return "paused"
     if status_val == ExperimentStatus.APPROVED.value:
+        max_units = getattr(experiment, "max_units", None)
+        # Reached its max_units cap: everything done, nothing in flight, and the
+        # submitted-unit count sits within a final round of the cap — the driver
+        # stopped because the coordinator won't accept more units, NOT because it
+        # died. A clean end state, distinct from a mid-run stall / dead driver.
+        if (
+            max_units
+            and max_units > 2 * _CAP_ROUND_MARGIN
+            and in_flight_count == 0
+            and pending_count == 0
+            and completions_total > 0
+            and total_units >= max_units - _CAP_ROUND_MARGIN
+        ):
+            return "capped"
         # Has started → running (an idle gap mid-run is "between beats", not
         # queued; the heart-monitor narrates that, and a below-floor stall is a
         # PAUSED state, not this one).
@@ -203,6 +226,15 @@ def _liveness_note(
                 "logged-out worker back in."
             )
         return "Paused by the maintainer."
+
+    if run_phase == "capped":
+        cap = getattr(experiment, "max_units", None)
+        return (
+            f"Reached its {cap}-unit cap — all requested work is done and the "
+            "coordinator won't accept more, so the workers have gone idle. This is the "
+            "run finishing its quota, NOT a stall. Complete it to close it out, or raise "
+            "max_units to extend the run."
+        )
 
     if run_phase == "queued":
         if capable_worker_count == 0:
@@ -539,6 +571,7 @@ def build_router(
             in_flight_count=in_flight,
             pending_count=counts.get("pending", 0),
             completions_total=completions_total,
+            total_units=sum(counts.values()),
         )
         download_progress = (
             prestage_repository.progress_for_models(required_models)

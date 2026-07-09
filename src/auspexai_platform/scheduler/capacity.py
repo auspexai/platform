@@ -216,7 +216,10 @@ def eligible_capable_count(
     eligible = _eligible(
         schedulable,
         experiment.required_capabilities or {},
-        experiment.replication_target,
+        # A not-yet-approved experiment may have no replication_target yet; the
+        # eligibility count is about model/containment capability, so 1 is a safe
+        # stand-in for "how many workers could serve this at all".
+        getattr(experiment, "replication_target", None) or 1,
         requires_real_execution=experiment.requires_real_execution,
         required_containment=experiment.required_containment,
     )

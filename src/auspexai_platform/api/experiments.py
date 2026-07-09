@@ -122,6 +122,10 @@ class ExperimentResponse(BaseModel):
     # dashboard can render elapsed/ETA progress for duration-mode runs
     # (detail route only — one manifest parse; None elsewhere).
     expected_duration_hours: Annotated[float | None, ExposureTag.TENANT_SCOPED] = None
+    # How many workers in the fleet can serve this experiment's model at all — the
+    # structural ceiling on replication (detail route only). Lets the approve pane
+    # warn when the replication floor exceeds the capable fleet (a structural stall).
+    capable_worker_count: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     submitted_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
     started_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
     completed_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
@@ -1471,6 +1475,12 @@ def build_router(
             raise _experiment_not_found(experiment_id)
         resp = _to_response(experiment)
         resp.run_phase = _experiment_phase(experiment, per_job_factory, datetime.now(UTC))
+        if worker_repository is not None:
+            from auspexai_platform.scheduler.capacity import eligible_capable_count
+
+            resp.capable_worker_count = eligible_capable_count(
+                experiment, worker_repository=worker_repository, now=datetime.now(UTC)
+            )
         m = manifest_repository.get(experiment.manifest_hash)
         if m is not None:
             try:
