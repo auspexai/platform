@@ -242,7 +242,7 @@ class Experiment(BaseModel):
     # to be eligible for this experiment's units — derived at submit from the
     # manifest's `local_weights_required` models, keyed by worker store model_id
     # (<repo-slug>-<quant>). Empty = no requirement (every worker eligible; pre-M1).
-    required_capabilities: dict[str, list[str]] = Field(default_factory=dict)
+    required_capabilities: dict[str, Any] = Field(default_factory=dict)
     # Audit 2026-06-08: a real-execution experiment with NO model requirement
     # (executor runs real code but declares no local weights) must still be kept
     # off synthetic-mode workers (which echo → false consensus). Derived at submit

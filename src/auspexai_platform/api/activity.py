@@ -29,7 +29,7 @@ my experiment draws on" signal; identity-free, so safe for any caller.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -272,7 +272,7 @@ class ExperimentActivityResponse(BaseModel):
     # M1 (#30): the models this experiment requires workers to locally hold, and
     # how many active workers currently satisfy that (the 'empty pool' signal
     # feeding #32 / the M2 demand-board). Omitted when there's no requirement.
-    required_capabilities: Annotated[dict[str, list[str]] | None, ExposureTag.TENANT_SCOPED] = None
+    required_capabilities: Annotated[dict[str, Any] | None, ExposureTag.TENANT_SCOPED] = None
     capable_worker_count: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     # D12 busy/idle index: of the eligible (capable) workers, how many are
     # currently busy holding an active assignment on some run. 'X of Y eligible

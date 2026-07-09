@@ -216,3 +216,28 @@ def test_list_filters_by_status(experiment_repository: ExperimentRepository, syn
     approved = experiment_repository.list_all(status=ExperimentStatus.APPROVED)
     assert len(submitted) == 0
     assert len(approved) == 1
+
+
+def test_create_and_read_back_required_capabilities_with_model_ram_gb(
+    experiment_repository: ExperimentRepository, synth_setup
+) -> None:
+    """Regression: `required_capabilities` carries `model_ram_gb` (a dict, from the
+    fleet-fit routing gate) alongside `models` (a list). The field must accept the
+    heterogeneous value and READ BACK without a validation error — the row round-trip
+    that a raw `dict[str, list[str]]` type broke with a 500 on submit + list."""
+    tenant_id, manifest_hash = synth_setup
+    caps = {
+        "models": ["mistral-7b-instruct-v0.3-q4"],
+        "model_ram_gb": {"mistral-7b-instruct-v0.3-q4": 5.24},
+    }
+    exp = experiment_repository.create(
+        tenant_id=tenant_id,
+        tenant_experiment_label="fleet-fit-roundtrip",
+        manifest_hash=manifest_hash,
+        required_capabilities=caps,
+    )
+    assert exp.required_capabilities == caps
+    # The read-back path that 500'd: list_all + get re-validate the Experiment row.
+    got = next(e for e in experiment_repository.list_all() if e.experiment_id == exp.experiment_id)
+    assert got.required_capabilities["model_ram_gb"] == {"mistral-7b-instruct-v0.3-q4": 5.24}
+    assert got.required_capabilities["models"] == ["mistral-7b-instruct-v0.3-q4"]

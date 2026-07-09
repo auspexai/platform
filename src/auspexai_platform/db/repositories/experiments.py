@@ -23,6 +23,7 @@ import json
 import secrets
 import sqlite3
 from datetime import UTC, datetime
+from typing import Any
 
 from auspexai_platform.auth.credential import CredentialClass
 from auspexai_platform.db.database import Database
@@ -85,7 +86,7 @@ class ExperimentRepository:
         tenant_id: str,
         tenant_experiment_label: str,
         manifest_hash: str,
-        required_capabilities: dict[str, list[str]] | None = None,
+        required_capabilities: dict[str, Any] | None = None,
         requires_real_execution: bool = False,
         submitted_by_account_id: str | None = None,
     ) -> Experiment:

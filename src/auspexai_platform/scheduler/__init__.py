@@ -39,6 +39,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
 
 from auspexai_platform.db.models import (
     INTEGRITY_POLICY_REPLICATION,
@@ -363,7 +364,7 @@ def worker_runs_provisioned(worker: Worker) -> bool:
 
 def worker_satisfies(
     worker: Worker,
-    required_capabilities: dict[str, list[str]],
+    required_capabilities: dict[str, Any],
     *,
     requires_real_execution: bool = False,
     required_containment: str = CONTAINMENT_PERMISSIVE,

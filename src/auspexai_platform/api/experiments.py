@@ -140,7 +140,7 @@ class ExperimentResponse(BaseModel):
     max_concurrent_assignments: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     max_payload_bytes: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
     # M1 (#30): models a worker must locally hold to be eligible (empty = none).
-    required_capabilities: Annotated[dict[str, list[str]] | None, ExposureTag.TENANT_SCOPED] = None
+    required_capabilities: Annotated[dict[str, Any] | None, ExposureTag.TENANT_SCOPED] = None
     # M-Results retention state.
     retention_hold: Annotated[bool | None, ExposureTag.TENANT_SCOPED] = None
     retention_hold_reason: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None

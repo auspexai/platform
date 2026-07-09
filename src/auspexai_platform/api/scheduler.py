@@ -20,6 +20,7 @@ the eligible workforce.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -58,7 +59,7 @@ class SchedulerExperiment(BaseModel):
     pending: int
     in_progress: int
     completed: int
-    required_capabilities: dict[str, list[str]]
+    required_capabilities: dict[str, Any]
     capable_worker_count: int  # active workers that hold the required model(s)
     eligible_worker_count: int  # capable AND tier-eligible for the unit replication target
     blocked: bool
