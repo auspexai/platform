@@ -35,6 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
+from auspexai_platform.completion import reached_unit_cap
 from auspexai_platform.db.models import ExperimentStatus
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
@@ -104,13 +105,6 @@ def _queue_rank(
     return None, None
 
 
-# A run that hits its max_units cap stops at the last full round that fit under the
-# cap, so its final submitted-unit count sits within one round of max_units (never
-# exactly at it). Treat "within a round of the cap, all done" as capped. A generous
-# per-round allowance; the guard below keeps a genuinely-short run from reading capped.
-_CAP_ROUND_MARGIN = 24
-
-
 def _run_phase(
     experiment,
     *,
@@ -139,13 +133,13 @@ def _run_phase(
         # submitted-unit count sits within a final round of the cap — the driver
         # stopped because the coordinator won't accept more units, NOT because it
         # died. A clean end state, distinct from a mid-run stall / dead driver.
+        # Same predicate the auto-complete paths use, so the badge and the state
+        # machine never disagree.
         if (
-            max_units
-            and max_units > 2 * _CAP_ROUND_MARGIN
-            and in_flight_count == 0
+            in_flight_count == 0
             and pending_count == 0
             and completions_total > 0
-            and total_units >= max_units - _CAP_ROUND_MARGIN
+            and reached_unit_cap(max_units, total_units)
         ):
             return "capped"
         # Has started → running (an idle gap mid-run is "between beats", not

@@ -12,12 +12,27 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
+from auspexai_platform.completion import CAP_ROUND_MARGIN, reached_unit_cap
 from auspexai_platform.config import Config
 from auspexai_platform.db.database import Database
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.maintenance import settle_sweep
 from tests._result_helpers import sign_result_body
 from tests.test_integration_full_flow import _ed25519, _enroll_worker, _signed_request
+
+
+def test_reached_unit_cap_boundaries() -> None:
+    m = CAP_ROUND_MARGIN
+    # No cap, or a cap too small to tell a round from the whole run → never capped.
+    assert reached_unit_cap(None, 10_000) is False
+    assert reached_unit_cap(0, 0) is False
+    assert reached_unit_cap(2 * m, 2 * m) is False  # cap must be > 2*margin
+    # A real cap: within a final round → capped; short by more than a round → not.
+    cap = 500
+    assert reached_unit_cap(cap, cap) is True
+    assert reached_unit_cap(cap, cap - m) is True  # exactly one round short still counts
+    assert reached_unit_cap(cap, cap - m - 1) is False  # more than a round short
+    assert reached_unit_cap(cap, 0) is False
 
 
 def _submit_result(client: TestClient, wid: str, wp, wpub: str, unit_id: str) -> None:
@@ -397,3 +412,162 @@ def test_regime3_never_resumes_an_operator_pause(
     report = settle_sweep(config, apply=True, now=datetime.now(UTC))
     assert report.resumed == []
     assert client.get(f"/api/v0/experiments/{exp_id}", headers=mh).json()["status"] == "paused"
+
+
+# --- Auto-wrap: cap-reached auto-complete + below-cap driverless auto-abort ---
+#
+# A run whose driver dies/interrupts without sending the finalize signal must not
+# strand in APPROVED forever. Reaching the maintainer max_units cap completes it
+# (a clean quota end); falling short with the driver gone aborts it (it didn't
+# meet the maintainer default). See `completion.reached_unit_cap`.
+
+
+def _cap_experiment(client, mh, rp, rpub, tenant: str, exp: str, *, max_units: int, n_units: int):
+    """An experiment approved with `max_units`, fed `n_units` work units. No
+    finalize call. Returns (exp_id, replication_target) — the target is clamped
+    to the integrity-policy floor, so the caller enrolls that many workers."""
+    client.post(
+        "/api/v0/tenants",
+        headers=mh,
+        json={"tenant_id": tenant, "maintainer_pubkey": rpub, "display_name": tenant},
+    )
+    r = _signed_request(
+        client,
+        method="POST",
+        path="/api/v0/experiments",
+        privkey=rp,
+        pubkey_hex=rpub,
+        json_body={
+            "manifest": {
+                "tenant_id": tenant,
+                "experiment_id": exp,
+                "executor": "python -m x",
+                "replication_factor": 1,
+            },
+            "signature": {"alg": "ed25519", "sig": "x"},
+        },
+    )
+    assert r.status_code == 201, r.text
+    exp_id = r.json()["experiment_id"]
+    manifest_hash = r.json()["manifest_hash"]
+    assert (
+        client.post(
+            f"/api/v0/experiments/{exp_id}/actions/approve?max_units={max_units}",
+            headers=mh,
+        ).status_code
+        == 200
+    )
+    units = [
+        {
+            "schema_version": "0.1",
+            "unit_id": f"u{i}",
+            "tenant_id": tenant,
+            "experiment_id": exp,
+            "manifest_sha256": manifest_hash,
+            "created_at": "2026-05-19T00:00:00Z",  # server re-stamps; age via _age_units
+            "payload": {"input": i},
+        }
+        for i in range(n_units)
+    ]
+    r = _signed_request(
+        client,
+        method="POST",
+        path=f"/api/v0/experiments/{exp_id}/work-units",
+        privkey=rp,
+        pubkey_hex=rpub,
+        json_body={"work_units": units},
+    )
+    assert r.status_code == 201, r.text
+    rt = client.get(f"/api/v0/experiments/{exp_id}", headers=mh).json()["replication_target"]
+    return exp_id, rt
+
+
+def _complete_units(client, *, replication_target: int) -> None:
+    """Complete every offered unit to its replication target: enroll one worker
+    per replica and drain its queue (identical payloads → hash agreement)."""
+    for _ in range(replication_target):
+        wp, wpub, wid = _enroll_worker(client)
+        while True:
+            pick = _signed_request(
+                client,
+                method="GET",
+                path=f"/api/v0/workers/{wid}/assignments",
+                privkey=wp,
+                pubkey_hex=wpub,
+            ).json()
+            wu = pick.get("work_unit")
+            if not wu:
+                break
+            _submit_result(client, wid, wp, wpub, wu["unit_id"])
+
+
+def _age_units(config: Config, exp_id: str, when: datetime) -> None:
+    """Backdate every work unit's server-stamped created_at — the driver-idle
+    signal the auto-wrap reads (units are fed by the driver, so this is when it
+    last acted)."""
+    pj = PerJobDatabaseFactory(config.jobs_dir).get(exp_id)
+    assert pj is not None
+    with pj.transaction() as cur:
+        cur.execute("UPDATE work_units SET created_at = ?", (when.isoformat(),))
+
+
+def test_auto_completes_at_cap_without_finalize(
+    client: TestClient, config: Config, maintainer_token: str
+) -> None:
+    """A run that reaches its max_units cap auto-completes the moment its last unit
+    lands — WITHOUT the driver ever calling finalize-submissions. This is the fix
+    for the stranded-driver failure: completion no longer hangs on a live driver."""
+    mh = {"Authorization": f"Bearer {maintainer_token}"}
+    rp, rpub = _ed25519()
+    # max_units=49 (> 2*margin) so 25 units (>= 49-24) reads as "capped".
+    exp_id, rt = _cap_experiment(
+        client, mh, rp, rpub, "synth-capd", "capd-1", max_units=49, n_units=25
+    )
+    _complete_units(client, replication_target=rt)
+
+    # No finalize was ever sent, yet the run is COMPLETE (cap reached).
+    got = client.get(f"/api/v0/experiments/{exp_id}", headers=mh).json()
+    assert got["status"] == "completed", got
+    assert got["submissions_finalized"] is False
+
+
+def test_settle_auto_aborts_below_cap_when_driver_idle(
+    client: TestClient, config: Config, maintainer_token: str
+) -> None:
+    """A run that fell short of its cap with the driver gone quiet is auto-aborted
+    by the sweep — it didn't meet the maintainer default (operator policy (a):
+    below-cap driverless → abort, not a silent partial)."""
+    mh = {"Authorization": f"Bearer {maintainer_token}"}
+    rp, rpub = _ed25519()
+    now = datetime.now(UTC)
+    exp_id, rt = _cap_experiment(
+        client, mh, rp, rpub, "synth-short", "short-1", max_units=49, n_units=3
+    )
+    _complete_units(client, replication_target=rt)
+    _age_units(config, exp_id, now - timedelta(hours=1))  # driver fed an hour ago → gone
+
+    # Below cap → NOT auto-completed; it sits APPROVED until the sweep aborts it.
+    assert client.get(f"/api/v0/experiments/{exp_id}", headers=mh).json()["status"] == "approved"
+    report = settle_sweep(config, apply=True, now=now)
+    assert exp_id in report.auto_aborted, report.summary()
+    assert client.get(f"/api/v0/experiments/{exp_id}", headers=mh).json()["status"] == "aborted"
+
+
+def test_settle_holds_below_cap_run_while_driver_active(
+    client: TestClient, config: Config, maintainer_token: str
+) -> None:
+    """A below-cap run whose driver is merely between rounds (recent work-unit
+    feed) is left alone — the idle grace prevents aborting a live run out from
+    under it."""
+    mh = {"Authorization": f"Bearer {maintainer_token}"}
+    rp, rpub = _ed25519()
+    now = datetime.now(UTC)
+    exp_id, rt = _cap_experiment(
+        client, mh, rp, rpub, "synth-live", "live-1", max_units=49, n_units=3
+    )
+    _complete_units(client, replication_target=rt)
+    _age_units(config, exp_id, now - timedelta(minutes=1))  # driver fed a minute ago → active
+
+    report = settle_sweep(config, apply=True, now=now)
+    assert exp_id not in report.auto_aborted, report.summary()
+    assert client.get(f"/api/v0/experiments/{exp_id}", headers=mh).json()["status"] == "approved"

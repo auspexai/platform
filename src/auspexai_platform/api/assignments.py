@@ -54,6 +54,7 @@ from pydantic import BaseModel, Field
 
 from auspexai_platform.auth.credential import Credential, CredentialClass
 from auspexai_platform.auth.dependency import enforce_worker_active, require_worker
+from auspexai_platform.completion import reached_unit_cap
 from auspexai_platform.db.models import ExperimentStatus, TrustTier
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
@@ -1509,22 +1510,26 @@ def _maybe_auto_complete(
     audit_repository: AuditRepository,
     event_bus=None,
 ) -> None:
-    """Auto-transition an experiment to COMPLETED iff:
+    """Auto-transition an experiment to COMPLETED iff it is APPROVED, all work
+    units are 'completed', AND either:
 
-      - submissions_finalized is True (researcher has signaled "no more work")
-      - all work units are in 'completed' status
-      - experiment status is currently APPROVED (paused experiments wait for resume)
+      - submissions_finalized is True (the driver signaled "no more work"), or
+      - the run reached its maintainer-set max_units cap (a clean quota end).
 
-    Called from the result-submission path after a unit transitions to
-    completed. No-op when conditions aren't met. Logs an audit entry with
-    actor_class=SYSTEM (M6e — coordinator-driven action class).
+    The cap trigger makes wrap-up a coordinator responsibility that does not hang
+    on a live driver reaching its finalize call: a driver that dies AT the cap no
+    longer strands the run in APPROVED forever. A driver that dies BELOW the cap
+    is a genuinely-short run — not completed here; the settle sweep auto-aborts it
+    (it didn't meet the maintainer default). Paused experiments wait for resume.
+
+    Called from the result-submission path after a unit transitions to completed.
+    No-op when conditions aren't met. Logs an audit entry with actor_class=SYSTEM
+    (M6e — coordinator-driven action class).
     """
     experiment = experiment_repository.get_by_id(experiment_id)
     if experiment is None:  # pragma: no cover — defensive
         return
     if experiment.status is not ExperimentStatus.APPROVED:
-        return
-    if not experiment.submissions_finalized:
         return
 
     # Cheap check: any unit not yet completed?
@@ -1532,6 +1537,13 @@ def _maybe_auto_complete(
     remaining = int(rows[0]["n"]) if rows else 0
     if remaining != 0:
         return
+    trows = per_job_db.execute("SELECT COUNT(*) AS n FROM work_units")
+    total_units = int(trows[0]["n"]) if trows else 0
+
+    capped = reached_unit_cap(experiment.max_units, total_units)
+    if not (experiment.submissions_finalized or capped):
+        return
+    trigger = "finalized" if experiment.submissions_finalized else "reached_max_units_cap"
 
     try:
         experiment_repository.update_status(
@@ -1547,7 +1559,7 @@ def _maybe_auto_complete(
         action="experiment.auto_complete",
         resource_type="experiment",
         resource_id=experiment_id,
-        payload={"trigger": "all_units_completed_and_finalized"},
+        payload={"trigger": trigger},
     )
     if event_bus is not None:
         # M8: surface the coordinator-driven completion live, same shape as the

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from auspexai_platform.completion import reached_unit_cap
 from auspexai_platform.config import Config
 from auspexai_platform.db.database import Database
 from auspexai_platform.db.models import (
@@ -217,6 +218,14 @@ def age_off_sweep(
 # below target.
 SETTLE_QUIESCENCE_INTERVALS = 2
 
+# Auto-wrap idle grace for the below-cap abort. A driver merely between rounds
+# reposts work units within its round interval (minutes); this must comfortably
+# exceed that so a live-but-quiet driver is never aborted out from under. The
+# cap-reached auto-complete uses the shorter settle quiescence instead — the cap
+# is a hard guarantee that no more units can arrive, so there's nothing to wait
+# for beyond letting an in-flight settle land.
+AUTO_ABORT_IDLE_MINUTES = 30
+
 
 @dataclass
 class SettledUnit:
@@ -234,16 +243,24 @@ class SettleReport:
     settled: list[SettledUnit] = field(default_factory=list)
     paused: list[SettledUnit] = field(default_factory=list)  # regime 3: starved below the floor
     resumed: list[str] = field(default_factory=list)  # experiment_ids auto-resumed (capacity back)
+    # Auto-wrap: an idle APPROVED run whose driver never sent finalize. Completed
+    # if it reached the max_units cap; aborted if it fell short (below default).
+    auto_completed: list[str] = field(default_factory=list)
+    auto_aborted: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         head = (
             f"regime-2/3 capacity sweep @ {self.now} ({'APPLIED' if self.applied else 'DRY-RUN'})"
         )
-        if not (self.settled or self.paused or self.resumed):
-            return f"{head}\n  nothing to settle, pause, or resume"
+        if not (
+            self.settled or self.paused or self.resumed or self.auto_completed or self.auto_aborted
+        ):
+            return f"{head}\n  nothing to settle, pause, resume, or wrap up"
         sv = "settled" if self.applied else "would settle"
         pv = "paused" if self.applied else "would pause"
         rv = "resumed" if self.applied else "would resume"
+        cv = "auto-completed" if self.applied else "would auto-complete"
+        av = "auto-aborted" if self.applied else "would auto-abort"
         lines = [head]
         lines += [
             f"  {sv} {s.experiment_id}/{s.unit_id} at {s.achieved}/{s.target} (floor {s.floor})"
@@ -254,6 +271,8 @@ class SettleReport:
             for p in self.paused
         ]
         lines += [f"  {rv} {e} (corroborating capacity recovered)" for e in self.resumed]
+        lines += [f"  {cv} {e} (reached max_units cap, driver idle)" for e in self.auto_completed]
+        lines += [f"  {av} {e} (below max_units cap, driver idle)" for e in self.auto_aborted]
         return "\n".join(lines)
 
 
@@ -263,6 +282,7 @@ def settle_sweep(
     apply: bool,
     now: datetime,
     quiescence_intervals: int = SETTLE_QUIESCENCE_INTERVALS,
+    auto_abort_idle_minutes: int = AUTO_ABORT_IDLE_MINUTES,
 ) -> SettleReport:
     """C14 regimes 2 + 3 (capacity-aware completion + pause/resume below the floor). Settle an IN_PROGRESS unit at its ACHIEVED
     replication when it has met its floor, the eligible fleet is exhausted, AND it has been
@@ -415,6 +435,42 @@ def settle_sweep(
                 report.resumed.append(exp.experiment_id)
                 if apply:
                     _regime3_resume(svc, exp)
+
+        # Auto-wrap: an APPROVED run whose units are ALL terminal but whose driver
+        # never sent the finalize signal (it died / dropped / was interrupted)
+        # would otherwise sit in APPROVED forever. Complete it if it reached the
+        # maintainer max_units cap (a clean quota end — the coordinator won't
+        # accept more units regardless of the driver); abort it if it fell short
+        # of the cap with the driver gone (it didn't meet the maintainer default,
+        # so it's not a valid result set — operator policy, not a partial). Idle-
+        # gated so a driver merely between rounds is never wrapped out from under.
+        abort_idle = timedelta(minutes=auto_abort_idle_minutes)
+        for exp in svc.experiment_repository.list_all(status=ExperimentStatus.APPROVED):
+            per_job = factory.get(exp.experiment_id)
+            if per_job is None:
+                continue
+            counts = WorkUnitRepository(per_job).count_by_status()
+            total = sum(counts.values())
+            if total == 0 or counts.get("completed", 0) != total:
+                continue  # nothing submitted, or a unit still pending / in-progress
+            idle_since = _last_work_unit_at(per_job)
+            idle_for = (now - idle_since) if idle_since is not None else None
+            if reached_unit_cap(exp.max_units, total):
+                # Cap reached → done regardless of the driver. A short quiescence
+                # only guards against racing an in-flight settle from the loop above.
+                if idle_for is not None and idle_for < quiescence:
+                    continue
+                report.auto_completed.append(exp.experiment_id)
+                if apply:
+                    _auto_complete_idle(svc, exp, per_job)
+            else:
+                # Below the cap → the driver COULD still feed more units, so abort
+                # only after it has been silent well past any round interval.
+                if idle_for is None or idle_for < abort_idle:
+                    continue
+                report.auto_aborted.append(exp.experiment_id)
+                if apply:
+                    _auto_abort_idle(svc, exp, submitted=total)
     finally:
         factory.close_all()
     return report
@@ -481,6 +537,90 @@ def _regime3_resume(svc, exp) -> None:
         resource_type="experiment",
         resource_id=exp.experiment_id,
         payload={"trigger": "corroborating_capacity_recovered"},
+    )
+
+
+def _last_work_unit_at(per_job) -> datetime | None:
+    """Timestamp of the most recently submitted work unit — the driver's last
+    feed activity. Used as the driver-idle signal for the auto-wrap pass (a live
+    driver reposts within its round interval; a dead one goes silent). None when
+    no units exist or the timestamp is unparseable."""
+    rows = per_job.execute("SELECT MAX(created_at) AS t FROM work_units")
+    raw = rows[0]["t"] if rows else None
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:  # pragma: no cover — defensive against a malformed stamp
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def _auto_complete_idle(svc, exp, per_job) -> None:
+    """Auto-complete an APPROVED run that reached its max_units cap but whose
+    driver never sent the finalize signal. SYSTEM-actor transition + canonical
+    completion attestation, byte-identical to the result-submit auto-complete
+    path (`api/assignments._maybe_emit_completion_attestation`)."""
+    try:
+        svc.experiment_repository.update_status(
+            exp.experiment_id,
+            ExperimentStatus.COMPLETED,
+            actor_class=CredentialClass.SYSTEM,
+        )
+    except InvalidStatusTransitionError:  # pragma: no cover — guarded by the caller
+        return
+    svc.audit_repository.append(
+        actor_class=CredentialClass.SYSTEM,
+        actor_identifier="settle-sweep",
+        action="experiment.auto_complete",
+        resource_type="experiment",
+        resource_id=exp.experiment_id,
+        payload={"trigger": "reached_max_units_cap_idle"},
+    )
+    # Emit the canonical completion attestation now (idempotent; the on-demand
+    # GET is the lazy backstop). Local import mirrors `finalize_completed_unit`
+    # above — avoids a module-level api ↔ maintenance import cycle.
+    from auspexai_platform.api.assignments import _maybe_emit_completion_attestation
+
+    _maybe_emit_completion_attestation(
+        experiment_id=exp.experiment_id,
+        per_job_db=per_job,
+        experiment_repository=svc.experiment_repository,
+        receipt_index_repository=svc.receipt_index_repository,
+        signing_key=svc.receipt_signing_key,
+        audit_repository=svc.audit_repository,
+        attestation_repository=svc.attestation_repository,
+        event_bus=None,
+        governance_footprint_builder=svc.governance_footprint_for,
+        pre_registration_repository=svc.pre_registration_repository,
+    )
+
+
+def _auto_abort_idle(svc, exp, *, submitted: int) -> None:
+    """Auto-abort an APPROVED run that fell short of its max_units cap with the
+    driver gone quiet — it didn't meet the maintainer default, so it is not a
+    valid result set (operator policy: below-cap driverless → abort, not a
+    silent partial)."""
+    try:
+        svc.experiment_repository.update_status(
+            exp.experiment_id,
+            ExperimentStatus.ABORTED,
+            actor_class=CredentialClass.SYSTEM,
+            error_summary="auto-aborted: driver inactive below max_units cap",
+        )
+    except InvalidStatusTransitionError:  # pragma: no cover — guarded by the caller
+        return
+    svc.audit_repository.append(
+        actor_class=CredentialClass.SYSTEM,
+        actor_identifier="settle-sweep",
+        action="experiment.auto_abort",
+        resource_type="experiment",
+        resource_id=exp.experiment_id,
+        payload={
+            "trigger": "below_max_units_driver_inactive",
+            "submitted_units": submitted,
+            "max_units": exp.max_units,
+        },
     )
 
 
