@@ -322,6 +322,7 @@ def create_app(
     )
 
     from auspexai_platform.api.publications import create_publications_router
+    from auspexai_platform.db.repositories.driver_status import DriverStatusRepository
     from auspexai_platform.db.repositories.publications import PublicationRepository
     from auspexai_platform.raw_transit import RawTransitBuffer
     from auspexai_platform.zenodo import ZenodoClient
@@ -329,6 +330,7 @@ def create_app(
     raw_transit = RawTransitBuffer()  # D20: ephemeral raw-content transit (in-memory)
     app.state.raw_transit = raw_transit
     publication_repository = PublicationRepository(svc.db)
+    driver_status_repository = DriverStatusRepository(svc.db)  # 0059: driver liveness
     app.include_router(
         create_publications_router(
             experiment_repository=experiment_repository,
@@ -389,6 +391,7 @@ def create_app(
             pre_registration_deviation_repository=pre_registration_deviation_repository,
             certified_profile_repository=certified_profile_repository,
             account_repository=account_repository,  # Tier-1 account-run gate
+            driver_status_repository=driver_status_repository,  # 0059: driver liveness
             tenant_tier=_tenant_tier,  # §9 #48 class-by-tier auto-approval
             tenant_research_standing=_tenant_research_standing,  # D9 Phase 4 BYOT gate
             tenant_byot_revoked=_tenant_byot_revoked,  # AUD-13 explicit BYOT revocation

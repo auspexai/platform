@@ -31,9 +31,9 @@ import logging
 import secrets
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -55,6 +55,7 @@ from auspexai_platform.db.repositories import (
     AttestationRepository,
     AuditRepository,
     CertifiedProfileRepository,
+    DriverStatusRepository,
     ExperimentRepository,
     ManifestRepository,
     ReceiptIndexRepository,
@@ -95,6 +96,30 @@ logger = logging.getLogger(__name__)
 # ---- response models -------------------------------------------------------
 
 
+class DriverStatusView(BaseModel):
+    """The off-coordinator tenant driver's last-known liveness (0059), so a
+    stalled / stranded run self-explains: which driver, when it was last seen,
+    how long it has been silent, and why it stopped when it managed a final
+    report. The driver runs on the tenant's machine over the tunnel, so this is
+    the coordinator's ONLY window into driver liveness."""
+
+    status: str | None = None  # driving | finalizing | exiting | gone
+    run_id: str | None = None
+    reason: str | None = None
+    round: int | None = None
+    last_seen_at: str | None = None
+    silent_for_seconds: int | None = None
+
+
+class DriverHeartbeatBody(BaseModel):
+    """A driver liveness ping. Sent each round and on the driver's exit paths."""
+
+    status: Literal["driving", "finalizing", "exiting", "gone"]
+    run_id: str | None = None
+    reason: str | None = None
+    round: int | None = None
+
+
 class ExperimentResponse(BaseModel):
     """Wire shape for an experiment. Fields are Optional so the exposure
     filter can mask non-visible ones.
@@ -129,6 +154,12 @@ class ExperimentResponse(BaseModel):
     # The replication the MANIFEST declared (detail route only) — so the researcher
     # can see whether approval changed it vs the approved replication_target/floor.
     declared_replication_factor: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
+    # The off-coordinator tenant driver's liveness (0059, detail route only) —
+    # the `DriverStatusView` shape, dumped to a plain dict so the TENANT_SCOPED
+    # exposure filter (which flattens nested models) round-trips it cleanly. None
+    # when no driver has ever reported; a large `silent_for_seconds` = the driver
+    # died/dropped without finalizing → the run reads `stalled`, not `running`.
+    driver: Annotated[dict[str, Any] | None, ExposureTag.TENANT_SCOPED] = None
     submitted_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
     started_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
     completed_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
@@ -739,6 +770,33 @@ def _enforce_policy_floor(
 # ---- router ----------------------------------------------------------------
 
 
+def _driver_status_view(
+    driver_status_repository: DriverStatusRepository, experiment_id: str, now: datetime
+) -> DriverStatusView | None:
+    """Build the DriverStatusView from the stored row, computing how long the
+    driver has been silent (now - last_seen_at) — the signal a stalled run reads.
+    None when no driver has ever reported for this experiment."""
+    ds = driver_status_repository.get(experiment_id)
+    if ds is None:
+        return None
+    silent: int | None = None
+    try:
+        last = datetime.fromisoformat(str(ds.last_seen_at).replace("Z", "+00:00"))
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=UTC)
+        silent = max(0, int((now - last).total_seconds()))
+    except (ValueError, TypeError):  # pragma: no cover — defensive against a bad stamp
+        pass
+    return DriverStatusView(
+        status=ds.status,
+        run_id=ds.run_id,
+        reason=ds.reason,
+        round=ds.round,
+        last_seen_at=ds.last_seen_at,
+        silent_for_seconds=silent,
+    )
+
+
 def build_router(
     credential_dep,
     manifest_repository: ManifestRepository,
@@ -759,6 +817,10 @@ def build_router(
     # starter. Used to gate the account path on suspension + research standing
     # (the other lookups here are tenant-scoped and don't apply to an account).
     account_repository: AccountRepository | None = None,
+    # 0059: the off-coordinator driver's liveness store. Optional so the router
+    # builds in tests without it; absent → the heartbeat route is a no-op and the
+    # detail response carries no driver field.
+    driver_status_repository: DriverStatusRepository | None = None,
     # §9 #48: injected lookups (wired in main.py from the account/application
     # repos, à la the scheduler's account_suspended_for_tenant). All optional so
     # the router builds in tests without them — defaults make every experiment
@@ -1497,12 +1559,61 @@ def build_router(
                     resp.declared_replication_factor = declared_repl
             except AttributeError:
                 pass
+        if driver_status_repository is not None:
+            dv = _driver_status_view(driver_status_repository, experiment_id, datetime.now(UTC))
+            resp.driver = dv.model_dump() if dv is not None else None
         return filter_for_credential(
             resp,
             credential,
             resource_tenant_id=experiment.tenant_id,
             resource_account_id=experiment.submitted_by_account_id,
         )
+
+    @router.post(
+        "/experiments/{experiment_id}/driver-heartbeat",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def driver_heartbeat(
+        experiment_id: str,
+        body: DriverHeartbeatBody,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> Response:
+        """The off-coordinator tenant driver reports its liveness — each round
+        (status=driving) and on its exit paths (finalizing / exiting, with a
+        reason). Best-effort from the driver's side; here it upserts the driver's
+        last-seen/status/reason so a stalled or stranded run is a timestamped,
+        queryable fact instead of a silent mystery. An `exiting`/`gone` report is
+        also audited (the diagnostic record of WHY a driver stopped)."""
+        experiment = experiment_repository.get_by_id(experiment_id)
+        if experiment is None:
+            raise _experiment_not_found(experiment_id)
+        _check_action_authz(credential, experiment, allow_researcher=True)
+        if driver_status_repository is not None:
+            now = datetime.now(UTC).isoformat()
+            driver_status_repository.record(
+                experiment_id,
+                status=body.status,
+                now=now,
+                run_id=body.run_id,
+                reason=body.reason,
+                round=body.round,
+            )
+            if body.status in ("exiting", "gone"):
+                audit_repository.append(
+                    actor_class=credential.kind,
+                    actor_identifier=credential.pubkey_hex,
+                    actor_tenant_id=credential.tenant_id,
+                    action="driver.exit",
+                    resource_type="experiment",
+                    resource_id=experiment_id,
+                    payload={
+                        "status": body.status,
+                        "reason": body.reason,
+                        "run_id": body.run_id,
+                        "round": body.round,
+                    },
+                )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.post(
         "/experiments/{experiment_id}/actions/approve",
