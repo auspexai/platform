@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
@@ -67,6 +68,7 @@ from auspexai_platform.oauth import IdentityVerifier, build_default_verifier
 from auspexai_platform.packages import PackageStore
 from auspexai_platform.rate_limit import limiter
 from auspexai_platform.scheduler import Scheduler
+from auspexai_platform.scheduler.capacity import _schedulable_workforce
 from auspexai_platform.services import build_coordinator_services
 
 _SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
@@ -219,6 +221,11 @@ def create_app(
         experiment_repository,
         per_job_factory,
         account_suspended_for_tenant=_account_suspended_for_tenant,
+        # Constraint-aware ordering: the schedulable fleet, so a fits-everywhere
+        # model yields scarce workers to models that can only run there.
+        active_workers=lambda: _schedulable_workforce(
+            worker_repository.list_all(), now=datetime.now(UTC)
+        ),
     )
     # M8: in-process live-event bus. SSE endpoints subscribe; lifecycle /
     # result-submission routes publish. Process-local (single-process coord).

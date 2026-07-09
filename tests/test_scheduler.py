@@ -1129,3 +1129,50 @@ def test_worker_satisfies_ram_gate_uses_usable_budget_not_raw_ram():
 
     assert worker_satisfies(_w("jetson", 7.44, 5.44), req) is False  # 5.91 > usable 5.44
     assert worker_satisfies(_w("mac", 24.0, 22.0), req) is True  # fits the usable budget
+
+
+def test_order_by_constraint_offers_scarcest_fit_first():
+    """Constraint-aware ordering: an experiment whose model fits FEWER workers is
+    offered before a fits-everywhere one — so the Mac takes llama (Mac-only) over
+    mistral (fits all), and mistral falls to the Jetsons. No idle reservation."""
+    from auspexai_platform.scheduler import Scheduler
+
+    def _w(wid, usable):
+        return Worker(
+            worker_id=wid,
+            pubkey_hex="a" * 64,
+            trust_tier=TrustTier.T2_TRUSTED,
+            capabilities={
+                "os": "linux",
+                "execute_tenant_code": "provisioned",
+                "usable_memory_gb": usable,
+                "auto_acquire": True,
+            },
+            registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+
+    fleet = [_w("mac", 22.0), _w("jet1", 5.44), _w("jet2", 5.44)]
+    sched = Scheduler(None, None, active_workers=lambda: fleet)
+
+    class _Exp:
+        def __init__(self, eid, model, ram):
+            self.experiment_id = eid
+            self.required_capabilities = {"models": [model], "model_ram_gb": {model: ram}}
+            self.requires_real_execution = True
+            self.required_containment = "permissive"
+
+    mistral = _Exp("exp-mistral", "mistral", 5.25)  # fits all 3 (<= 5.44)
+    llama = _Exp("exp-llama", "llama", 5.91)  # fits only the Mac (> 5.44)
+    qwen3 = _Exp("exp-qwen3", "qwen3", 10.8)  # fits only the Mac
+
+    # Registration order mistral→llama→qwen3 reorders to scarcest-first: the two
+    # Mac-only models (fit 1) before mistral (fits 3). Ties keep registration order.
+    ordered = [e.experiment_id for e in sched._order_by_constraint([mistral, llama, qwen3])]
+    assert ordered == ["exp-llama", "exp-qwen3", "exp-mistral"]
+
+    # No fleet ⇒ registration-order fallback (unchanged behavior).
+    plain = Scheduler(None, None)
+    assert [e.experiment_id for e in plain._order_by_constraint([mistral, llama])] == [
+        "exp-mistral",
+        "exp-llama",
+    ]

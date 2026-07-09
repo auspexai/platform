@@ -476,15 +476,50 @@ class Scheduler:
         experiment_repository: ExperimentRepository,
         per_job_factory: PerJobDatabaseFactory,
         account_suspended_for_tenant: Callable[[str], bool] | None = None,
+        active_workers: Callable[[], list[Worker]] | None = None,
     ):
         self._experiments = experiment_repository
         self._per_job_factory = per_job_factory
+        # Constraint-aware ordering: () -> the active fleet, so pick_for_worker offers
+        # the SCARCEST-fit work first — a model that fits fewer workers wins the
+        # workers that can run it, so a fits-everywhere model yields those scarce
+        # slots to a model that can ONLY run there (no starvation; a worker still
+        # takes broad work when no constrained work is pending; never idle-reserved).
+        # None ⇒ registration-order fallback (legacy / tests).
+        self._active_workers = active_workers
         # F5 (accountability cascade): resolves an experiment's owning tenant to
         # its account's suspension state. A suspended account's already-APPROVED
         # experiments stop dispatching (no burning volunteer compute on a
         # suspended account's work) — the dispatch-side complement to the
         # researcher-surface 403. None ⇒ no cascade (legacy / tests).
         self._account_suspended_for_tenant = account_suspended_for_tenant
+
+    def _order_by_constraint(self, experiments: list) -> list:
+        """Order approved experiments MOST-CONSTRAINED-FIRST: the one whose model
+        fits the FEWEST active workers is offered first, so a polling worker takes
+        the scarcest-fit work it's eligible for. A fits-everywhere model then yields
+        its scarce-worker slots to a model that can only run there — no starvation,
+        and a worker still takes broad work when nothing constrained is pending (it
+        is never idle-reserved). Stable: equal-constraint experiments keep
+        registration (FIFO) order. Registration-order fallback when the fleet is
+        unknown or there's nothing to reorder."""
+        if self._active_workers is None or len(experiments) < 2:
+            return experiments
+        fleet = self._active_workers()
+
+        def _fit_count(exp) -> int:
+            return sum(
+                1
+                for w in fleet
+                if worker_satisfies(
+                    w,
+                    exp.required_capabilities or {},
+                    requires_real_execution=exp.requires_real_execution,
+                    required_containment=exp.required_containment,
+                )
+            )
+
+        return sorted(experiments, key=_fit_count)
 
     def pick_for_worker(self, worker: Worker) -> SchedulerPick | None:
         """Return the first eligible (experiment_id, work_unit) pair, or
@@ -505,7 +540,8 @@ class Scheduler:
         if worker_is_self_paused(worker):
             return None
 
-        for experiment in self._experiments.list_all(status=ExperimentStatus.APPROVED):
+        approved = self._experiments.list_all(status=ExperimentStatus.APPROVED)
+        for experiment in self._order_by_constraint(approved):
             # #30 (M1): skip the whole experiment when this worker lacks a model
             # it requires (the requirement is experiment-level, derived from the
             # manifest at submit). Empty requirement ⇒ satisfied (pre-M1 behavior).
