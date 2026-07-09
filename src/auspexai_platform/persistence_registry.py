@@ -91,6 +91,10 @@ CONTROL_DB_PERSISTENCE: dict[str, Persistence] = {
     "publication_records": _grows(
         "benchmark publications — permanent signed record, bounded by #publications"
     ),
+    "driver_status": _grows(
+        "driver-liveness telemetry (0059) — 1 upserted row per experiment, bounded by "
+        "#experiments (which are never deleted in-code); the driver's small last-known state"
+    ),
     "audit_log": _grows(
         "the audit trail — append-only BY DESIGN; permanent governance/contestation evidence"
     ),

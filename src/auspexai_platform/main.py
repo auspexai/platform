@@ -497,6 +497,7 @@ def create_app(
             worker_repository=worker_repository,
             receipt_index_repository=receipt_index_repository,
             prestage_repository=model_prestage_repository,
+            driver_status_repository=driver_status_repository,  # 0059: stalled signal
         ),
         prefix="/api/v0",
         tags=["activity"],

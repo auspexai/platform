@@ -465,49 +465,123 @@ def test_liveness_note_transient_pause_still_promises_auto_resume():
     assert "corroborating workers" in note
 
 
-class _ApprovedExp:
-    """Minimal stand-in for the `_run_phase` / capped-note unit tests."""
+class _Exp:
+    """Minimal stand-in for the canonical `compute_run_phase` unit tests."""
 
-    def __init__(self, max_units: int | None) -> None:
-        from auspexai_platform.db.models import ExperimentStatus
+    def __init__(
+        self,
+        status,
+        *,
+        max_units=None,
+        submissions_finalized=False,
+        submitted_at=None,
+        assessment_decision=None,
+    ) -> None:
+        from datetime import UTC, datetime
 
-        self.status = ExperimentStatus.APPROVED
+        self.status = status
         self.max_units = max_units
+        self.submissions_finalized = submissions_finalized
+        self.submitted_at = submitted_at or datetime(2026, 7, 9, 12, 0, tzinfo=UTC)
+        self.assessment_decision = assessment_decision
+        self.experiment_id = "exp-x"
 
 
-def test_run_phase_capped_when_all_done_within_a_round_of_max_units():
-    """A run that hit its max_units cap (all done, nothing in flight, unit count within
-    a final round of the cap) reads as `capped`, not `running`/stalled."""
-    from auspexai_platform.api.activity import _run_phase
+def test_compute_run_phase_is_one_unified_vocabulary():
+    """ONE phase function feeds every surface, so the detail, list, and activity
+    rollup can never disagree. Exercises the full vocabulary — the capped/stalled
+    states that used to live in only one of the two former functions."""
+    from datetime import UTC, datetime, timedelta
 
-    rp = lambda exp, **kw: _run_phase(exp, in_flight_count=0, pending_count=0, **kw)  # noqa: E731
-    # 498/500 done → capped
-    assert rp(_ApprovedExp(500), completions_total=498, total_units=498) == "capped"
-    # mid-run, momentarily idle far below the cap → running (a real stall, not capped)
-    assert rp(_ApprovedExp(500), completions_total=200, total_units=200) == "running"
-    # no cap set → never capped
-    assert rp(_ApprovedExp(None), completions_total=498, total_units=498) == "running"
-    # tiny cap (<= 2*margin) is not eligible → a short run doesn't read capped
-    assert rp(_ApprovedExp(30), completions_total=28, total_units=28) == "running"
-    # still work pending → not capped even at the cap
+    from auspexai_platform.api.experiments import compute_run_phase
+    from auspexai_platform.db.models import ExperimentStatus as S
+
+    now = datetime(2026, 7, 9, 12, 0, tzinfo=UTC)
+
+    def rp(exp, **kw):
+        base = dict(
+            in_flight=0,
+            pending=0,
+            completed=0,
+            total=0,
+            last_completion_at=None,
+            driver_stalled=False,
+            now=now,
+        )
+        base.update(kw)
+        return compute_run_phase(exp, **base)
+
+    approved = S.APPROVED
+    # reached the 500-unit cap (498 within a round) → capped, not running/stalled
+    assert rp(_Exp(approved, max_units=500), completed=498, total=498) == "capped"
+    # below cap, a recent completion → running (between rounds)
     assert (
-        _run_phase(
-            _ApprovedExp(500),
-            in_flight_count=0,
-            pending_count=3,
-            completions_total=495,
-            total_units=498,
+        rp(
+            _Exp(approved, max_units=500),
+            completed=200,
+            total=200,
+            last_completion_at=now - timedelta(minutes=5),
         )
         == "running"
     )
+    # below cap, stale, no driver signal → stalled (the completion-staleness fallback)
+    assert (
+        rp(
+            _Exp(approved, max_units=500),
+            completed=200,
+            total=200,
+            last_completion_at=now - timedelta(hours=3),
+        )
+        == "stalled"
+    )
+    # driver telemetry says stalled → stalled even with a fresh completion
+    assert (
+        rp(
+            _Exp(approved, max_units=500),
+            completed=200,
+            total=200,
+            last_completion_at=now,
+            driver_stalled=True,
+        )
+        == "stalled"
+    )
+    # finalized beats the stall/run heuristics → completing
+    assert (
+        rp(
+            _Exp(approved, max_units=500, submissions_finalized=True),
+            completed=200,
+            total=200,
+            driver_stalled=True,
+        )
+        == "completing"
+    )
+    # no cap set → never capped
+    assert (
+        rp(_Exp(approved, max_units=None), completed=498, total=498, last_completion_at=now)
+        == "running"
+    )
+    # pending work, nothing started → queued; something in flight → running
+    assert rp(_Exp(approved), pending=3, total=3) == "queued"
+    assert rp(_Exp(approved), in_flight=2, total=2) == "running"
+    # no units: fresh → provisioning, long-stuck → inert
+    assert rp(_Exp(approved, submitted_at=now)) == "provisioning"
+    assert rp(_Exp(approved, submitted_at=now - timedelta(hours=1))) == "inert"
+    # other statuses
+    assert rp(_Exp(S.PAUSED)) == "paused"
+    assert rp(_Exp(S.SUBMITTED)) == "awaiting_assessment"
+    assert rp(_Exp(S.SUBMITTED, assessment_decision="approve")) == "assessed"
+    assert rp(_Exp(S.COMPLETED)) is None
 
 
 def test_liveness_note_capped_explains_and_offers_wrapup():
     """The capped note names the cap, says it's NOT a stall, and offers both wrap-up
     paths (complete it / raise the cap)."""
     from auspexai_platform.api.activity import _liveness_note
+    from auspexai_platform.db.models import ExperimentStatus
 
-    note = _liveness_note(_ApprovedExp(500), run_phase="capped", capable_worker_count=2)
+    note = _liveness_note(
+        _Exp(ExperimentStatus.APPROVED, max_units=500), run_phase="capped", capable_worker_count=2
+    )
     assert "500-unit cap" in note
     assert "NOT a stall" in note
     assert "Complete it" in note and "raise" in note

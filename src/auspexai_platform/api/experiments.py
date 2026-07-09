@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field
 
 from auspexai_platform.assessment import assess_envelope, decide
 from auspexai_platform.auth.credential import Credential, CredentialClass
+from auspexai_platform.completion import reached_unit_cap
 from auspexai_platform.auth.dependency import require_maintainer
 from auspexai_platform.certification import certified_match
 from auspexai_platform.db.models import (
@@ -364,33 +365,94 @@ def _capability_unsatisfiable_experiments(
     return out
 
 
-def _experiment_phase(experiment, per_job_factory, now: datetime) -> str | None:
-    """E15: a coarse, presentation-only phase so a bare status — especially the
-    overloaded APPROVED — doesn't read the same whether a run is awaiting
-    assessment, queued behind a busy fleet, actively running, or abandoned. Not a
-    new ExperimentStatus; a view-layer refinement over signals that already exist.
-    None for paused/terminal, where the status string already says it.
+# A driver silent (no heartbeat) this long past its round cadence has died/
+# dropped, not paused between rounds. 4x the stuck threshold matches the longest
+# cadence we run (a half-hourly loop idles ~28 min between rounds).
+DRIVER_STALL_MINUTES = 4 * ATTENTION_STUCK_MINUTES
+
+
+def _driver_is_stalled(driver_status_repository, experiment_id: str, now: datetime) -> bool:
+    """True when the off-coordinator driver has reported it is leaving
+    (exiting/gone) OR its last heartbeat is older than the stall grace — the
+    telemetry signal (0059) that a run is stalled, not merely between rounds.
+    False when there's no driver-status store or no driver has ever reported."""
+    if driver_status_repository is None:
+        return False
+    ds = driver_status_repository.get(experiment_id)
+    if ds is None:
+        return False
+    if ds.status in ("exiting", "gone"):
+        return True
+    try:
+        last = datetime.fromisoformat(str(ds.last_seen_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):  # pragma: no cover — defensive against a bad stamp
+        return False
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=UTC)
+    return (now - last) > timedelta(minutes=DRIVER_STALL_MINUTES)
+
+
+def _experiment_phase(
+    experiment, per_job_factory, now: datetime, driver_status_repository=None
+) -> str | None:
+    """THE canonical run-phase for an experiment: derives the live signals
+    (work-unit counts, latest completion, driver liveness) and delegates to the
+    pure `compute_run_phase`. ONE function so every surface — the experiment
+    detail, the list, and the activity rollup — agrees (the R-D "stalled here /
+    running there" bug was two divergent phase functions)."""
+    pj = per_job_factory.get(experiment.experiment_id) if per_job_factory is not None else None
+    counts = WorkUnitRepository(pj).count_by_status() if pj is not None else {}
+    last_dt: datetime | None = None
+    last = WorkUnitRepository(pj).latest_completion_at() if pj is not None else None
+    if last is not None:
+        last_dt = datetime.fromisoformat(last)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=UTC)
+    return compute_run_phase(
+        experiment,
+        in_flight=counts.get("in_progress", 0),
+        pending=counts.get("pending", 0),
+        completed=counts.get("completed", 0),
+        total=sum(counts.values()),
+        last_completion_at=last_dt,
+        driver_stalled=_driver_is_stalled(driver_status_repository, experiment.experiment_id, now),
+        now=now,
+    )
+
+
+def compute_run_phase(
+    experiment,
+    *,
+    in_flight: int,
+    pending: int,
+    completed: int,
+    total: int,
+    last_completion_at: datetime | None,
+    driver_stalled: bool,
+    now: datetime,
+) -> str | None:
+    """Pure, presentation-only run-phase from already-derived signals — one
+    vocabulary, unit-testable, identical across every surface. NOT a new
+    ExperimentStatus. None for terminal states, where the status already says it.
 
       submitted → awaiting_assessment (async auto-assessment hasn't run) | assessed
+      paused    → paused
       approved  → provisioning (fresh, 0 units) · inert (old, 0 units = E14 stuck)
                   · queued (work pending, nothing started) · running
+                  · capped (reached its max_units cap — a clean quota end)
                   · completing (finalized — no more submissions can come)
-                  · stalled (settled + no activity — the driver stopped feeding)
+                  · stalled (driver silent/exited without a clean end — 0059 telemetry,
+                             falling back to completion-staleness when no driver signal)
     """
     status_val = getattr(experiment.status, "value", experiment.status)
     if status_val == ExperimentStatus.SUBMITTED.value:
         decided = getattr(experiment, "assessment_decision", None)
         return "assessed" if decided else "awaiting_assessment"
+    if status_val == ExperimentStatus.PAUSED.value:
+        return "paused"
     if status_val != ExperimentStatus.APPROVED.value:
         return None
-    counts: dict[str, int] = {}
-    pj = per_job_factory.get(experiment.experiment_id) if per_job_factory is not None else None
-    if pj is not None:
-        counts = WorkUnitRepository(pj).count_by_status()
-    in_flight = counts.get("in_progress", 0)
-    pending = counts.get("pending", 0)
-    completed = counts.get("completed", 0)
-    if sum(counts.values()) == 0:
+    if total == 0:
         submitted = experiment.submitted_at
         if isinstance(submitted, str):
             submitted = datetime.fromisoformat(submitted)
@@ -401,26 +463,32 @@ def _experiment_phase(experiment, per_job_factory, now: datetime) -> str | None:
             if (now - submitted) > timedelta(minutes=ATTENTION_STUCK_MINUTES)
             else "provisioning"
         )
-    if in_flight == 0 and pending == 0:
-        # "completing" was the 2026-07-04 campaign's most-reported legibility
-        # bug: round-based drivers sit all-settled ~93% of wall time, so the
-        # label read as perpetually-finishing on My Experiments, the experiment
-        # page, AND zeroed the console's running-count tiles. Honest split:
-        #   finalized            → completing (no more submissions can come)
-        #   settled + recent     → running    (between rounds)
-        #   settled + stale      → stalled    (the driver stopped feeding —
-        #                                      the E14 signal, surfaced)
+    all_settled = in_flight == 0 and pending == 0
+    # Reached the max_units cap with everything settled: a clean quota end, NOT a
+    # stall (the coordinator won't accept more units — see completion.reached_unit_cap).
+    if (
+        all_settled
+        and completed > 0
+        and reached_unit_cap(getattr(experiment, "max_units", None), total)
+    ):
+        return "capped"
+    if all_settled:
+        # "completing" was the 2026-07-04 campaign's most-reported legibility bug:
+        # round-based drivers sit all-settled ~93% of wall time. Honest split:
+        #   finalized                → completing (no more submissions can come)
+        #   driver silent/exited     → stalled    (0059 telemetry — the driver died)
+        #   settled + recent         → running    (between rounds)
+        #   settled + stale (no sig) → stalled    (the completion-staleness fallback)
         if getattr(experiment, "submissions_finalized", False):
             return "completing"
-        last = WorkUnitRepository(pj).latest_completion_at() if pj is not None else None
-        if last is not None:
-            last_dt = datetime.fromisoformat(last)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=UTC)
-            # 4x the stuck threshold: a half-hourly cadence (the longest we
-            # run) idles ~28 min between rounds — comfortably "running".
-            if (now - last_dt) <= timedelta(minutes=4 * ATTENTION_STUCK_MINUTES):
-                return "running"
+        if driver_stalled:
+            return "stalled"
+        # 4x the stuck threshold: a half-hourly cadence (the longest we run) idles
+        # ~28 min between rounds — comfortably "running".
+        if last_completion_at is not None and (now - last_completion_at) <= timedelta(
+            minutes=4 * ATTENTION_STUCK_MINUTES
+        ):
+            return "running"
         return "stalled"
     if in_flight > 0 or completed > 0:
         return "running"
@@ -1436,7 +1504,7 @@ def build_router(
             resp = _to_response(e)
             # E15: only APPROVED experiments touch the per-job DB (the helper
             # early-returns for submitted/terminal), so the list stays cheap.
-            resp.run_phase = _experiment_phase(e, per_job_factory, now)
+            resp.run_phase = _experiment_phase(e, per_job_factory, now, driver_status_repository)
             filtered.append(
                 filter_for_credential(
                     resp,
@@ -1542,7 +1610,9 @@ def build_router(
         if experiment is None or not _can_view(credential, experiment):
             raise _experiment_not_found(experiment_id)
         resp = _to_response(experiment)
-        resp.run_phase = _experiment_phase(experiment, per_job_factory, datetime.now(UTC))
+        resp.run_phase = _experiment_phase(
+            experiment, per_job_factory, datetime.now(UTC), driver_status_repository
+        )
         if worker_repository is not None:
             from auspexai_platform.scheduler.capacity import eligible_capable_count
 

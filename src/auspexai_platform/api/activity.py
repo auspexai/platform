@@ -34,12 +34,13 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
+from auspexai_platform.api.experiments import _experiment_phase
 from auspexai_platform.auth.credential import Credential, CredentialClass
-from auspexai_platform.completion import reached_unit_cap
 from auspexai_platform.db.models import ExperimentStatus
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
     AssignmentRepository,
+    DriverStatusRepository,
     ExperimentRepository,
     TenantRepository,
     WorkerRepository,
@@ -105,54 +106,10 @@ def _queue_rank(
     return None, None
 
 
-def _run_phase(
-    experiment,
-    *,
-    in_flight_count: int,
-    pending_count: int,
-    completions_total: int,
-    total_units: int = 0,
-) -> str | None:
-    """Derived, presentation-only phase that distinguishes an APPROVED experiment
-    that is *queued* (nothing in flight, work still pending) from one actively
-    *running* (D12), and one that has *reached its max_units cap* (a clean end, not
-    a stalled driver).
-
-    This is NOT a new ExperimentStatus — the scheduler and the terminal-state
-    guards are untouched. `APPROVED` is overloaded for both "queued behind a busy
-    fleet" and "running"; this is a view-layer refinement over signals that
-    already exist (in-flight assignment count + work-unit counts). Returns None
-    for the other states, where the bare status string already says it.
-    """
-    status_val = getattr(experiment.status, "value", experiment.status)
-    if status_val == ExperimentStatus.PAUSED.value:
-        return "paused"
-    if status_val == ExperimentStatus.APPROVED.value:
-        max_units = getattr(experiment, "max_units", None)
-        # Reached its max_units cap: everything done, nothing in flight, and the
-        # submitted-unit count sits within a final round of the cap — the driver
-        # stopped because the coordinator won't accept more units, NOT because it
-        # died. A clean end state, distinct from a mid-run stall / dead driver.
-        # Same predicate the auto-complete paths use, so the badge and the state
-        # machine never disagree.
-        if (
-            in_flight_count == 0
-            and pending_count == 0
-            and completions_total > 0
-            and reached_unit_cap(max_units, total_units)
-        ):
-            return "capped"
-        # Has started → running (an idle gap mid-run is "between beats", not
-        # queued; the heart-monitor narrates that, and a below-floor stall is a
-        # PAUSED state, not this one).
-        if completions_total > 0 or in_flight_count > 0:
-            return "running"
-        # Never started, with work waiting → queued behind capacity (the D12 gap).
-        if pending_count > 0:
-            return "queued"
-        # Approved but no work units yet (transient).
-        return "provisioning"
-    return None
+# The run-phase is computed by the ONE canonical function in api.experiments
+# (`_experiment_phase`) so the activity rollup, the experiment detail, and the
+# list can never disagree (the R-D "stalled here / running there" bug). The
+# activity endpoint delegates to it below.
 
 
 def _liveness_note(
@@ -377,6 +334,7 @@ def build_router(
     worker_repository: WorkerRepository,
     receipt_index_repository: ReceiptIndexRepository,
     prestage_repository: ModelPrestageRepository,
+    driver_status_repository: DriverStatusRepository | None = None,  # 0059: stalled signal
 ) -> APIRouter:
     router = APIRouter()
 
@@ -545,8 +503,8 @@ def build_router(
                 required_capabilities=required_caps or None,
                 capable_worker_count=capable_worker_count,
                 capable_busy_count=capable_busy_count,
-                run_phase=_run_phase(
-                    experiment, in_flight_count=0, pending_count=0, completions_total=0
+                run_phase=_experiment_phase(
+                    experiment, per_job_factory, datetime.now(UTC), driver_status_repository
                 ),
             )
 
@@ -556,16 +514,10 @@ def build_router(
         counts = work_units.count_by_status()
         completions_total, target_total = work_units.replication_totals()
 
-        # D12: distinguish "queued" (approved, nothing in flight, work pending)
-        # from "running", then explain the wait. All derived from existing
-        # signals — no new ExperimentStatus, no scheduler change.
-        in_flight = AssignmentRepository(per_job_db).count_active_for_experiment()
-        run_phase = _run_phase(
-            experiment,
-            in_flight_count=in_flight,
-            pending_count=counts.get("pending", 0),
-            completions_total=completions_total,
-            total_units=sum(counts.values()),
+        # The canonical phase (queued vs running vs capped vs stalled …) — one
+        # function shared with the experiment detail so the surfaces can't disagree.
+        run_phase = _experiment_phase(
+            experiment, per_job_factory, datetime.now(UTC), driver_status_repository
         )
         download_progress = (
             prestage_repository.progress_for_models(required_models)
