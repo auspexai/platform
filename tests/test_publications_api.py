@@ -134,3 +134,73 @@ class TestMintDoiGates:
         )
         assert r.status_code == 403
         assert r.json()["detail"]["error"]["code"] == "research_standing_too_low"
+
+    def test_prereg_gate_looks_up_by_experiment_id_not_manifest_hash(
+        self,
+        client,
+        approved_experiment,
+        experiment_repository,
+        account_repository,
+        tenant_repository,
+        db,
+    ):
+        """Regression: the DOI prereg gate must look up the pre-registration by
+        experiment_id (like every other call site), NOT manifest_hash. The bug
+        (`get(experiment.manifest_hash)`) 409'd `pre_registration_missing` on a
+        genuinely pre-registered experiment — silently blocking EVERY real DOI
+        mint (no production experiment ever minted one). A pre-registered, R3,
+        completed+attested experiment must get PAST the prereg gate — here it
+        then stops at the benchmark gate (none published), proving the prereg
+        check passed."""
+        from auspexai_platform.db.models import IdentityProvider, ResearchStanding, TrustTier
+        from auspexai_platform.db.repositories.attestations import AttestationRepository
+        from auspexai_platform.db.repositories.pre_registrations import PreRegistrationRepository
+
+        privkey, binding, experiment, mh = approved_experiment
+        eid = experiment.experiment_id
+        label = getattr(experiment, "tenant_experiment_label", eid)
+        _complete(experiment_repository, eid)
+        # An R3 researcher (DOI issuance requires R3).
+        account_repository.create(
+            account_id="acct-doi",
+            idp=IdentityProvider.GITHUB,
+            idp_sub="acct-doi-sub",
+            trust_tier=TrustTier.T2_TRUSTED,
+        )
+        account_repository.set_research_standing(
+            "acct-doi", new_standing=ResearchStanding.R3_TRUSTED
+        )
+        tenant_repository.set_account(experiment.tenant_id, "acct-doi")
+        # A final attestation → get_final returns one (past attestation_missing).
+        AttestationRepository(db).insert(
+            attestation_id="att-doi",
+            experiment_id=eid,
+            tenant_id=experiment.tenant_id,
+            tenant_experiment_label=label,
+            merkle_root="a" * 64,
+            algorithm="sha256-merkle-v1",
+            unit_count=1,
+            cose_signed_blob=b"x",
+            signing_key_pubkey_hex="00" * 32,
+        )
+        # Pre-registered — the real submit-time shape: keyed by experiment_id.
+        PreRegistrationRepository(db).insert(
+            experiment_id=eid,
+            tenant_id=experiment.tenant_id,
+            tenant_experiment_label=label,
+            manifest_hash=mh,
+            cose_signed_blob=b"x",
+            signing_key_pubkey_hex="00" * 32,
+            submitted_at="2026-07-09T00:00:00+00:00",
+        )
+        r = _signed_post(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{eid}/actions/mint-doi",
+            body={},
+        )
+        # Past the prereg gate → stopped at the benchmark gate. With the bug this
+        # was `pre_registration_missing`.
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"]["code"] == "benchmark_publication_required"

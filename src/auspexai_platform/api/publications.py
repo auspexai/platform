@@ -173,7 +173,7 @@ def create_publications_router(
             raise _typed_409("doi_already_minted", f"experiment already has DOI {att.doi}")
         # Ratified TECHNICAL gate (F4/D16.2): no DOI without the prereg chain.
         if pre_registration_repository is not None:
-            prereg = pre_registration_repository.get(experiment.manifest_hash)
+            prereg = pre_registration_repository.get(experiment_id)
             if prereg is None:
                 raise _typed_409(
                     "pre_registration_missing",
