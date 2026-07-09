@@ -82,6 +82,11 @@ class SchedulerWorker(BaseModel):
     # model-gated experiments (it would echo). Absent declaration ⇒ "synthetic".
     execute_tenant_code: str = "synthetic"
     eligible_experiment_count: int  # approved experiments w/ outstanding work this worker can take
+    # What this worker is actively working RIGHT NOW (its live assignment), so the
+    # fleet view shows "running <model>" instead of a blank — a serve-on-demand
+    # worker reports served_models=[] between units, which hid real activity.
+    running_model: str | None = None  # the model of the unit it's currently assigned
+    running_label: str | None = None  # that experiment's tenant label
 
 
 class SchedulerStateResponse(BaseModel):
@@ -181,9 +186,17 @@ def build_router(
         ]
 
         elig_count: dict[str, int] = {w.worker_id: 0 for w in workforce}
+        # Per-worker CURRENT work: worker_id -> (label, model) of its live assignment,
+        # so the fleet view shows "running <model>" (served_models is empty between
+        # units on a serve-on-demand worker). First live assignment wins.
+        worker_running: dict[str, tuple[str, str | None]] = {}
         experiments_out: list[SchedulerExperiment] = []
         for exp in experiment_repository.list_all(status=ExperimentStatus.APPROVED):
             pj = per_job_factory.get(exp.experiment_id)
+            if pj is not None:
+                _model = ((exp.required_capabilities or {}).get("models") or [None])[0]
+                for _wid in AssignmentRepository(pj).active_worker_ids():
+                    worker_running.setdefault(_wid, (exp.tenant_experiment_label, _model))
             counts = WorkUnitRepository(pj).count_by_status() if pj is not None else {}
             pending = counts.get("pending", 0)
             in_progress = counts.get("in_progress", 0)
@@ -243,6 +256,8 @@ def build_router(
                 self_paused=worker_is_self_paused(w),
                 execute_tenant_code=(w.capabilities.get("execute_tenant_code") or "synthetic"),
                 eligible_experiment_count=elig_count.get(w.worker_id, 0),
+                running_label=worker_running.get(w.worker_id, (None, None))[0],
+                running_model=worker_running.get(w.worker_id, (None, None))[1],
             )
             for w in on_network
         ]
