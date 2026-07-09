@@ -56,6 +56,7 @@ from auspexai_platform.db.repositories import (
     ExperimentRepository,
     WorkUnitRepository,
 )
+from auspexai_platform.hf_catalog import _LOAD_OVERHEAD
 
 _TIER_REPLICATION_FLOOR = {
     TrustTier.T0_ANONYMOUS: 3,
@@ -449,7 +450,13 @@ def worker_satisfies(
     if isinstance(worker_ram, (int, float)) and model_ram_gb:
         for mid in required_models:
             fp = model_ram_gb.get(mid)
-            if isinstance(fp, (int, float)) and worker_ram < fp:
+            # Apply the SAME load overhead the catalog's runnability check uses
+            # (hf_catalog._LOAD_OVERHEAD): serving a model needs headroom beyond its
+            # raw weights (KV cache + compute/CUDA buffers). Gating on the bare
+            # footprint routed mistral-7b-q4 (5.25 GB) onto a 5.44 GB-usable Jetson
+            # that then 500s at load ("unable to allocate CUDA0 buffer"), bouncing
+            # the unit between workers instead of falling through to a bigger box.
+            if isinstance(fp, (int, float)) and worker_ram < fp * _LOAD_OVERHEAD:
                 return False
     if worker.capabilities.get("auto_acquire") is True:
         return True

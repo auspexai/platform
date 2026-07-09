@@ -1161,18 +1161,48 @@ def test_order_by_constraint_offers_scarcest_fit_first():
             self.requires_real_execution = True
             self.required_containment = "permissive"
 
-    mistral = _Exp("exp-mistral", "mistral", 5.25)  # fits all 3 (<= 5.44)
-    llama = _Exp("exp-llama", "llama", 5.91)  # fits only the Mac (> 5.44)
+    small = _Exp("exp-small", "smol", 1.5)  # 1.5 * 1.2 = 1.8 <= 5.44 → fits all 3
+    llama = _Exp("exp-llama", "llama", 5.91)  # fits only the Mac (5.91 * 1.2 > 5.44)
     qwen3 = _Exp("exp-qwen3", "qwen3", 10.8)  # fits only the Mac
+    # NB: mistral-7b-q4 (5.25) is NOT a fits-all model — 5.25 * _LOAD_OVERHEAD = 6.3
+    # exceeds the 5.44 Jetson budget, so it too is Mac-only (see the overhead test).
 
-    # Registration order mistral→llama→qwen3 reorders to scarcest-first: the two
-    # Mac-only models (fit 1) before mistral (fits 3). Ties keep registration order.
-    ordered = [e.experiment_id for e in sched._order_by_constraint([mistral, llama, qwen3])]
-    assert ordered == ["exp-llama", "exp-qwen3", "exp-mistral"]
+    # Registration order small→llama→qwen3 reorders to scarcest-first: the two
+    # Mac-only models (fit 1) before the small fits-all one (fit 3). Ties keep
+    # registration order.
+    ordered = [e.experiment_id for e in sched._order_by_constraint([small, llama, qwen3])]
+    assert ordered == ["exp-llama", "exp-qwen3", "exp-small"]
 
     # No fleet ⇒ registration-order fallback (unchanged behavior).
     plain = Scheduler(None, None)
-    assert [e.experiment_id for e in plain._order_by_constraint([mistral, llama])] == [
-        "exp-mistral",
+    assert [e.experiment_id for e in plain._order_by_constraint([small, llama])] == [
+        "exp-small",
         "exp-llama",
     ]
+
+
+def test_worker_satisfies_ram_gate_applies_load_overhead():
+    # A model whose RAW footprint fits the usable budget but whose SERVE footprint
+    # (footprint * _LOAD_OVERHEAD, covering KV cache + compute/CUDA buffers) does not
+    # must be excluded: mistral-7b-q4 (5.25 GB) must NOT route to a 5.44 GB-usable
+    # Jetson that then 500s at load ("unable to allocate CUDA0 buffer").
+    req = {"models": ["mistral"], "model_ram_gb": {"mistral": 5.25}}
+
+    def _w(wid, usable):
+        return Worker(
+            worker_id=wid,
+            pubkey_hex="a" * 64,
+            trust_tier=TrustTier.T2_TRUSTED,
+            capabilities={
+                "os": "linux",
+                "execute_tenant_code": "provisioned",
+                "models": ["mistral"],
+                "usable_memory_gb": usable,
+            },
+            registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+
+    # 5.25 <= 5.44 (raw would have passed) but 5.25 * 1.2 = 6.3 > 5.44 → excluded.
+    assert worker_satisfies(_w("jetson", 5.44), req) is False
+    # The Mac's 22 GB usable clears the overhead-adjusted footprint.
+    assert worker_satisfies(_w("mac", 22.0), req) is True
