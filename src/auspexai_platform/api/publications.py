@@ -224,7 +224,12 @@ def create_publications_router(
                 experiment_doi_metadata(
                     title=title,
                     description_html=description,
-                    creators=[{"name": "AuspexAI Network"}],
+                    # Empty → the RDM-correct organizational-creator default in
+                    # experiment_doi_metadata. The legacy `[{"name": ...}]` deposit
+                    # shape is DROPPED by the records API on create, then rejected at
+                    # publish (`metadata.creators: Missing`) — which silently failed
+                    # every DOI mint at the final step (2026-07-09).
+                    creators=[],
                     related_urls=related,
                     contributors=contributors,
                 )
