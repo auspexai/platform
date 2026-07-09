@@ -126,6 +126,9 @@ class ExperimentResponse(BaseModel):
     # structural ceiling on replication (detail route only). Lets the approve pane
     # warn when the replication floor exceeds the capable fleet (a structural stall).
     capable_worker_count: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
+    # The replication the MANIFEST declared (detail route only) — so the researcher
+    # can see whether approval changed it vs the approved replication_target/floor.
+    declared_replication_factor: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     submitted_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
     started_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
     completed_at: Annotated[datetime | None, ExposureTag.TENANT_SCOPED] = None
@@ -140,9 +143,12 @@ class ExperimentResponse(BaseModel):
     replication_target: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     replication_floor: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     max_unit_duration_seconds: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
-    max_units: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
-    max_concurrent_assignments: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
-    max_payload_bytes: Annotated[int | None, ExposureTag.OPERATOR_ONLY] = None
+    # The approved resource bounds are the researcher's OWN run's envelope — the
+    # tenant sees them (from approval onward) so a cap or replication change made at
+    # approval is visible on their experiment page, not a silent surprise.
+    max_units: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
+    max_concurrent_assignments: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
+    max_payload_bytes: Annotated[int | None, ExposureTag.TENANT_SCOPED] = None
     # M1 (#30): models a worker must locally hold to be eligible (empty = none).
     required_capabilities: Annotated[dict[str, Any] | None, ExposureTag.TENANT_SCOPED] = None
     # M-Results retention state.
@@ -1484,9 +1490,11 @@ def build_router(
         m = manifest_repository.get(experiment.manifest_hash)
         if m is not None:
             try:
-                resp.expected_duration_hours = (m.manifest_json or {}).get(
-                    "expected_duration_hours"
-                )
+                mj = m.manifest_json or {}
+                resp.expected_duration_hours = mj.get("expected_duration_hours")
+                declared_repl = mj.get("replication_factor")
+                if isinstance(declared_repl, int):
+                    resp.declared_replication_factor = declared_repl
             except AttributeError:
                 pass
         return filter_for_credential(
