@@ -259,6 +259,54 @@ class TestExperimentActivity:
         assert resp.status_code == 200, resp.text
         assert "liveness_note" not in resp.json()
 
+    def test_auto_acquire_worker_counts_as_capable_before_holding_model(
+        self,
+        client,
+        registered_tenant,
+        manifest_repository,
+        experiment_repository,
+        worker_repository,
+    ) -> None:
+        """Regression: the rollup's capable_worker_count (behind the 'N capable
+        workers / corroboration thin' banner) counts a provisioned auto-acquire
+        worker as capable BEFORE it holds the model — else it falsely read '0
+        capable' during every cold-start acquire while the worker downloads the
+        model. Now computed via the scheduler's own worker_satisfies eligibility."""
+        from auspexai_platform.db.models import ExperimentStatus
+
+        privkey, binding = registered_tenant
+        # A provisioned auto-acquire worker that does NOT hold m-x yet.
+        worker_repository.enroll(worker_id="wkr-aa", pubkey_hex="a" * 64)
+        worker_repository.record_heartbeat(
+            "wkr-aa",
+            capabilities={
+                "os": "linux",
+                "execute_tenant_code": "provisioned",
+                "auto_acquire": True,
+            },
+        )
+        manifest = manifest_repository.insert(
+            tenant_id=binding.tenant_id,
+            manifest_json={"tenant_id": binding.tenant_id, "experiment_id": "aa"},
+            signature_json={},
+        )
+        exp = experiment_repository.create(
+            tenant_id=binding.tenant_id,
+            tenant_experiment_label="aa-mx",
+            manifest_hash=manifest.manifest_hash,
+            required_capabilities={"models": ["m-x"]},
+            requires_real_execution=True,
+        )
+        experiment_repository.update_status(exp.experiment_id, ExperimentStatus.APPROVED)
+        resp = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{exp.experiment_id}/activity",
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["capable_worker_count"] == 1  # auto-acquire counts (was 0)
+
     def test_queued_experiment_reports_phase_position_and_note(
         self, client, approved_experiment, per_job_factory
     ) -> None:

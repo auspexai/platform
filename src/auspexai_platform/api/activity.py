@@ -50,6 +50,7 @@ from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.exposure import ExposureTag, is_visible
 from auspexai_platform.receipts.attestation import collect_diverged_units
 from auspexai_platform.scheduler import worker_satisfies
+from auspexai_platform.scheduler.capacity import _eligible, _schedulable_workforce
 from auspexai_platform.worker_status import derive_worker_status, heartbeat_cutoff
 
 
@@ -450,15 +451,26 @@ def build_router(
         # M1 (#30): how many active workers can actually run this experiment given
         # its model requirement. Only meaningful when there IS a requirement;
         # capable==0 with pending units is the empty-pool signal (#32 / M2).
+        # Computed via the SCHEDULER's own eligibility (`_eligible`/`worker_satisfies`)
+        # so this capacity signal can never disagree with routing: an auto-acquire
+        # worker that FITS the model counts as capable BEFORE it holds it — else the
+        # banner falsely reads "0 capable / corroboration thin" during every
+        # cold-start acquire while the workers are downloading the model. (The repo's
+        # `count_capable` stays presence-only for the prestage/holder counts.)
         required_caps = experiment.required_capabilities or {}
         required_models = required_caps.get("models", [])
-        capable_worker_count = (
-            worker_repository.count_capable(
-                required_models=required_models, heartbeat_cutoff=heartbeat_cutoff(now)
+        capable_worker_count: int | None = None
+        capable_ids: set[str] = set()
+        if required_models:
+            eligible = _eligible(
+                _schedulable_workforce(worker_repository.list_all(), now=now),
+                required_caps,
+                experiment.replication_target,
+                requires_real_execution=experiment.requires_real_execution,
+                required_containment=experiment.required_containment,
             )
-            if required_models
-            else None
-        )
+            capable_worker_count = len(eligible)
+            capable_ids = {w.worker_id for w in eligible}
 
         # D12 busy/idle: of the eligible workers, how many are currently busy on
         # some run (active-assignment holders across approved experiments) — the
@@ -466,10 +478,7 @@ def build_router(
         capable_busy_count = None
         if capable_worker_count:
             busy_ids = _busy_worker_ids(experiment_repository, per_job_factory)
-            capable_ids = worker_repository.list_capable_ids(
-                required_models=required_models, heartbeat_cutoff=heartbeat_cutoff(now)
-            )
-            capable_busy_count = len(set(capable_ids) & busy_ids)
+            capable_busy_count = len(capable_ids & busy_ids)
 
         per_job_db = per_job_factory.get(experiment_id)
         if per_job_db is None:
