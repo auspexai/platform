@@ -50,10 +50,13 @@ from auspexai_platform.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
-# repo full_name → release channel. Single worker channel today; adding a
-# channel (e.g. tenant-sdk) = one more entry.
+# repo full_name → release channel. Each entry lets that repo's published
+# GitHub releases be recorded + announced on its channel (the worker heartbeat
+# relays 'worker'; the R-D update banner reads 'tenant-sdk' + 'researcher-dashboard').
 REPO_CHANNELS: dict[str, str] = {
     "auspexai/worker": "worker",
+    "auspexai/tenant-sdk": "tenant-sdk",
+    "auspexai/researcher-dashboard": "researcher-dashboard",
 }
 
 MAX_NOTES_LENGTH = 8000
