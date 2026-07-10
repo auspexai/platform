@@ -322,6 +322,7 @@ def create_app(
     )
 
     from auspexai_platform.api.publications import create_publications_router
+    from auspexai_platform.db.repositories.doi_mints import DoiMintRepository
     from auspexai_platform.db.repositories.driver_status import DriverStatusRepository
     from auspexai_platform.db.repositories.publications import PublicationRepository
     from auspexai_platform.raw_transit import RawTransitBuffer
@@ -331,6 +332,7 @@ def create_app(
     app.state.raw_transit = raw_transit
     publication_repository = PublicationRepository(svc.db)
     driver_status_repository = DriverStatusRepository(svc.db)  # 0059: driver liveness
+    doi_mint_repository = DoiMintRepository(svc.db)  # 0060: idempotent/resumable DOI mint
     app.include_router(
         create_publications_router(
             experiment_repository=experiment_repository,
@@ -344,6 +346,7 @@ def create_app(
             credential_dep=credential_dep,
             zenodo_client_factory=lambda: ZenodoClient(config.state_dir),
             pre_registration_repository=pre_registration_repository,
+            doi_mint_repository=doi_mint_repository,
         ),
         prefix="/api/v0",
         tags=["publications"],

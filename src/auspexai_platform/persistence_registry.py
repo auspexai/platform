@@ -95,6 +95,10 @@ CONTROL_DB_PERSISTENCE: dict[str, Persistence] = {
         "driver-liveness telemetry (0059) — 1 upserted row per experiment, bounded by "
         "#experiments (which are never deleted in-code); the driver's small last-known state"
     ),
+    "doi_mints": _grows(
+        "DOI-mint bookkeeping (0060) — 1 upserted row per experiment for idempotent/resumable "
+        "Zenodo mints; permanent, bounded by #experiments-with-a-DOI"
+    ),
     "audit_log": _grows(
         "the audit trail — append-only BY DESIGN; permanent governance/contestation evidence"
     ),

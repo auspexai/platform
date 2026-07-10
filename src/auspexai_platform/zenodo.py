@@ -14,6 +14,7 @@ A missing file or an unrecognized mode can never mint anything.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -23,6 +24,11 @@ _BASES = {
     "production": "https://zenodo.org",
 }
 TIMEOUT_S = 30.0
+
+
+def _extract_doi(body: dict) -> str | None:
+    """The DOI from a record/reserve response (top-level or under pids.doi)."""
+    return body.get("doi") or ((body.get("pids") or {}).get("doi") or {}).get("identifier")
 
 
 class ZenodoNotConfiguredError(Exception):
@@ -46,82 +52,49 @@ class ZenodoClient:
             raise ZenodoNotConfiguredError(f"zenodo mode {self.mode!r} is not sandbox/production")
         self._base = _BASES[self.mode]
 
-    def mint_doi(self, metadata: dict, verification: dict | None = None) -> dict:
+    def mint_doi(
+        self,
+        metadata: dict,
+        verification: dict | None = None,
+        *,
+        resume_record_id: str | None = None,
+        on_draft: Callable[[str, str | None], None] | None = None,
+    ) -> dict:
         """Create a METADATA-ONLY record (files disabled — the ratified Q3
         shape) via the modern records API and publish it. Returns
-        {doi, record_url, mode}."""
+        {doi, record_url, mode}.
+
+        Idempotent + resumable. The mint is a multi-step external transaction, so
+        a failure after the irreversible publish (e.g. a lost final response)
+        would, on a naive retry, mint a SECOND DOI for the same result. To make it
+        exactly-once:
+
+        - `on_draft(record_id, reserved_doi)` fires the moment the draft's DOI is
+          reserved — BEFORE publish — so the caller can persist the record id and
+          reconcile on a later retry.
+        - `resume_record_id` reconciles against Zenodo instead of minting anew:
+          already published → return that DOI (no duplicate); still a draft →
+          resume the SAME draft (no new orphan, no second reserved DOI)."""
         headers = {"Authorization": f"Bearer {self._token}"}
+        # Zenodo reserves true metadata-only records (files.enabled=false 400s at
+        # publish for regular accounts). The compliant-in-spirit shape: ONE tiny
+        # attestation.json — verification data (roots + Rekor ids + how-to-verify),
+        # never experiment content (ratified Q3: content is the researcher's own
+        # separate DOI).
+        att_bytes = json.dumps(verification, indent=2).encode() if verification else b"{}"
         with httpx.Client(timeout=TIMEOUT_S) as client:
-            created = client.post(
-                f"{self._base}/api/records",
-                headers=headers,
-                json={
-                    "access": {"record": "public", "files": "public"},
-                    "files": {"enabled": True},  # one attestation.json only — never content
-                    "metadata": metadata,
-                },
-            )
-            if created.status_code not in (200, 201):
-                raise ZenodoError(
-                    f"draft create failed: HTTP {created.status_code} {created.text[:300]}"
-                )
-            draft = created.json()
-            # Reserve the DOI on the draft — without this, publish succeeds
-            # WITHOUT registering any DOI (found live on the sandbox).
-            reserved = client.post(
-                f"{self._base}/api/records/{draft['id']}/draft/pids/doi",
-                headers=headers,
-            )
-            if reserved.status_code not in (200, 201):
-                raise ZenodoError(
-                    f"DOI reserve failed: HTTP {reserved.status_code} {reserved.text[:200]}"
-                )
-            # Zenodo reserves true metadata-only records (files.enabled=false
-            # 400s at publish for regular accounts). The compliant-in-spirit
-            # shape: ONE tiny attestation.json — verification data (roots +
-            # Rekor ids + how-to-verify), never experiment content (ratified
-            # Q3: content is the researcher's own separate DOI).
-            att_bytes = json.dumps(verification, indent=2).encode() if verification else b"{}"
-            fid = draft["id"]
-            for step, resp in (
-                (
-                    "register",
-                    client.post(
-                        f"{self._base}/api/records/{fid}/draft/files",
-                        headers=headers,
-                        json=[{"key": "attestation.json"}],
-                    ),
-                ),
-                (
-                    "upload",
-                    client.put(
-                        f"{self._base}/api/records/{fid}/draft/files/attestation.json/content",
-                        headers={**headers, "Content-Type": "application/octet-stream"},
-                        content=att_bytes,
-                    ),
-                ),
-                (
-                    "commit",
-                    client.post(
-                        f"{self._base}/api/records/{fid}/draft/files/attestation.json/commit",
-                        headers=headers,
-                    ),
-                ),
-            ):
-                if resp.status_code not in (200, 201):
-                    raise ZenodoError(
-                        f"file {step} failed: HTTP {resp.status_code} {resp.text[:200]}"
-                    )
-            published = client.post(
-                f"{self._base}/api/records/{fid}/draft/actions/publish",
-                headers=headers,
-            )
-            if published.status_code not in (200, 202):
-                raise ZenodoError(
-                    f"publish failed: HTTP {published.status_code} {published.text[:300]}"
-                )
-            body = published.json()
-        doi = body.get("doi") or ((body.get("pids") or {}).get("doi") or {}).get("identifier")
+            fid: str | None = None
+            if resume_record_id is not None:
+                done = self._reconcile(client, headers, resume_record_id)
+                if done is not None and "doi" in done:
+                    return done  # already published on a prior attempt — no duplicate
+                if done is not None and done.get("resume"):
+                    fid = resume_record_id  # a live draft survived — resume it
+            if fid is None:
+                fid = self._create_and_reserve(client, headers, metadata, on_draft)
+            self._ensure_attestation_file(client, headers, fid, att_bytes)
+            body = self._publish(client, headers, fid)
+        doi = _extract_doi(body)
         if not doi:
             raise ZenodoError("publish succeeded but no DOI in the response")
         return {
@@ -129,6 +102,96 @@ class ZenodoClient:
             "record_url": (body.get("links") or {}).get("self_html"),
             "mode": self.mode,
         }
+
+    def _reconcile(self, client, headers, record_id: str) -> dict | None:
+        """Inspect an existing record before acting. Returns {doi, record_url,
+        mode} if it already published (short-circuit), {'resume': True} if a live
+        draft remains, or None if neither (mint fresh)."""
+        pub = client.get(f"{self._base}/api/records/{record_id}", headers=headers)
+        if pub.status_code == 200:
+            body = pub.json()
+            doi = _extract_doi(body)
+            if body.get("is_published") and doi:
+                return {
+                    "doi": doi,
+                    "record_url": (body.get("links") or {}).get("self_html"),
+                    "mode": self.mode,
+                }
+        draft = client.get(f"{self._base}/api/records/{record_id}/draft", headers=headers)
+        if draft.status_code == 200:
+            return {"resume": True}
+        return None
+
+    def _create_and_reserve(self, client, headers, metadata: dict, on_draft) -> str:
+        created = client.post(
+            f"{self._base}/api/records",
+            headers=headers,
+            json={
+                "access": {"record": "public", "files": "public"},
+                "files": {"enabled": True},  # one attestation.json only — never content
+                "metadata": metadata,
+            },
+        )
+        if created.status_code not in (200, 201):
+            raise ZenodoError(
+                f"draft create failed: HTTP {created.status_code} {created.text[:300]}"
+            )
+        fid = str(created.json()["id"])
+        # Reserve the DOI on the draft — without this, publish succeeds WITHOUT
+        # registering any DOI (found live on the sandbox).
+        reserved = client.post(f"{self._base}/api/records/{fid}/draft/pids/doi", headers=headers)
+        if reserved.status_code not in (200, 201):
+            raise ZenodoError(
+                f"DOI reserve failed: HTTP {reserved.status_code} {reserved.text[:200]}"
+            )
+        # Persist the reserved draft BEFORE the irreversible publish, so a crash
+        # here is resumable rather than a duplicate on retry.
+        if on_draft is not None:
+            on_draft(fid, _extract_doi(reserved.json()))
+        return fid
+
+    def _ensure_attestation_file(self, client, headers, fid: str, att_bytes: bytes) -> None:
+        """Register + upload + commit attestation.json — tolerant of a partial
+        prior attempt (a resumed draft may already have the file in some state)."""
+        listing = client.get(f"{self._base}/api/records/{fid}/draft/files", headers=headers)
+        state = None
+        if listing.status_code == 200:
+            for e in listing.json().get("entries") or []:
+                if e.get("key") == "attestation.json":
+                    state = e.get("status")  # "completed" once committed
+                    break
+        if state == "completed":
+            return  # already uploaded + committed on a prior attempt
+        if state is None:
+            reg = client.post(
+                f"{self._base}/api/records/{fid}/draft/files",
+                headers=headers,
+                json=[{"key": "attestation.json"}],
+            )
+            if reg.status_code not in (200, 201):
+                raise ZenodoError(f"file register failed: HTTP {reg.status_code} {reg.text[:200]}")
+        up = client.put(
+            f"{self._base}/api/records/{fid}/draft/files/attestation.json/content",
+            headers={**headers, "Content-Type": "application/octet-stream"},
+            content=att_bytes,
+        )
+        if up.status_code not in (200, 201):
+            raise ZenodoError(f"file upload failed: HTTP {up.status_code} {up.text[:200]}")
+        commit = client.post(
+            f"{self._base}/api/records/{fid}/draft/files/attestation.json/commit", headers=headers
+        )
+        if commit.status_code not in (200, 201):
+            raise ZenodoError(f"file commit failed: HTTP {commit.status_code} {commit.text[:200]}")
+
+    def _publish(self, client, headers, fid: str) -> dict:
+        published = client.post(
+            f"{self._base}/api/records/{fid}/draft/actions/publish", headers=headers
+        )
+        if published.status_code not in (200, 202):
+            raise ZenodoError(
+                f"publish failed: HTTP {published.status_code} {published.text[:300]}"
+            )
+        return published.json()
 
 
 def experiment_doi_metadata(

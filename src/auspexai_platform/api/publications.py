@@ -60,6 +60,7 @@ def create_publications_router(
     credential_dep,
     zenodo_client_factory,
     pre_registration_repository=None,
+    doi_mint_repository=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -248,6 +249,27 @@ def create_publications_router(
                 "Metadata + verification only — never model content. See https://auspexai.network."
             ),
         }
+        # Idempotent + resumable mint. If a prior attempt reserved a Zenodo draft
+        # (persisted below via on_draft) but died before we recorded the DOI,
+        # reconcile against that record instead of minting a duplicate: already
+        # published → return that DOI; still a draft → resume it. Closes the
+        # lost-final-response double-mint hole (a permanent duplicate + gaming
+        # vector) and stops orphan drafts accumulating on retry.
+        inflight = doi_mint_repository.get(experiment_id) if doi_mint_repository else None
+        resume_record_id = (
+            inflight.record_id if inflight and inflight.status != "published" else None
+        )
+
+        def _on_draft(record_id: str, reserved_doi: str | None) -> None:
+            if doi_mint_repository is not None:
+                doi_mint_repository.record_draft(
+                    experiment_id,
+                    attestation_id=att.attestation_id,
+                    record_id=record_id,
+                    reserved_doi=reserved_doi,
+                    mode=zenodo.mode,
+                )
+
         try:
             minted = zenodo.mint_doi(
                 experiment_doi_metadata(
@@ -263,6 +285,8 @@ def create_publications_router(
                     contributors=contributors,
                 ),
                 verification=verification,
+                resume_record_id=resume_record_id,
+                on_draft=_on_draft,
             )
         except ZenodoError as e:
             raise HTTPException(
@@ -270,24 +294,41 @@ def create_publications_router(
                 detail={"error": {"code": "doi_registrar_error", "message": str(e)}},
             ) from e
         attestation_repository.set_doi(att.attestation_id, minted["doi"])
-        publication_repository.record(
-            experiment_id=experiment_id,
-            kind="doi",
-            tenant_id=experiment.tenant_id,
-            publisher_pubkey=credential.pubkey_hex,
-            standing_at_issue=standing,
-            summary={"title": title, "mode": minted["mode"]},
-            obs_merkle_root=att.merkle_root,
-            obs_rekor_uuid=getattr(att, "rekor_entry_uuid", None),
-            doi=minted["doi"],
+        if doi_mint_repository is not None:
+            doi_mint_repository.mark_published(
+                experiment_id,
+                doi=minted["doi"],
+                record_url=minted.get("record_url"),
+                mode=minted.get("mode"),
+            )
+        # Guard the ledger too: a resumed mint must not append a SECOND doi
+        # publication record for the same result.
+        already_recorded = bool(
+            publication_repository.list_for_experiment(experiment_id, kind="doi")
         )
-        audit_repository.append(
-            actor_class=CredentialClass.RESEARCHER,
-            action="publication.doi_minted",
-            resource_type="experiment",
-            resource_id=experiment_id,
-            payload={"doi": minted["doi"], "mode": minted["mode"], "standing_at_issue": standing},
-        )
+        if not already_recorded:
+            publication_repository.record(
+                experiment_id=experiment_id,
+                kind="doi",
+                tenant_id=experiment.tenant_id,
+                publisher_pubkey=credential.pubkey_hex,
+                standing_at_issue=standing,
+                summary={"title": title, "mode": minted["mode"]},
+                obs_merkle_root=att.merkle_root,
+                obs_rekor_uuid=getattr(att, "rekor_entry_uuid", None),
+                doi=minted["doi"],
+            )
+            audit_repository.append(
+                actor_class=CredentialClass.RESEARCHER,
+                action="publication.doi_minted",
+                resource_type="experiment",
+                resource_id=experiment_id,
+                payload={
+                    "doi": minted["doi"],
+                    "mode": minted["mode"],
+                    "standing_at_issue": standing,
+                },
+            )
         return {
             "doi": minted["doi"],
             "record_url": minted.get("record_url"),

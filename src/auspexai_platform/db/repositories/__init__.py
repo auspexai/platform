@@ -16,6 +16,7 @@ from auspexai_platform.db.repositories.assignments import AssignmentRepository
 from auspexai_platform.db.repositories.attestations import AttestationRepository
 from auspexai_platform.db.repositories.audit import AuditRepository
 from auspexai_platform.db.repositories.certified_profiles import CertifiedProfileRepository
+from auspexai_platform.db.repositories.doi_mints import DoiMintRepository
 from auspexai_platform.db.repositories.driver_status import DriverStatusRepository
 from auspexai_platform.db.repositories.experiments import ExperimentRepository
 from auspexai_platform.db.repositories.manifests import ManifestRepository
@@ -55,6 +56,7 @@ __all__ = [
     "AuditRepository",
     "CertifiedProfileRepository",
     "DeviationRecord",
+    "DoiMintRepository",
     "DriverStatusRepository",
     "ExperimentRepository",
     "ManifestRepository",
