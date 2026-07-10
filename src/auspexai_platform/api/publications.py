@@ -219,6 +219,35 @@ def create_publications_router(
                 name = getattr(acct, "display_name", None)
                 if name:
                     contributors.append(name)
+        # The DOI's attestation.json — a SELF-CONTAINED, independently-verifiable
+        # record (NOT an empty {}): the result-set root + transparency-log anchor +
+        # the benchmark finding + how to verify with the open tooling. This is the
+        # durable evidence the DOI cites; the Zenodo metadata only points at it.
+        bench_pubs = publication_repository.list_for_experiment(experiment_id, kind="benchmark")
+        verification = {
+            "schema": "auspexai-doi-verification/v1",
+            "experiment_id": experiment_id,
+            "label": getattr(experiment, "tenant_experiment_label", None),
+            "manifest_hash": getattr(experiment, "manifest_hash", None),
+            "result_set": {
+                "merkle_root": att.merkle_root,
+                "algorithm": getattr(att, "algorithm", None),
+                "unit_count": getattr(att, "unit_count", None),
+            },
+            "transparency_log": {
+                "rekor_entry_uuid": getattr(att, "rekor_entry_uuid", None),
+                "rekor_log_index": getattr(att, "rekor_log_index", None),
+                "search_url": rekor_url,
+            },
+            "benchmark": bench_pubs[0].summary if bench_pubs else None,
+            "contributors": contributors,
+            "how_to_verify": (
+                "Independently verifiable with the open AuspexAI tooling (auspexai-tenant, "
+                "PyPI): fetch the result-set bundle, recompute the Merkle root above, and "
+                "check the Rekor inclusion proof against the public transparency log. "
+                "Metadata + verification only — never model content. See https://auspexai.network."
+            ),
+        }
         try:
             minted = zenodo.mint_doi(
                 experiment_doi_metadata(
@@ -232,7 +261,8 @@ def create_publications_router(
                     creators=[],
                     related_urls=related,
                     contributors=contributors,
-                )
+                ),
+                verification=verification,
             )
         except ZenodoError as e:
             raise HTTPException(
