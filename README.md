@@ -4,7 +4,7 @@ The coordinator daemon and platform infrastructure for [AuspexAI](https://github
 
 ## Status
 
-**Phase 1 — Coordinator daemon in active development.** M1–M6 shipped (292 tests, CI green on Python 3.11 + 3.12). What's live:
+**LIVE — open beta.** The coordinator daemon runs at [coord.auspexai.network](https://coord.auspexai.network) (v0.1.170). M1–M8 shipped and well beyond — signed receipts + per-account trust-tier promotion, DOI minting, HF model catalog, benchmark board, Rekor anchoring, and settle/reap timers. CI green on Python 3.11 + 3.12. What's live:
 
 - **System + auth:** `GET /api/v0/health` + `GET /api/v0/health/public`, `GET /api/v0/auth/whoami`
 - **Tenants:** `POST/GET /api/v0/tenants`, `GET /api/v0/tenants/{id}`
@@ -17,7 +17,7 @@ The coordinator daemon and platform infrastructure for [AuspexAI](https://github
 - **Five credential classes (per §5.18):** maintainer bearer token, researcher RFC 9421 HTTP Message Signature, anonymous-public, **worker** (M6b — RFC 9421 signed), and **system** (M6e — coordinator-driven actions; appears in audit_log only, never bound to an HTTP request)
 - **Four field-exposure tags** filter responses field-by-field per credential class
 - **SQLite control DB** with sequential migration framework; **per-job DBs** holding work_units + assignments + results
-- **CLI:** `auspexai-coordinator {serve, token init/rotate/show}`
+- **CLI:** `auspexai-coordinator {serve, token init/rotate/show}` + maintenance/timer subcommands (`settle`, `settle-outcomes`, `age-off`, `reap-orphan-jobs`, `refresh-hf-catalog`, `attestation`, `receipts`)
 
 Subsequent milestones:
 - **M7** — Receipts + per-account trust-tier promotion (§6.8.2) + retired_keys registry + reducer dispatch + public receipt-verify endpoint
@@ -66,4 +66,4 @@ ruff format --check src tests           # format check
 
 ## Watch this repo
 
-Activity will begin as Phase 1 ramps up. Until then, issues and discussion are welcome.
+The coordinator is live in open beta. Issues and discussion are welcome.
