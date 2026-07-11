@@ -19,7 +19,7 @@ The coordinator daemon and platform infrastructure for [AuspexAI](https://github
 - **SQLite control DB** with sequential migration framework; **per-job DBs** holding work_units + assignments + results
 - **CLI:** `auspexai-coordinator {serve, token init/rotate/show}` + maintenance/timer subcommands (`settle`, `settle-outcomes`, `age-off`, `reap-orphan-jobs`, `refresh-hf-catalog`, `attestation`, `receipts`)
 
-Subsequent milestones:
+Milestones M7–M8 (shipped; the coordinator has continued well beyond — DOI minting, HF model catalog, benchmark board, Rekor anchoring, settle/reap timers):
 - **M7** — Receipts + per-account trust-tier promotion (§6.8.2) + retired_keys registry + reducer dispatch + public receipt-verify endpoint
 - **M8** — Audit log list endpoint + alerts + SSE event bus
 
