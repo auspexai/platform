@@ -51,7 +51,7 @@ from auspexai_platform.db.repositories.results import ResultRepository
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
 from auspexai_platform.exposure import ExposureTag, is_visible
 from auspexai_platform.receipts.attestation import collect_diverged_units
-from auspexai_platform.scheduler import worker_satisfies
+from auspexai_platform.scheduler import worker_model_download, worker_satisfies
 from auspexai_platform.scheduler.capacity import _eligible, _schedulable_workforce
 from auspexai_platform.worker_status import derive_worker_status, heartbeat_cutoff
 
@@ -469,6 +469,7 @@ def build_router(
         required_models = required_caps.get("models", [])
         capable_worker_count: int | None = None
         capable_ids: set[str] = set()
+        eligible: list = []
         if required_models:
             eligible = _eligible(
                 _schedulable_workforce(worker_repository.list_all(), now=now),
@@ -504,7 +505,11 @@ def build_router(
                 capable_worker_count=capable_worker_count,
                 capable_busy_count=capable_busy_count,
                 run_phase=_experiment_phase(
-                    experiment, per_job_factory, datetime.now(UTC), driver_status_repository
+                    experiment,
+                    per_job_factory,
+                    datetime.now(UTC),
+                    driver_status_repository,
+                    worker_repository,
                 ),
             )
 
@@ -517,13 +522,29 @@ def build_router(
         # The canonical phase (queued vs running vs capped vs stalled …) — one
         # function shared with the experiment detail so the surfaces can't disagree.
         run_phase = _experiment_phase(
-            experiment, per_job_factory, datetime.now(UTC), driver_status_repository
+            experiment,
+            per_job_factory,
+            datetime.now(UTC),
+            driver_status_repository,
+            worker_repository,
         )
-        download_progress = (
-            prestage_repository.progress_for_models(required_models)
-            if run_phase == "queued"
-            else None
-        )
+        # D12 5c: in-flight model-download progress for THIS experiment's required
+        # models — sourced from the capable workers' LIVE heartbeat `downloads`,
+        # so it surfaces regardless of run_phase. A lazy in-line auto-acquire
+        # happens AFTER the experiment is already "running" (its first unit is
+        # in_progress on the downloading worker), not only while queued — the
+        # queued-only gate hid every multi-GB first-serve. Falls back to the
+        # prestage row's sample (the eager-conductor path). Clears to None once
+        # the model serves (the sample completes and drops out).
+        download_progress = None
+        for w in eligible:
+            dl = worker_model_download(w, required_models)
+            if dl is not None and (
+                download_progress is None or (dl["pct"] or -1) > (download_progress["pct"] or -1)
+            ):
+                download_progress = dl
+        if download_progress is None:
+            download_progress = prestage_repository.progress_for_models(required_models)
         downloading = download_progress is not None
         queue_position = queue_depth = None
         if run_phase == "queued":

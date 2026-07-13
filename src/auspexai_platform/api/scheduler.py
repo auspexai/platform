@@ -45,6 +45,7 @@ from auspexai_platform.scheduler import (
     assignment_presumed_lost,
     reoffer_eligible,
     worker_is_degraded,
+    worker_is_provisioning,
     worker_is_self_paused,
     worker_satisfies,
 )
@@ -100,26 +101,38 @@ def _model_count(worker) -> int:
     return len(m) if isinstance(m, list) else 0
 
 
-def _count_stalled(pj) -> int:
+def _count_stalled(pj, workers_by_id=None, required_models=()) -> int:
     """§2.1 #8-tail: in-progress units stranded because no assignment is
     working or re-offerable — every row is a non-reofferable refusal (terminal
     kind, or retryable-at-cap) or a presumed-lost active row at the attempt cap
-    (C16) — the unit can't complete without intervention."""
+    (C16) — the unit can't complete without intervention.
+
+    A worker still DOWNLOADING a required model is provisioning, not stranded, so
+    its active row counts as working (the same shared guard the maintainer stall
+    alarm and the re-delivery lease use — `worker_is_provisioning`)."""
     if pj is None:
         return 0
     work_units = WorkUnitRepository(pj)
     assignments_repo = AssignmentRepository(pj)
+    by_id = workers_by_id or {}
+
+    def _prov(a) -> bool:
+        w = by_id.get(a.worker_id)
+        return worker_is_provisioning(w, required_models) if w is not None else False
+
     stalled = 0
     for unit in work_units.list_all(status=WorkUnitStatus.IN_PROGRESS):
         assignments = assignments_repo.list_for_unit(unit.unit_id)
         if not assignments:
             continue  # in-progress but unassigned (a transient state) — not stalled
         if any(
-            a.refused_at is None and a.result_id is None and not assignment_presumed_lost(a)
+            a.refused_at is None
+            and a.result_id is None
+            and not assignment_presumed_lost(a, worker_provisioning=_prov(a))
             for a in assignments
         ):
-            continue  # a FRESH active assignment exists — someone's working it
-        if any(reoffer_eligible(a) for a in assignments):
+            continue  # a FRESH (or provisioning) active assignment exists — someone's working it
+        if any(reoffer_eligible(a, worker_provisioning=_prov(a)) for a in assignments):
             # Re-offerable — a retryable refusal, or a presumed-lost offer the
             # C16 lease will re-deliver on the worker's next poll. Self-heals.
             continue
@@ -165,6 +178,9 @@ def build_router(
         cutoff = heartbeat_cutoff(datetime.now(UTC))
 
         all_workers = worker_repository.list_all()
+        # worker_id -> Worker, so the per-experiment stall count can ask whether an
+        # assignment's worker is provisioning (downloading) a required model.
+        _workers_by_id = {w.worker_id: w for w in all_workers}
         # On the network = heartbeating + not retired/quarantined (those live on the
         # Workers page). Paused workers are shown here (flagged) but excluded from
         # the workforce the scheduler can actually use.
@@ -242,7 +258,7 @@ def build_router(
                     eligible_worker_count=len(eligible),
                     blocked=blocked,
                     block_reason=reason,
-                    stalled_units=_count_stalled(pj),
+                    stalled_units=_count_stalled(pj, _workers_by_id, required.get("models") or []),
                 )
             )
 

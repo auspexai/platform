@@ -563,6 +563,11 @@ def test_compute_run_phase_is_one_unified_vocabulary():
     # pending work, nothing started → queued; something in flight → running
     assert rp(_Exp(approved), pending=3, total=3) == "queued"
     assert rp(_Exp(approved), in_flight=2, total=2) == "running"
+    # a capable worker still downloading a required model + no result yet →
+    # provisioning, not "running" (the units sit in_progress on the puller)
+    assert rp(_Exp(approved), in_flight=2, total=2, provisioning=True) == "provisioning"
+    # once a result lands, it's genuinely running even mid-download of a later replica
+    assert rp(_Exp(approved), in_flight=1, completed=1, total=2, provisioning=True) == "running"
     # no units: fresh → provisioning, long-stuck → inert
     assert rp(_Exp(approved, submitted_at=now)) == "provisioning"
     assert rp(_Exp(approved, submitted_at=now - timedelta(hours=1))) == "inert"

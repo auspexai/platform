@@ -35,7 +35,7 @@ thin slice that makes BYOM routing real.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -267,6 +267,53 @@ def worker_is_degraded(worker: Worker) -> bool:
     return thermal.get("state") == "critical"
 
 
+def worker_model_download(worker: Worker, model_ids: Collection[str]) -> dict | None:
+    """The furthest-along IN-FLIGHT download on `worker` for one of `model_ids`,
+    shaped `{model_id, bytes_downloaded, total_bytes, pct}` (the same shape the
+    prestage `progress_for_models` returns), or None when the worker reports no
+    matching in-flight pull.
+
+    The worker declares `capabilities["downloads"]` = `{model_id:
+    {bytes_downloaded, total_bytes}}` in every heartbeat (D12 5c) for whatever it
+    is pulling RIGHT NOW — covering both an eager prestage and a lazy in-line
+    auto-acquire. A sample that has reached its total (done >= total) is COMPLETE,
+    not in flight, so it drops out (the model is about to serve). `pct` is None
+    until a sample with a known total lands."""
+    downloads = worker.capabilities.get("downloads")
+    if not isinstance(downloads, dict) or not model_ids:
+        return None
+    wanted = set(model_ids)
+    best: dict | None = None
+    for model_id, prog in downloads.items():
+        if model_id not in wanted or not isinstance(prog, dict):
+            continue
+        done = prog.get("bytes_downloaded") or 0
+        total = prog.get("total_bytes")
+        if total is not None and done >= total:
+            continue  # complete — not in flight
+        pct = round(done / total * 100, 1) if (done is not None and total) else None
+        cand = {
+            "model_id": model_id,
+            "bytes_downloaded": done,
+            "total_bytes": total,
+            "pct": pct,
+        }
+        if best is None or (cand["pct"] or -1) > (best["pct"] or -1):
+            best = cand
+    return best
+
+
+def worker_is_provisioning(worker: Worker, model_ids: Collection[str]) -> bool:
+    """True if `worker` has an in-flight download of one of `model_ids` — it is
+    PROVISIONING to serve, so an active assignment on it is progressing toward a
+    result, not a lost offer or a stall. THE shared root fact for "is this
+    assignment making no progress?": the re-delivery lease
+    (`assignment_presumed_lost`) and the maintainer stall alarm
+    (`_stalled_unit_experiments`) both consult it, so a downloading worker never
+    trips either — a multi-GB first-serve is expected, not an incident."""
+    return worker_model_download(worker, model_ids) is not None
+
+
 # C16: how long an ACTIVE assignment may sit result-less and refusal-less before
 # the offer is presumed lost in flight and becomes re-DELIVERABLE to its own
 # worker. The offer response can be lost (read timeout / edge 502 under origin
@@ -282,14 +329,23 @@ ASSIGNMENT_REDELIVERY_LEASE_SECONDS = 600
 def assignment_presumed_lost(
     assignment: Assignment,
     *,
+    worker_provisioning: bool = False,
     redelivery_lease_seconds: float = ASSIGNMENT_REDELIVERY_LEASE_SECONDS,
     now: datetime | None = None,
 ) -> bool:
     """C16: True for an ACTIVE row (no result, no refusal) older than the
     re-delivery lease — the offer response was presumably lost in flight and
     the worker never learned of its assignment. A fresh active row is presumed
-    delivered (the worker may be executing right now)."""
+    delivered (the worker may be executing right now).
+
+    `worker_provisioning` (the shared root guard): when the assigned worker is
+    still DOWNLOADING a required model (`worker_is_provisioning`), the offer was
+    not lost — the worker is provisioning to serve, and a multi-GB first-serve
+    legitimately outlasts the lease. Such a row is never presumed lost (no
+    re-delivery churn to a worker that already holds the unit)."""
     if assignment.result_id is not None or assignment.refused_at is not None:
+        return False
+    if worker_provisioning:
         return False
     assigned_at = assignment.assigned_at
     if assigned_at.tzinfo is None:
@@ -301,6 +357,7 @@ def assignment_presumed_lost(
 def reoffer_eligible(
     assignment: Assignment,
     *,
+    worker_provisioning: bool = False,
     max_attempts: int = MAX_ASSIGNMENT_ATTEMPTS,
     redelivery_lease_seconds: float = ASSIGNMENT_REDELIVERY_LEASE_SECONDS,
     now: datetime | None = None,
@@ -324,9 +381,13 @@ def reoffer_eligible(
     if assignment.refused_at is None:
         # C16 stale-active branch: re-deliver a presumed-lost offer, under the
         # same attempt cap that bounds refusal retries (no infinite re-delivery
-        # to a pairing that never lands).
+        # to a pairing that never lands). A worker still provisioning the model
+        # is NOT presumed lost (worker_provisioning), so it's left to deliver.
         return assignment.attempt_count < max_attempts and assignment_presumed_lost(
-            assignment, redelivery_lease_seconds=redelivery_lease_seconds, now=now
+            assignment,
+            worker_provisioning=worker_provisioning,
+            redelivery_lease_seconds=redelivery_lease_seconds,
+            now=now,
         )
     if not is_retryable_refusal(assignment.refused_kind, assignment.refused_reason):
         return False
@@ -585,6 +646,13 @@ class Scheduler:
             candidates.extend(work_units.list_all(status=WorkUnitStatus.PENDING))
             candidates.extend(work_units.list_all(status=WorkUnitStatus.IN_PROGRESS))
 
+            # Is THIS worker still pulling a model this experiment requires? Then an
+            # existing active row on it is provisioning, not a lost offer — don't
+            # re-deliver (churn) while the multi-GB first-serve completes.
+            worker_prov = worker_is_provisioning(
+                worker, (experiment.required_capabilities or {}).get("models") or []
+            )
+
             for unit in candidates:
                 # M4-tail pin / force-assign: a pinned unit is offered ONLY to
                 # its pinned worker (the maintainer override). Other workers skip
@@ -597,7 +665,9 @@ class Scheduler:
                 # or terminally/exhaustedly refused. A retryable refusal under
                 # the attempt cap stays eligible — the route reactivates the row.
                 existing = assignments.get_for_unit_and_worker(unit.unit_id, worker.worker_id)
-                if existing is not None and not reoffer_eligible(existing):
+                if existing is not None and not reoffer_eligible(
+                    existing, worker_provisioning=worker_prov
+                ):
                     continue
                 # C16: a stale-ACTIVE row (lost-delivery re-offer) already occupies
                 # its replication slot — re-delivering it attaches no new worker, so

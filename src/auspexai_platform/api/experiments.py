@@ -90,6 +90,7 @@ from auspexai_platform.scheduler import (
     policy_floor_for_tier,
     required_containment_for_tier,
     resolve_replication,
+    worker_is_provisioning,
 )
 
 logger = logging.getLogger(__name__)
@@ -262,7 +263,7 @@ def _stuck_experiments(
 
 
 def _stalled_unit_experiments(
-    experiment_repository, per_job_factory, now: datetime
+    experiment_repository, per_job_factory, now: datetime, worker_repository=None
 ) -> list[tuple[Any, int, int]]:
     """C16: approved experiments holding an in_progress unit whose missing
     replicas sit on ACTIVE assignments (no result, no refusal) older than
@@ -275,15 +276,27 @@ def _stalled_unit_experiments(
     scheduler's ASSIGNMENT_REDELIVERY_LEASE_SECONDS — re-delivery is the
     self-heal (a re-armed row gets a fresh assigned_at and drops back below
     the threshold); this surface is the backstop for when re-delivery can't
-    fire (attempt cap exhausted, worker stopped polling) or hasn't worked."""
+    fire (attempt cap exhausted, worker stopped polling) or hasn't worked.
+
+    A worker still DOWNLOADING a required model is PROVISIONING, not stalled — a
+    multi-GB first-serve legitimately outlasts the threshold with no result yet.
+    Such an assignment is excluded from the stall count via the shared
+    `worker_is_provisioning` guard (the same fact the re-delivery lease consults),
+    so a large-model pull never raises a false "needs attention"."""
     out: list[tuple[Any, int, int]] = []
     if per_job_factory is None:
         return out
+    workers_by_id = (
+        {w.worker_id: w for w in worker_repository.list_all()}
+        if worker_repository is not None
+        else {}
+    )
     cutoff = now - timedelta(minutes=STALLED_UNIT_MINUTES)
     for e in experiment_repository.list_all(status=ExperimentStatus.APPROVED):
         pj = per_job_factory.get(e.experiment_id)
         if pj is None:
             continue
+        required_models = (e.required_capabilities or {}).get("models") or []
         wu_repo = WorkUnitRepository(pj)
         asg_repo = AssignmentRepository(pj)
         stalled = 0
@@ -292,6 +305,9 @@ def _stalled_unit_experiments(
             for a in asg_repo.list_for_unit(unit.unit_id):
                 if a.result_id is not None or a.refused_at is not None:
                     continue
+                worker = workers_by_id.get(a.worker_id)
+                if worker is not None and worker_is_provisioning(worker, required_models):
+                    continue  # provisioning the model — making progress, not stalled
                 assigned_at = a.assigned_at
                 if assigned_at.tzinfo is None:
                     assigned_at = assigned_at.replace(tzinfo=UTC)
@@ -393,7 +409,11 @@ def _driver_is_stalled(driver_status_repository, experiment_id: str, now: dateti
 
 
 def _experiment_phase(
-    experiment, per_job_factory, now: datetime, driver_status_repository=None
+    experiment,
+    per_job_factory,
+    now: datetime,
+    driver_status_repository=None,
+    worker_repository=None,
 ) -> str | None:
     """THE canonical run-phase for an experiment: derives the live signals
     (work-unit counts, latest completion, driver liveness) and delegates to the
@@ -408,6 +428,15 @@ def _experiment_phase(
         last_dt = datetime.fromisoformat(last)
         if last_dt.tzinfo is None:
             last_dt = last_dt.replace(tzinfo=UTC)
+    # Is a capable worker still pulling a required model? Then the run is
+    # provisioning, not running (compute_run_phase folds this in when no result
+    # has landed yet). Cheap: reads each worker's already-loaded capabilities.
+    provisioning = False
+    required_models = (getattr(experiment, "required_capabilities", None) or {}).get("models") or []
+    if worker_repository is not None and required_models:
+        provisioning = any(
+            worker_is_provisioning(w, required_models) for w in worker_repository.list_all()
+        )
     return compute_run_phase(
         experiment,
         in_flight=counts.get("in_progress", 0),
@@ -417,6 +446,7 @@ def _experiment_phase(
         last_completion_at=last_dt,
         driver_stalled=_driver_is_stalled(driver_status_repository, experiment.experiment_id, now),
         now=now,
+        provisioning=provisioning,
     )
 
 
@@ -430,6 +460,7 @@ def compute_run_phase(
     last_completion_at: datetime | None,
     driver_stalled: bool,
     now: datetime,
+    provisioning: bool = False,
 ) -> str | None:
     """Pure, presentation-only run-phase from already-derived signals — one
     vocabulary, unit-testable, identical across every surface. NOT a new
@@ -463,6 +494,12 @@ def compute_run_phase(
             if (now - submitted) > timedelta(minutes=ATTENTION_STUCK_MINUTES)
             else "provisioning"
         )
+    # A capable worker is still pulling a required model and no result has landed
+    # yet: the units sit in_progress on the downloading worker, but the run is
+    # PROVISIONING, not "running" — say so, so every surface agrees the worker is
+    # fetching the model rather than mislabeling a multi-GB first-serve as running.
+    if provisioning and completed == 0:
+        return "provisioning"
     all_settled = in_flight == 0 and pending == 0
     # Reached the max_units cap with everything settled: a clean quota end, NOT a
     # stall (the coordinator won't accept more units — see completion.reached_unit_cap).
@@ -1504,7 +1541,9 @@ def build_router(
             resp = _to_response(e)
             # E15: only APPROVED experiments touch the per-job DB (the helper
             # early-returns for submitted/terminal), so the list stays cheap.
-            resp.run_phase = _experiment_phase(e, per_job_factory, now, driver_status_repository)
+            resp.run_phase = _experiment_phase(
+                e, per_job_factory, now, driver_status_repository, worker_repository
+            )
             filtered.append(
                 filter_for_credential(
                     resp,
@@ -1553,7 +1592,7 @@ def build_router(
                 ),
             )
             for e, n, oldest_minutes in _stalled_unit_experiments(
-                experiment_repository, per_job_factory, now
+                experiment_repository, per_job_factory, now, worker_repository
             )
         )
         # D16.1 §7: a CERTIFIED result rejected for a feature_schema violation is a
@@ -1611,7 +1650,11 @@ def build_router(
             raise _experiment_not_found(experiment_id)
         resp = _to_response(experiment)
         resp.run_phase = _experiment_phase(
-            experiment, per_job_factory, datetime.now(UTC), driver_status_repository
+            experiment,
+            per_job_factory,
+            datetime.now(UTC),
+            driver_status_repository,
+            worker_repository,
         )
         if worker_repository is not None:
             from auspexai_platform.scheduler.capacity import eligible_capable_count

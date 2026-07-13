@@ -29,7 +29,9 @@ from auspexai_platform.scheduler import (
     policy_floor_for_tier,
     reoffer_eligible,
     worker_is_degraded,
+    worker_is_provisioning,
     worker_is_self_paused,
+    worker_model_download,
     worker_satisfies,
 )
 
@@ -900,6 +902,121 @@ def test_reoffer_eligible_stale_active_redelivery():
     naive = _active_assignment(age_seconds=lease + 1, now=now)
     naive = naive.model_copy(update={"assigned_at": naive.assigned_at.replace(tzinfo=None)})
     assert reoffer_eligible(naive, now=now) is True
+
+
+def _worker_with_downloads(downloads: dict) -> Worker:
+    return Worker(
+        worker_id="wkr-dl",
+        pubkey_hex="a" * 64,
+        trust_tier=TrustTier.T2_TRUSTED,
+        capabilities={"os": "linux", "downloads": downloads},
+        registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+
+
+def test_worker_model_download_and_is_provisioning():
+    req = ["m-x"]
+    # In-flight pull of a required model → surfaced with pct, and provisioning.
+    w = _worker_with_downloads({"m-x": {"bytes_downloaded": 3_000_000, "total_bytes": 12_000_000}})
+    dl = worker_model_download(w, req)
+    assert dl == {
+        "model_id": "m-x",
+        "bytes_downloaded": 3_000_000,
+        "total_bytes": 12_000_000,
+        "pct": 25.0,
+    }
+    assert worker_is_provisioning(w, req) is True
+    # A completed sample (done >= total) is NOT in flight — the model is about to serve.
+    done = _worker_with_downloads(
+        {"m-x": {"bytes_downloaded": 12_000_000, "total_bytes": 12_000_000}}
+    )
+    assert worker_model_download(done, req) is None
+    assert worker_is_provisioning(done, req) is False
+    # A download of some OTHER model doesn't count for this experiment.
+    other = _worker_with_downloads({"m-y": {"bytes_downloaded": 1, "total_bytes": 9}})
+    assert worker_is_provisioning(other, req) is False
+    # No downloads / no required models → not provisioning.
+    assert worker_is_provisioning(_worker_with_downloads({}), req) is False
+    assert worker_is_provisioning(w, []) is False
+    # Unknown total (pct None) still counts as in-flight.
+    partial = _worker_with_downloads({"m-x": {"bytes_downloaded": 500, "total_bytes": None}})
+    assert worker_is_provisioning(partial, req) is True
+    assert worker_model_download(partial, req)["pct"] is None
+
+
+def test_provisioning_worker_is_never_presumed_lost_or_reofferable():
+    now = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    lease = ASSIGNMENT_REDELIVERY_LEASE_SECONDS
+    # A stale-active row that WOULD be presumed lost/re-deliverable on age alone…
+    stale = _active_assignment(age_seconds=lease + 1, now=now)
+    assert assignment_presumed_lost(stale, now=now) is True
+    assert reoffer_eligible(stale, now=now) is True
+    # …is neither once its worker is provisioning (downloading) a required model:
+    # the offer isn't lost, it's a multi-GB first-serve in progress. No churn.
+    assert assignment_presumed_lost(stale, worker_provisioning=True, now=now) is False
+    assert reoffer_eligible(stale, worker_provisioning=True, now=now) is False
+
+
+def test_stall_alarm_silent_while_worker_downloads_the_model(
+    enrolled_worker,
+    approved_experiment,
+    per_job_factory: PerJobDatabaseFactory,
+    experiment_repository: ExperimentRepository,
+    worker_repository,
+):
+    """The maintainer 'needs attention' stall alarm must NOT fire for a unit whose
+    assigned worker is still DOWNLOADING the required model — a multi-GB first-serve
+    (gpt-oss-20b) legitimately outlasts STALLED_UNIT_MINUTES with no result yet. The
+    alarm never triggers in the first place while provisioning (the shared guard)."""
+    from auspexai_platform.api.experiments import (
+        STALLED_UNIT_MINUTES,
+        _stalled_unit_experiments,
+    )
+    from auspexai_platform.db.models import ExperimentStatus
+
+    _, worker = enrolled_worker
+    _, tenant_binding, _, manifest_hash = approved_experiment
+    exp = experiment_repository.create(
+        tenant_id=tenant_binding.tenant_id,
+        tenant_experiment_label="exp-prov",
+        manifest_hash=manifest_hash,
+        required_capabilities={"models": ["m-x"]},
+    )
+    experiment_repository.update_status(exp.experiment_id, ExperimentStatus.APPROVED)
+
+    db = per_job_factory.get_or_create(exp.experiment_id)
+    wu = WorkUnitRepository(db)
+    wu.submit_batch([{"unit_id": "u1", "payload": {}}], replication_target=1)
+    AssignmentRepository(db).create(
+        assignment_id="asg-1",
+        unit_id="u1",
+        worker_id=worker.worker_id,
+        worker_pubkey_hex=worker.pubkey_hex,
+    )
+    wu.mark_in_progress("u1")
+    _backdate_assignment(db, "asg-1", STALLED_UNIT_MINUTES * 60 + 120)  # well past the threshold
+    now = datetime.now(UTC)
+
+    def flagged() -> bool:
+        return any(
+            e.experiment_id == exp.experiment_id
+            for e, _, _ in _stalled_unit_experiments(
+                experiment_repository, per_job_factory, now, worker_repository
+            )
+        )
+
+    # Worker idle (not downloading) → the stale active unit trips the alarm.
+    assert flagged() is True
+    # Worker now reports an in-flight pull of the required model → provisioning,
+    # not stalled: the alarm goes silent for this experiment.
+    worker_repository.record_heartbeat(
+        worker.worker_id,
+        capabilities={
+            "os": "linux",
+            "downloads": {"m-x": {"bytes_downloaded": 3_000_000, "total_bytes": 12_000_000}},
+        },
+    )
+    assert flagged() is False
 
 
 def test_stale_active_offer_redelivers_to_same_worker(
