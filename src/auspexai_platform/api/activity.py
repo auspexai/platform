@@ -533,9 +533,11 @@ def build_router(
         # so it surfaces regardless of run_phase. A lazy in-line auto-acquire
         # happens AFTER the experiment is already "running" (its first unit is
         # in_progress on the downloading worker), not only while queued — the
-        # queued-only gate hid every multi-GB first-serve. Falls back to the
-        # prestage row's sample (the eager-conductor path). Clears to None once
-        # the model serves (the sample completes and drops out).
+        # queued-only gate hid every multi-GB first-serve. The live signal covers
+        # the eager-prestage path too (the worker reports the same model_downloads
+        # while prestaging) and SELF-CLEARS to None the moment the model serves —
+        # unlike the prestage row, which lingers in 'requested' with stale/empty
+        # bytes after acquisition and would show a phantom "downloading…" forever.
         download_progress = None
         for w in eligible:
             dl = worker_model_download(w, required_models)
@@ -543,8 +545,6 @@ def build_router(
                 download_progress is None or (dl["pct"] or -1) > (download_progress["pct"] or -1)
             ):
                 download_progress = dl
-        if download_progress is None:
-            download_progress = prestage_repository.progress_for_models(required_models)
         downloading = download_progress is not None
         queue_position = queue_depth = None
         if run_phase == "queued":
