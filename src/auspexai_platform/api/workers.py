@@ -64,6 +64,7 @@ from auspexai_platform.db.repositories.workers import (
 )
 from auspexai_platform.events import EventBus
 from auspexai_platform.exposure import ExposureTag, filter_for_credential
+from auspexai_platform.ollama_versions import ollama_update_recommended
 from auspexai_platform.rate_limit import limiter
 from auspexai_platform.scheduler.capacity import experiments_collapsed_by_removing
 from auspexai_platform.worker_status import derive_worker_status, heartbeat_cutoff
@@ -144,6 +145,13 @@ class WorkerResponse(BaseModel):
     pubkey_hex: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     account_id: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
     capabilities: Annotated[dict[str, Any] | None, ExposureTag.OPERATOR_ONLY] = None
+    # The serving Ollama version this worker reported + whether it is below the
+    # recommended floor (a newer model may fail to serve on it). Computed from
+    # capabilities.ollama_version so the operator surface can flag a stale worker
+    # PROACTIVELY, rather than waiting for a run to be refused. None when the worker
+    # reports no version (not serving / probe failed).
+    ollama_version: Annotated[str | None, ExposureTag.OPERATOR_ONLY] = None
+    ollama_update_recommended: Annotated[bool | None, ExposureTag.OPERATOR_ONLY] = None
     # §9 #46: latest-release announcement, populated ONLY by the heartbeat
     # handler (other worker routes leave it None → dropped by exclude_none).
     # A single PUBLIC dict, not a nested model — the exposure filter does not
@@ -249,6 +257,8 @@ def _generate_worker_id() -> str:
 
 
 def _worker_to_response(worker) -> WorkerResponse:
+    caps = worker.capabilities or {}
+    ollama_version = caps.get("ollama_version")
     return WorkerResponse(
         worker_id=worker.worker_id,
         trust_tier=int(worker.trust_tier),
@@ -262,6 +272,10 @@ def _worker_to_response(worker) -> WorkerResponse:
         pubkey_hex=worker.pubkey_hex,
         account_id=worker.account_id,
         capabilities=worker.capabilities,
+        ollama_version=ollama_version,
+        ollama_update_recommended=(
+            ollama_update_recommended(ollama_version) if ollama_version else None
+        ),
     )
 
 
