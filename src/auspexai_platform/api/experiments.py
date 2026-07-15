@@ -381,6 +381,43 @@ def _capability_unsatisfiable_experiments(
     return out
 
 
+# An approved experiment with pending work, this many refusals, and ZERO completed
+# units = the fleet keeps REFUSING it. Low enough to alarm within ~a minute of a
+# fast refuse loop (a serve failure refuses in seconds), high enough to ignore a
+# one-off transient. Distinct from C6a (nobody MATCHES the capability) — here workers
+# match but refuse at SERVE time, the recurring stale-Ollama bite (phi/qwen3 500'd
+# 21 times over 15 min, silently, before this).
+SERVE_REFUSAL_ATTENTION_THRESHOLD = 3
+
+
+def _serve_refused_experiments(
+    experiment_repository, per_job_factory, now: datetime
+) -> list[tuple[Any, int, str]]:
+    """Layer 2b: approved experiments the fleet keeps REFUSING — pending work, at
+    least SERVE_REFUSAL_ATTENTION_THRESHOLD refusals, and ZERO completed units. The
+    capability check (C6a) passes here (workers hold the model / fit RAM), but they
+    refuse at serve time (e.g. an Ollama too old for the model's architecture), so the
+    run would sit stuck-pending until age-off with no alarm. Returns (experiment,
+    refused_count, reason) — the reason is the latest (Layer-1-enriched) refusal, so
+    the alert names the cause ('Ollama too old — update it')."""
+    out: list[tuple[Any, int, str]] = []
+    if per_job_factory is None:
+        return out
+    for e in experiment_repository.list_all(status=ExperimentStatus.APPROVED):
+        pj = per_job_factory.get(e.experiment_id)
+        if pj is None:
+            continue
+        wu_repo = WorkUnitRepository(pj)
+        if not wu_repo.list_all(status=WorkUnitStatus.PENDING):
+            continue  # nothing waiting → not stuck
+        refused, _workers, completed, reason = AssignmentRepository(pj).refusal_progress_summary()
+        if completed > 0:
+            continue  # progressing — occasional refusals aren't a fleet-can't-serve alarm
+        if refused >= SERVE_REFUSAL_ATTENTION_THRESHOLD:
+            out.append((e, refused, reason or "workers refused the work"))
+    return out
+
+
 # A driver silent (no heartbeat) this long past its round cadence has died/
 # dropped, not paused between rounds. 4x the stuck threshold matches the longest
 # cadence we run (a half-hourly loop idles ~28 min between rounds).
@@ -1629,6 +1666,24 @@ def build_router(
             )
             for e, summary in _capability_unsatisfiable_experiments(
                 experiment_repository, per_job_factory, worker_repository, now
+            )
+        )
+        # Layer 2b: the fleet keeps REFUSING an experiment's units at serve time
+        # (capability matches, but serving fails — the stale-Ollama bite). C6a can't
+        # see this; without it the run silently spins then sits stuck-pending.
+        items.extend(
+            AttentionExperiment(
+                experiment_id=e.experiment_id,
+                tenant_id=e.tenant_id,
+                label=getattr(e, "tenant_experiment_label", None),
+                age_minutes=0,
+                reason=(
+                    f"{refused} unit-refusal(s), 0 completed — the fleet can't serve this "
+                    f"model. Latest: {reason[:160]}"
+                ),
+            )
+            for e, refused, reason in _serve_refused_experiments(
+                experiment_repository, per_job_factory, now
             )
         )
         return AttentionResponse(count=len(items), experiments=items)

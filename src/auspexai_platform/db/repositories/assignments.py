@@ -212,6 +212,33 @@ class AssignmentRepository:
         )
         return int(rows[0]["n"]) if rows else 0
 
+    def refusal_progress_summary(self) -> tuple[int, int, int, str | None]:
+        """(refused_count, distinct_refused_workers, completed_count, latest_reason)
+        across this per-job DB — the signal for a serve-unservable experiment. When
+        the fleet keeps REFUSING an experiment's units (high refused_count) and NONE
+        complete (completed_count == 0), the run is stuck at serve time even though
+        workers MATCH its capabilities (C6a can't see it). `latest_reason` is the most
+        recent refusal reason — Layer-1-enriched, e.g. 'Ollama too old' — for the
+        operator alert."""
+        rows = self.db.execute(
+            "SELECT "
+            "  SUM(CASE WHEN refused_at IS NOT NULL THEN 1 ELSE 0 END) AS refused, "
+            "  COUNT(DISTINCT CASE WHEN refused_at IS NOT NULL THEN worker_id END) AS workers, "
+            "  SUM(CASE WHEN result_id IS NOT NULL THEN 1 ELSE 0 END) AS completed "
+            "FROM assignments"
+        )
+        refused = int(rows[0]["refused"] or 0) if rows else 0
+        workers = int(rows[0]["workers"] or 0) if rows else 0
+        completed = int(rows[0]["completed"] or 0) if rows else 0
+        reason: str | None = None
+        if refused:
+            rr = self.db.execute(
+                "SELECT refused_reason FROM assignments "
+                "WHERE refused_at IS NOT NULL ORDER BY refused_at DESC LIMIT 1"
+            )
+            reason = rr[0]["refused_reason"] if rr else None
+        return refused, workers, completed, reason
+
     def active_worker_ids(self) -> set[str]:
         """Distinct workers holding an ACTIVE assignment (offered, not refused, no
         result yet) in this per-job DB — i.e. currently working this experiment.

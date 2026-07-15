@@ -113,6 +113,52 @@ def test_active_worker_ids_excludes_refused_and_completed(
     assert assignments_repo.active_worker_ids() == {"wkr-a", "wkr-b"}
 
 
+def test_refusal_progress_summary(
+    work_units_repo: WorkUnitRepository,
+    assignments_repo: AssignmentRepository,
+    results_repo: ResultRepository,
+) -> None:
+    """Layer 2b: (refused, distinct workers, completed, latest reason) — the
+    serve-unservable signal. Empty by default; counts refusals across workers, the
+    latest reason, and completed (result-bearing) assignments."""
+    assert assignments_repo.refusal_progress_summary() == (0, 0, 0, None)
+
+    work_units_repo.submit_batch([{"unit_id": f"u{i}", "payload": {}} for i in range(1, 4)])
+    # Two workers each refuse (a serve failure), one unit completes.
+    assignments_repo.create(
+        assignment_id="a1", unit_id="u1", worker_id="wA", worker_pubkey_hex="a" * 64
+    )
+    assignments_repo.mark_refused(
+        assignment_id="a1", kind="executor_refused", reason="Ollama too old"
+    )
+    assignments_repo.create(
+        assignment_id="a2", unit_id="u2", worker_id="wB", worker_pubkey_hex="b" * 64
+    )
+    assignments_repo.mark_refused(
+        assignment_id="a2", kind="executor_refused", reason="serving unavailable: 500"
+    )
+    assignments_repo.create(
+        assignment_id="a3", unit_id="u3", worker_id="wC", worker_pubkey_hex="c" * 64
+    )
+    results_repo.insert(
+        result_id="r3",
+        unit_id="u3",
+        worker_id="wC",
+        worker_pubkey_hex="c" * 64,
+        exit_code=0,
+        payload={},
+        worker_signature="s",
+        completed_at=datetime(2026, 7, 15, tzinfo=UTC),
+    )
+    assignments_repo.attach_result("a3", "r3")
+
+    refused, workers, completed, reason = assignments_repo.refusal_progress_summary()
+    assert refused == 2
+    assert workers == 2
+    assert completed == 1
+    assert reason == "serving unavailable: 500"  # the latest refusal
+
+
 def test_two_workers_can_share_one_unit(
     seeded_unit, assignments_repo: AssignmentRepository
 ) -> None:
