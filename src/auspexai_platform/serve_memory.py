@@ -32,6 +32,12 @@ _KV_BYTES = 2
 # ~1.7B-class models (Qwen3-1.7B, SmolLM2) land comfortably under. The
 # observed-failure feedback is the backstop for anything marginal (e.g. Qwen3-4B).
 SERVE_OVERHEAD_GB = 1.5
+# When the architecture is UNKNOWN (a gated base model whose config.json we can't
+# fetch, or a present-but-unmenued model sized only from its file), estimate the KV
+# cache as this fraction of the weights — a deliberately CONSERVATIVE GQA-ish proxy at
+# 4096 ctx, so an arch-unknown model errs toward too_big rather than the old flat
+# file x 1.2 that let mistral-7b (never served on a Jetson) read "fits" there.
+_KV_PROXY_FRACTION = 0.2
 # The context length the worker serves at (matches the worker's DEFAULT_NUM_CTX).
 # The KV cache is linear in this, so it's a first-class input to the fit decision —
 # the whole point is that a bigger context needs more memory, which the old check
@@ -56,13 +62,19 @@ def estimate_serve_gb(
     n_kv_heads: int | None,
     head_dim: int | None,
     num_ctx: int = DEFAULT_NUM_CTX,
-) -> float | None:
+) -> float:
     """Estimated memory (GB) to SERVE a model: weights + KV cache + runtime overhead.
-    Returns None when the architecture is unknown (no KV term can be computed) — the
-    caller then falls back to the legacy file-size estimate rather than guess."""
-    if not (n_layers and n_kv_heads and head_dim):
-        return None
-    kv = kv_cache_gb(n_layers=n_layers, n_kv_heads=n_kv_heads, head_dim=head_dim, num_ctx=num_ctx)
+    When the architecture is known → the precise KV term. When it's UNKNOWN (a gated
+    base model, or a present-but-unmenued model sized only from its file) → a
+    CONSERVATIVE proxy (KV ~= weights x _KV_PROXY_FRACTION) so it errs toward too_big,
+    never the old flat file x 1.2 that let a 7B model read 'fits' on a 5.44 GB Jetson.
+    Always returns an estimate (weights are always known)."""
+    if n_layers and n_kv_heads and head_dim:
+        kv = kv_cache_gb(
+            n_layers=n_layers, n_kv_heads=n_kv_heads, head_dim=head_dim, num_ctx=num_ctx
+        )
+    else:
+        kv = weights_gb * _KV_PROXY_FRACTION
     return round(weights_gb + kv + SERVE_OVERHEAD_GB, 2)
 
 

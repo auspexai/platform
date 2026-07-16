@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from auspexai_platform.auth.credential import Credential
 from auspexai_platform.db.repositories import WorkerRepository
 from auspexai_platform.hf_catalog import catalog_fetched_at, read_catalog
+from auspexai_platform.serve_memory import estimate_serve_gb
 from auspexai_platform.supported_models import supported_by_id
 from auspexai_platform.worker_status import heartbeat_cutoff
 
@@ -191,8 +192,18 @@ def build_router(
             if isinstance(sizes, dict):
                 for mid_s, b in sizes.items():
                     if isinstance(mid_s, str) and isinstance(b, (int, float)) and b > 0:
+                        # A present-but-unmenued model (e.g. mistral-7b on a worker's
+                        # disk) is sized by the SAME conservative serve estimate as the
+                        # catalog — weights + KV proxy + overhead — never the old flat
+                        # file x 1.2 that let a 7B read "fits" on a 5.44 GB Jetson.
                         reported_gb[mid_s] = max(
-                            reported_gb.get(mid_s, 0.0), (b / 1e9) * _LOAD_OVERHEAD
+                            reported_gb.get(mid_s, 0.0),
+                            estimate_serve_gb(
+                                weights_gb=b / 1e9,
+                                n_layers=None,
+                                n_kv_heads=None,
+                                head_dim=None,
+                            ),
                         )
 
         # UNION: everything on the fleet + the whole provisionable set (deduped).

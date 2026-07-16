@@ -59,9 +59,21 @@ def test_classification_matches_observed_jetson_outcomes():
         assert m <= _MAC_USABLE_GB
 
 
-def test_unknown_arch_returns_none_for_legacy_fallback():
-    assert estimate_serve_gb(weights_gb=2.0, n_layers=None, n_kv_heads=8, head_dim=128) is None
-    assert estimate_serve_gb(weights_gb=2.0, n_layers=32, n_kv_heads=None, head_dim=128) is None
+def test_unknown_arch_uses_conservative_proxy_not_none():
+    # No arch → a conservative estimate (weights + KV proxy + overhead), NEVER the old
+    # flat file x 1.2. 2.0 GB weights → 2.0 + 2.0*0.2 + 1.5 = 3.9 GB.
+    est = estimate_serve_gb(weights_gb=2.0, n_layers=None, n_kv_heads=8, head_dim=128)
+    assert est == 3.9
+    assert est > 2.0 * 1.2  # strictly more than the legacy footprint it replaces
+
+
+def test_mistral_7b_without_arch_reads_too_big_on_a_jetson():
+    # The user's case: mistral-7b (4.37 GB weights) is a gated base model → no arch →
+    # conservative proxy must exceed a 5.44 GB Jetson (it only ever served on the Mac),
+    # while still fitting the 22 GB Mac.
+    est = estimate_serve_gb(weights_gb=4.37, n_layers=None, n_kv_heads=None, head_dim=None)
+    assert est > 5.44  # too_big on a Jetson (was 4.37*1.2 = 5.24 → wrongly "fits")
+    assert est <= 22.0  # fits the Mac, where it actually ran
 
 
 def test_arch_from_config_reads_real_shapes():

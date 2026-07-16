@@ -113,10 +113,12 @@ def test_serve_estimate_computed_from_arch_and_survives_roundtrip(tmp_path: Path
     assert loaded.serve_ram_gb == m.serve_ram_gb
 
 
-def test_no_arch_leaves_serve_estimate_none_for_fallback() -> None:
-    # A browser with no arch (or a fetch miss) → serve_ram_gb None → verdict uses the
-    # legacy file-size footprint. Never blocks the catalog on a missing config.
-    repo = "bartowski/Qwen_Qwen3-1.7B-GGUF"
-    (m,) = fetch_catalog(FakeBrowser([repo], {repo: {"Q4_K_M": 1_280_000_000}}), limit=5)
-    assert m.serve_ram_gb is None
-    assert m.approx_ram_gb > 0  # the legacy footprint is still there
+def test_no_arch_uses_conservative_serve_estimate() -> None:
+    # A browser with no arch (or a fetch miss) → serve_ram_gb is a CONSERVATIVE estimate
+    # (weights + KV proxy + overhead), never None and never the flat file x 1.2. So a
+    # gated-base-model 7B still can't hide behind an optimistic footprint.
+    repo = "bartowski/Mistral-7B-Instruct-v0.3-GGUF"
+    (m,) = fetch_catalog(FakeBrowser([repo], {repo: {"Q4_K_M": 4_370_000_000}}), limit=5)
+    assert m.serve_ram_gb is not None
+    assert m.serve_ram_gb > m.approx_ram_gb  # conservative > file x 1.2
+    assert m.serve_ram_gb > 5.44  # too_big on a Jetson

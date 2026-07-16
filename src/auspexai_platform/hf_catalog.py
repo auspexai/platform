@@ -265,10 +265,10 @@ def fetch_catalog(browser: HfBrowser, *, limit: int = 60) -> list[CatalogModel]:
         if model_id in seen:
             continue
         seen.add(model_id)
-        # KV-aware serve estimate: fetch the arch (config.json) and account for the
-        # KV cache + runtime overhead the flat file-size multiplier ignored. Best-
-        # effort — any miss leaves serve_ram_gb None and the verdict uses approx_ram_gb.
-        serve_ram_gb: float | None = None
+        # KV-aware serve estimate: fetch the arch (config.json) for the precise KV
+        # term; a miss (gated base model, network error) yields None arch and a
+        # CONSERVATIVE proxy — never the flat file x 1.2 that let a 7B "fit" a Jetson.
+        n_layers = n_kv = head_dim = None
         _arch = getattr(browser, "arch", None)
         if callable(_arch):
             try:
@@ -277,12 +277,12 @@ def fetch_catalog(browser: HfBrowser, *, limit: int = 60) -> list[CatalogModel]:
                 cfg = None
             if isinstance(cfg, dict):
                 n_layers, n_kv, head_dim = arch_from_config(cfg)
-                serve_ram_gb = estimate_serve_gb(
-                    weights_gb=size_bytes / 1e9,
-                    n_layers=n_layers,
-                    n_kv_heads=n_kv,
-                    head_dim=head_dim,
-                )
+        serve_ram_gb = estimate_serve_gb(
+            weights_gb=size_bytes / 1e9,
+            n_layers=n_layers,
+            n_kv_heads=n_kv,
+            head_dim=head_dim,
+        )
         out.append(
             CatalogModel(
                 model_id=model_id,

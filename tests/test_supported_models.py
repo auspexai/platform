@@ -169,7 +169,9 @@ def test_present_unmenued_model_sized_from_worker_report_available(
         "my-byom-1b-q4"
     ]
     assert m["status"] == "available"  # sized from the worker report, fits, present
-    assert m["approx_ram_gb"] == round(1.0 * 1.2, 2)  # footprint surfaced (was None/unknown before)
+    # Footprint is the CONSERVATIVE serve estimate (weights + KV proxy + overhead),
+    # not the old flat file x 1.2: 1.0 + 1.0*0.2 + 1.5 = 2.7 GB (still fits 7.44).
+    assert m["approx_ram_gb"] == 2.7
 
 
 def test_present_unmenued_too_big_from_worker_report(
