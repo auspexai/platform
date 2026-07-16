@@ -16,15 +16,24 @@ GB = 1_000_000_000
 
 
 class FakeBrowser:
-    def __init__(self, repos: list[str], sizes: dict[str, dict[str, int]]) -> None:
+    def __init__(
+        self,
+        repos: list[str],
+        sizes: dict[str, dict[str, int]],
+        archs: dict[str, dict] | None = None,
+    ) -> None:
         self._repos = repos
         self._sizes = sizes
+        self._archs = archs or {}
 
     def search(self, *, limit: int) -> list[str]:
         return self._repos[:limit]
 
     def quant_sizes(self, repo: str) -> dict[str, int]:
         return self._sizes.get(repo, {})
+
+    def arch(self, repo: str) -> dict | None:
+        return self._archs.get(repo)
 
 
 def test_filters_publisher_and_noise() -> None:
@@ -83,3 +92,31 @@ def test_cache_roundtrip(tmp_path: Path) -> None:
 def test_read_missing_is_empty(tmp_path: Path) -> None:
     assert read_catalog(tmp_path / "nope.json") == []
     assert catalog_fetched_at(tmp_path / "nope.json") is None
+
+
+def test_serve_estimate_computed_from_arch_and_survives_roundtrip(tmp_path: Path) -> None:
+    # #2: with the arch (config.json), the footprint is the KV-aware serve estimate,
+    # NOT the flat file x 1.2. Phi-3.5-mini (MHA, big KV) → serve estimate well above
+    # its 2.39 GB weights, so the catalog stops under-sizing it.
+    repo = "bartowski/Phi-3.5-mini-instruct-GGUF"
+    sizes = {repo: {"Q4_K_M": 2_390_000_000}}
+    archs = {repo: {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 3072}}
+    (m,) = fetch_catalog(FakeBrowser([repo], sizes, archs), limit=5)
+    assert m.serve_ram_gb is not None
+    assert m.serve_ram_gb > m.approx_ram_gb  # KV-aware > file x 1.2 (2.87)
+    assert m.serve_ram_gb > 5.0  # ~5.5 GB — over a Jetson, as observed
+
+    # Round-trips through the cache JSON.
+    path = tmp_path / "catalog.json"
+    write_catalog(path, [m], fetched_at="2026-07-16T00:00:00Z")
+    (loaded,) = read_catalog(path)
+    assert loaded.serve_ram_gb == m.serve_ram_gb
+
+
+def test_no_arch_leaves_serve_estimate_none_for_fallback() -> None:
+    # A browser with no arch (or a fetch miss) → serve_ram_gb None → verdict uses the
+    # legacy file-size footprint. Never blocks the catalog on a missing config.
+    repo = "bartowski/Qwen_Qwen3-1.7B-GGUF"
+    (m,) = fetch_catalog(FakeBrowser([repo], {repo: {"Q4_K_M": 1_280_000_000}}), limit=5)
+    assert m.serve_ram_gb is None
+    assert m.approx_ram_gb > 0  # the legacy footprint is still there

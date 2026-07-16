@@ -211,7 +211,14 @@ def build_router(
             #  - `available` requires a worker that HOLDS it AND FITS it (serve-ready);
             #  - `runnable` = fits ≥1 worker but isn't staged there yet.
             # `fits_worker_count` is the repl-capacity signal (fits 1 ⇒ repl-1 only).
-            footprint = m.approx_ram_gb if m is not None else reported_gb.get(mid)
+            # Prefer the KV-aware serve estimate (weights + KV cache + runtime) over
+            # the legacy file-size x 1.2 — the KV term is what the flat multiplier
+            # missed when phi/qwen3 "fit" then OOM'd. Falls back when arch is unknown.
+            footprint = (
+                (getattr(m, "serve_ram_gb", None) or m.approx_ram_gb)
+                if m is not None
+                else reported_gb.get(mid)
+            )
             if footprint is None or not ram_known:
                 fits_n = 0
                 ready_n = 0
@@ -247,11 +254,9 @@ def build_router(
                     family=m.family if m else "",
                     param_b=m.param_b if m else None,
                     quant=m.quant if m else "",
-                    approx_ram_gb=(
-                        m.approx_ram_gb
-                        if m is not None
-                        else (round(footprint, 2) if footprint is not None else None)
-                    ),
+                    # Surface the RESOLVED footprint (the KV-aware serve estimate for
+                    # cataloged models) so the R-D page shows what a serve really needs.
+                    approx_ram_gb=(round(footprint, 2) if footprint is not None else None),
                     on_worker_count=on_n,
                     fits_worker_count=fits_n,
                     ram_known_workers=len(ram_known),

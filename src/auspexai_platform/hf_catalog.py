@@ -31,6 +31,8 @@ from typing import Protocol
 
 import httpx
 
+from auspexai_platform.serve_memory import arch_from_config, estimate_serve_gb
+
 logger = logging.getLogger(__name__)
 
 # RAM to serve a GGUF is approx the file size x this (KV cache + runtime).
@@ -89,8 +91,12 @@ class CatalogModel:
     family: str
     param_b: float | None
     quant: str
-    approx_ram_gb: float  # file size x overhead — measured from HF
+    approx_ram_gb: float  # LEGACY footprint: file size x flat 1.2 overhead
     hf_repo: str  # provenance: the source HF repo
+    # KV-aware serve estimate (weights + KV cache + runtime overhead), from the
+    # model's real architecture (config.json). The footprint the fit verdict PREFERS;
+    # None when the arch couldn't be fetched → falls back to approx_ram_gb.
+    serve_ram_gb: float | None = None
 
 
 def _parse_quant(filename: str) -> str:
@@ -141,6 +147,11 @@ class HfBrowser(Protocol):
         """`{quant: size_bytes}` for the repo's GGUF files (one per quant)."""
         ...
 
+    def arch(self, repo: str) -> dict | None:
+        """The model's config.json (architecture) for the KV-aware serve estimate,
+        or None. Optional — callers guard with getattr for fake browsers."""
+        ...
+
 
 class HfHttpBrowser:
     """Real browser over the public HuggingFace API (plain httpx, unauthenticated)."""
@@ -176,6 +187,39 @@ class HfHttpBrowser:
             # A quant split across shards would repeat; keep the largest sighting.
             out[quant] = max(out.get(quant, 0), size)
         return out
+
+    def arch(self, repo: str) -> dict | None:
+        """The model's config.json (num_hidden_layers / num_key_value_heads /
+        head_dim) for the KV-aware serve estimate. GGUF repos rarely ship config.json
+        themselves, so resolve via the repo's `base_model`; fall back to the repo
+        itself. Best-effort — any failure returns None and the catalog falls back to
+        the file-size estimate rather than guess."""
+        try:
+            r = httpx.get(
+                f"{_HF_API}/api/models/{repo}",
+                timeout=self._timeout,
+                headers={"User-Agent": "auspexai-coordinator"},
+            )
+            r.raise_for_status()
+            base = (r.json().get("cardData") or {}).get("base_model")
+            if isinstance(base, list):
+                base = base[0] if base else None
+            for src in (base, repo):
+                if not isinstance(src, str) or not src:
+                    continue
+                cr = httpx.get(
+                    f"{_HF_API}/{src}/resolve/main/config.json",
+                    timeout=self._timeout,
+                    headers={"User-Agent": "auspexai-coordinator"},
+                    follow_redirects=True,
+                )
+                if cr.status_code == 200:
+                    cfg = cr.json()
+                    if isinstance(cfg, dict):
+                        return cfg
+        except (httpx.HTTPError, ValueError, KeyError):
+            pass
+        return None
 
 
 def _pick_quant(sizes: dict[str, int]) -> tuple[str, int] | None:
@@ -221,6 +265,24 @@ def fetch_catalog(browser: HfBrowser, *, limit: int = 60) -> list[CatalogModel]:
         if model_id in seen:
             continue
         seen.add(model_id)
+        # KV-aware serve estimate: fetch the arch (config.json) and account for the
+        # KV cache + runtime overhead the flat file-size multiplier ignored. Best-
+        # effort — any miss leaves serve_ram_gb None and the verdict uses approx_ram_gb.
+        serve_ram_gb: float | None = None
+        _arch = getattr(browser, "arch", None)
+        if callable(_arch):
+            try:
+                cfg = _arch(repo)
+            except Exception:
+                cfg = None
+            if isinstance(cfg, dict):
+                n_layers, n_kv, head_dim = arch_from_config(cfg)
+                serve_ram_gb = estimate_serve_gb(
+                    weights_gb=size_bytes / 1e9,
+                    n_layers=n_layers,
+                    n_kv_heads=n_kv,
+                    head_dim=head_dim,
+                )
         out.append(
             CatalogModel(
                 model_id=model_id,
@@ -230,6 +292,7 @@ def fetch_catalog(browser: HfBrowser, *, limit: int = 60) -> list[CatalogModel]:
                 quant=quant,
                 approx_ram_gb=ram,
                 hf_repo=repo,
+                serve_ram_gb=serve_ram_gb,
             )
         )
     return out
@@ -270,6 +333,9 @@ def read_catalog(path: Path) -> list[CatalogModel]:
                     quant=m.get("quant", ""),
                     approx_ram_gb=float(m["approx_ram_gb"]),
                     hf_repo=m.get("hf_repo", ""),
+                    serve_ram_gb=(
+                        float(m["serve_ram_gb"]) if m.get("serve_ram_gb") is not None else None
+                    ),
                 )
             )
         except (KeyError, TypeError, ValueError):
