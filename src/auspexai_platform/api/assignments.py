@@ -1064,6 +1064,33 @@ def build_router(
                 },
             ) from exc
 
+        # #1 learn-from-failures: a GPU-OOM refusal (Layer-1 "insufficient GPU memory
+        # to serve <model>") is ground truth that this model does NOT fit a worker
+        # with this much CAPACITY. Record it (at the worker's static usable budget, the
+        # stable notion the catalog gates on) so the catalog stops labelling the model
+        # "fits" for boxes this size. Best-effort — never disturbs the refusal.
+        try:
+            _rl = (body.reason or "").lower()
+            if "insufficient gpu memory" in _rl or "out of memory" in _rl:
+                _exp = experiment_repository.get_by_id(experiment_id)
+                _models = (
+                    (getattr(_exp, "required_capabilities", None) or {}).get("models") or []
+                    if _exp
+                    else []
+                )
+                _caps = getattr(worker_repository.get_by_id(worker_id), "capabilities", None) or {}
+                _capacity = _caps.get("usable_memory_gb") or _caps.get("ram_total_gb")
+                if _models and isinstance(_capacity, (int, float)):
+                    from auspexai_platform.db.repositories.model_serve_failures import (
+                        ModelServeFailureRepository,
+                    )
+
+                    ModelServeFailureRepository(worker_repository.db).record_oom(
+                        _models[0], float(_capacity), now=datetime.now(UTC).isoformat()
+                    )
+        except Exception:
+            logger.debug("serve-OOM record failed (ignored)", exc_info=True)
+
         audit_repository.append(
             actor_class=CredentialClass.WORKER,
             actor_identifier=credential.pubkey_hex,

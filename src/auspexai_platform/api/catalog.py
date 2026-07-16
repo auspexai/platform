@@ -147,10 +147,12 @@ def build_router(
                         present[mid] = present.get(mid, 0) + 1
 
         def _ram(c: dict) -> float | None:
-            # The worker's usable SERVE budget (ram_total - OS/runtime headroom) is the
-            # honest fit threshold — gate on it, not raw ram_total, so the catalog says
-            # "fits" only where the worker will actually serve. Fall back to ram_total
-            # for pre-fleet-fit workers that don't report a usable budget yet.
+            # The catalog is a CAPACITY menu ("can this fleet run X at all"), so gate
+            # on the static usable SERVE budget (total - reserve), not the momentary
+            # live-available memory (which dips while a worker is mid-serve — that
+            # belongs to routing/serve-time, where headroom-right-now matters). Fall
+            # back to raw total for pre-fleet-fit workers. The observed-OOM override
+            # below is what makes this capacity honest about serve failures.
             for key in ("usable_memory_gb", "ram_total_gb"):
                 v = c.get(key)
                 if isinstance(v, (int, float)):
@@ -158,6 +160,15 @@ def build_router(
             return None
 
         ram_known = [r for c in caps if (r := _ram(c)) is not None]
+
+        # #1 observed-OOM ground truth: a model that demonstrably OOM'd on a worker
+        # with usable <= X cannot serve any worker at/below X, whatever the a-priori
+        # estimate said. Ground truth overrides the estimate.
+        from auspexai_platform.db.repositories.model_serve_failures import (
+            ModelServeFailureRepository,
+        )
+
+        oom_thresholds = ModelServeFailureRepository(worker_repository.db).oom_thresholds()
 
         # Provisionable set = the fresh HF poll if the cache is warm, else the
         # curated static seed (the timer never ran, or HF was unreachable).
@@ -206,14 +217,22 @@ def build_router(
                 ready_n = 0
                 st = "unknown"  # footprint unknown, or no worker reports RAM → can't confirm
             else:
-                fits_n = sum(1 for r in ram_known if r >= footprint)
+                # A worker fits the model iff its memory covers the footprint AND the
+                # model wasn't observed to OOM on a box that size (#1). `> oom_thr`,
+                # not `>=`: a worker no bigger than one that already OOM'd can't fit it.
+                oom_thr = oom_thresholds.get(mid)
+
+                def _worker_can_serve(r: float, _thr=oom_thr, _fp=footprint) -> bool:
+                    return r >= _fp and (_thr is None or r > _thr)
+
+                fits_n = sum(1 for r in ram_known if _worker_can_serve(r))
                 ready_n = sum(
                     1
                     for c in caps
                     if isinstance(c.get("models"), list)
                     and mid in c["models"]
                     and (r := _ram(c)) is not None
-                    and r >= footprint
+                    and _worker_can_serve(r)
                 )
                 if fits_n == 0:
                     st = "too_big"  # fits no worker's RAM, presence notwithstanding

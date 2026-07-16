@@ -116,6 +116,10 @@ CONTROL_DB_PERSISTENCE: dict[str, Persistence] = {
     "model_prestage": _reaped(
         "settle-prestage timer — abandon stale 'requested' + reap dead-worker rows; UNIQUE(model,worker)-bounded"
     ),
+    "model_serve_failures": _grows(
+        "observed serve-OOM ground truth (0061) — 1 upserted row per model_id (PRIMARY KEY), "
+        "bounded by #distinct-models the fleet has tried; a small permanent fit-hint record"
+    ),
 }
 
 # ── Per-job DB (jobs/<experiment_id>.db) ─────────────────────────────────────
