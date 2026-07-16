@@ -28,7 +28,9 @@ AUTHORIZATION_SCHEMA = "auspexai-publication-authorization/v0"
 
 
 class BenchmarkPublicationRequest(BaseModel):
-    reference_experiment_id: str
+    # None for a SELF-BASELINE entry — the run is scored against its own first-K
+    # rounds, so there is no reference experiment to attest.
+    reference_experiment_id: str | None = None
     peak_eu: float | None = None
     breadth: float | None = None
     byte_divergence_rate: float | None = None
@@ -113,7 +115,13 @@ def create_publications_router(
             )
         summary = body.model_dump()
         obs = _attestation_facts(experiment_id)
-        ref = _attestation_facts(body.reference_experiment_id)
+        # Self-baseline entries carry no reference experiment (reference_experiment_id
+        # is None) → no reference attestation to bind.
+        ref = (
+            _attestation_facts(body.reference_experiment_id)
+            if body.reference_experiment_id
+            else {"merkle_root": None, "rekor_uuid": None}
+        )
         block: dict[str, Any] = {
             "schema": AUTHORIZATION_SCHEMA,
             "action": "benchmark-publication",

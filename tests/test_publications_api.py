@@ -105,6 +105,52 @@ class TestAuthorizeBenchmarkPublication:
         assert len(pubs) == 1 and pubs[0]["kind"] == "benchmark"
         assert pubs[0]["summary"]["peak_eu"] == 6.67
 
+    def test_self_baseline_authorization_needs_no_reference(
+        self,
+        client,
+        approved_experiment,
+        experiment_repository,
+        account_repository,
+        tenant_repository,
+    ):
+        # A self-baseline entry has NO reference experiment — authorization must not
+        # require reference_experiment_id (it was a required str → the field being
+        # absent 422'd before). Publishing a self-baselined run's 0.0 score is valid.
+        privkey, binding, experiment, _mh = approved_experiment
+        _complete(experiment_repository, experiment.experiment_id)
+        from auspexai_platform.db.models import IdentityProvider, TrustTier
+
+        account_repository.create(
+            account_id="acct-self",
+            idp=IdentityProvider.GITHUB,
+            idp_sub="acct-self-sub",
+            trust_tier=TrustTier.T2_TRUSTED,
+        )
+        tenant_repository.set_account(experiment.tenant_id, "acct-self")
+        path = (
+            f"/api/v0/experiments/{experiment.experiment_id}"
+            "/actions/authorize-benchmark-publication"
+        )
+        r = _signed_post(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=path,
+            body={"peak_eu": 0.0, "breadth": 0.0, "byte_divergence_rate": 0.0},
+        )
+        assert r.status_code == 200, r.text
+        block = r.json()["authorization"]
+        assert block["standing_at_issue"] >= 1
+        # Recorded as a benchmark publication (so it also satisfies the DOI gate).
+        lr = _signed_get(
+            client,
+            privkey=privkey,
+            pubkey_hex=binding.pubkey_hex,
+            path=f"/api/v0/experiments/{experiment.experiment_id}/publications",
+        )
+        pubs = lr.json()["publications"]
+        assert len(pubs) == 1 and pubs[0]["kind"] == "benchmark"
+
     def test_not_completed_is_typed_409(self, client, approved_experiment):
         privkey, binding, experiment, _mh = approved_experiment
         r = _signed_post(
