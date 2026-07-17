@@ -1674,3 +1674,122 @@ def test_binpack_conserves_a_contended_worker_by_contention_not_size(
     assert held.get("only1") == exp1.experiment_id  # exp1 took its exclusive worker...
     assert held.get("only2") == exp2.experiment_id  # ...exp2 took its exclusive worker...
     assert "shared" not in held  # ...and the CONTENDED worker was conserved (left free)
+
+
+def test_reclaim_frees_a_scarce_worker_from_a_temporally_blocked_holder(
+    registered_tenant, db, per_job_factory, experiment_repository, manifest_repository
+):
+    """Regime-aware RECLAIM (design §4.3) — the late-arrival fix. gpt-oss (Mac-only) is
+    starved because qwen grabbed the Mac before gpt-oss's work registered. Since qwen stays
+    structurally viable without the Mac (it fits the two Jetsons ≥ its floor 2), the Mac is
+    reclaimed for gpt-oss; qwen re-queues and completes on the Jetsons later."""
+    from auspexai_platform.db.repositories import WorkerReservationRepository
+
+    _, binding = registered_tenant
+    fleet = [_rw("mac", 22.0), _rw("jet1", 5.44), _rw("jet2", 5.44)]
+    gemma = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "gemma",
+        "gemma",
+        2.0,
+        2,
+        2,
+    )
+    qwen = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "qwen",
+        "qwen",
+        2.0,
+        2,
+        2,
+    )
+    gptoss = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "gptoss",
+        "gptoss",
+        14.5,
+        1,
+        1,  # Mac-only
+    )
+    res = WorkerReservationRepository(db)
+    # Pre-existing late-arrival state: gemma on the Jetsons, qwen holding the Mac.
+    res.reserve("jet1", gemma.experiment_id, now="2026-07-17T00:00:00Z")
+    res.reserve("jet2", gemma.experiment_id, now="2026-07-17T00:00:00Z")
+    res.reserve("mac", qwen.experiment_id, now="2026-07-17T00:00:00Z")
+
+    Scheduler(
+        experiment_repository,
+        per_job_factory,
+        active_workers=lambda: fleet,
+        reservation_repository=res,
+    ).pick_for_worker(_rw("mac", 22.0))
+
+    held = dict(res.all())
+    assert held.get("mac") == gptoss.experiment_id  # reclaimed for the scarce run
+    assert held.get("jet1") == gemma.experiment_id  # gemma untouched
+    assert held.get("jet2") == gemma.experiment_id
+    assert qwen.experiment_id not in held.values()  # qwen re-queued (recovers on Jetsons)
+
+
+def test_reclaim_refuses_when_it_would_strand_the_holder_below_floor(
+    registered_tenant, db, per_job_factory, experiment_repository, manifest_repository
+):
+    """The safety gate: reclaim is REFUSED when the holder would drop below its structural
+    floor. Here qwen (floor 2) fits only the Mac + one Jetson; taking the Mac would leave it
+    just one eligible worker < floor 2 → genuine contention, so gpt-oss waits rather than
+    stranding qwen. (Contrast the previous test, where qwen had a full Jetson pair to fall
+    back on.)"""
+    from auspexai_platform.db.repositories import WorkerReservationRepository
+
+    _, binding = registered_tenant
+    fleet = [_rw("mac", 22.0), _rw("jet1", 5.44)]  # only ONE Jetson
+    qwen = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "qwen",
+        "qwen",
+        2.0,
+        2,
+        2,  # fits mac + jet1 (structural 2)
+    )
+    gptoss = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "gptoss",
+        "gptoss",
+        14.5,
+        1,
+        1,  # Mac-only
+    )
+    res = WorkerReservationRepository(db)
+    res.reserve("mac", qwen.experiment_id, now="2026-07-17T00:00:00Z")
+    res.reserve("jet1", qwen.experiment_id, now="2026-07-17T00:00:00Z")
+
+    Scheduler(
+        experiment_repository,
+        per_job_factory,
+        active_workers=lambda: fleet,
+        reservation_repository=res,
+    ).pick_for_worker(_rw("mac", 22.0))
+
+    held = dict(res.all())
+    assert held.get("mac") == qwen.experiment_id  # NOT reclaimed — would strand qwen
+    assert gptoss.experiment_id not in held.values()  # gpt-oss waits (genuine contention)

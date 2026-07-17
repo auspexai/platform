@@ -27,6 +27,13 @@ with no a-priori model knowledge:
      handed out when nothing scarcer needs it. Capacity is the gate: an experiment with
      no free fitting worker stays queued; the replication FLOOR governs completion (via
      the C14 regimes in settle_sweep), not admission.
+  4. RECLAIM — regime-aware bounded preemption (the late-arrival fix). A run still below
+     floor after admission may take a fitting worker W from a holder E, but ONLY when E
+     stays STRUCTURALLY VIABLE without W (>= floor(E) other fitting workers exist, so E
+     recovers elsewhere) AND E is structurally LESS scarce than the starved run. Safe by
+     construction and non-cyclic (a worker only moves toward the strictly-scarcer run). It
+     is the only case bin-packing can't reach — a scarce worker granted before the run
+     that uniquely needs it existed. Regimes untouched; only the reservation re-points.
 `pick_for_worker` then serves only the experiment that reserved the polling worker.
 Legacy first-fit-with-affinity remains when no reservation store is wired (tests).
 
@@ -841,6 +848,62 @@ class Scheduler:
             if not offerable(exp.experiment_id):
                 continue
             _grant(exp, int(getattr(exp, "replication_target", 1) or 1))
+
+        # 4. RECLAIM — regime-aware, bounded preemption; the late-arrival fix (design §4.3).
+        #    A run still below its floor after admission (its fitting workers are all held by
+        #    others) may take a fitting worker W from its current holder E, but ONLY when that
+        #    is SAFE by the ratified C14 regime model:
+        #      (a) E stays STRUCTURALLY VIABLE without W — E still has >= floor(E) OTHER
+        #          fitting workers on the fleet, so E is merely TEMPORALLY using W and will
+        #          recover elsewhere (regime-3 won't strand it — `eligible_capable_count`
+        #          excluding W, computed reconcile-locally over fleet_list); AND
+        #      (b) E is structurally LESS scarce (more fitting workers) than the starved run,
+        #          so a worker only ever moves TOWARD the run that needs it most.
+        #    (a)+(b) make it safe-by-construction and NON-CYCLIC: a strictly-scarcer run wins
+        #    a worker from one with more options, so the loser can never reclaim it back (it
+        #    isn't scarcer) — no ping-pong, no deadlock. This is the ONLY case bin-packing
+        #    (step 3) cannot reach: a scarce worker granted before the run that uniquely needs
+        #    it existed (the 3-second-late arrival). Regimes are untouched; only the
+        #    reservation is re-pointed. Reclaim to FLOOR (the minimum to make progress); the
+        #    rest toward target is left to opportunistic top-up.
+        def _structural(e) -> int:
+            return sum(1 for w in fleet_list if self._fits(w, e))
+
+        for exp in approved:
+            floor_exp = int(getattr(exp, "replication_floor", 1) or 1)
+            if counts.get(exp.experiment_id, 0) >= floor_exp:
+                continue  # not starved below floor
+            if not offerable(exp.experiment_id):
+                continue
+            exp_fit = [w for w in fleet_list if self._fits(w, exp)]
+            if not exp_fit:
+                continue  # structurally unrunnable — regime-3's job, not reclaim's
+            exp_scarcity = len(exp_fit)
+            held_now = dict(self._reservations.all())  # worker_id -> holder experiment_id
+            for w in exp_fit:
+                if counts.get(exp.experiment_id, 0) >= floor_exp:
+                    break
+                holder_id = held_now.get(w.worker_id)
+                if holder_id is None or holder_id == exp.experiment_id:
+                    continue  # free (step 3 would have taken it) or already ours
+                holder = self._experiments.get_by_id(holder_id)
+                if holder is None:
+                    continue
+                # (b) reclaim only from a holder with strictly MORE options than the starved run.
+                if _structural(holder) <= exp_scarcity:
+                    continue
+                # (a) holder must remain structurally viable WITHOUT w (>= its own floor).
+                holder_floor = int(getattr(holder, "replication_floor", 1) or 1)
+                holder_without_w = sum(
+                    1 for w2 in fleet_list if w2.worker_id != w.worker_id and self._fits(w2, holder)
+                )
+                if holder_without_w < holder_floor:
+                    continue
+                # Safe: re-point w from the holder to the starved run.
+                self._reservations.reserve(w.worker_id, exp.experiment_id, now=now)
+                held_now[w.worker_id] = exp.experiment_id
+                counts[exp.experiment_id] = counts.get(exp.experiment_id, 0) + 1
+                counts[holder_id] = counts.get(holder_id, 0) - 1
 
     def pick_for_worker(self, worker: Worker) -> SchedulerPick | None:
         """The next unit for `worker`, or None. With a reservation store: reconcile the
