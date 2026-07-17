@@ -45,6 +45,7 @@ from auspexai_platform.db.repositories.unit_consensus import (
     UnitConsensusRepository,
 )
 from auspexai_platform.db.repositories.work_units import WorkUnitRepository
+from auspexai_platform.db.repositories.worker_reservations import WorkerReservationRepository
 from auspexai_platform.db.repositories.workers import WorkerRepository
 
 __all__ = [
@@ -79,4 +80,5 @@ __all__ = [
     "UnitConsensusRepository",
     "WorkUnitRepository",
     "WorkerRepository",
+    "WorkerReservationRepository",
 ]

@@ -5,10 +5,27 @@ heartbeat; the scheduler returns at most one assignment per call (one
 unit at a time per worker for v0). No background loops, no push, no
 SSE — those are M8 concerns.
 
-Algorithm: **first-fit-with-capability filtering**. Walk approved
-experiments in registration order; for each, walk pending + in_progress
-work units in creation order; pick the first one this worker is
-eligible for and not already assigned to.
+Algorithm: **capacity-aware RESERVATION scheduling** (0062). A worker is reserved
+to at most one experiment at a time, so an admitted experiment runs UNINTERRUPTED
+on a stable worker set — no mid-run model reloads (which would confound a drift
+measurement) and no per-unit thrash when concurrent experiments demand more distinct
+models than the constrained fleet can hold. Experiments that can't be granted a
+worker QUEUE (approved, "queued" phase) until a reservation frees.
+
+Each poll `_reconcile`s the reservation set against the LIVE fleet, model-agnostic and
+with no a-priori model knowledge:
+  1. RELEASE stale — a reservation whose worker went inactive (pause / retire / no
+     heartbeat) or whose experiment ended, so a departed worker is never left pegged
+     to a maybe-finished run and stranded.
+  2. TOP UP — an admitted experiment left under its replication target (a worker left)
+     reserves a free replacement, so it CONTINUES on another worker rather than hangs.
+  3. ADMIT — approved experiments with no reservation reserve free FITTING workers,
+     MOST-CONSTRAINED first (a model that fits few workers reserves them before a
+     fits-everywhere one starves it), FIFO within equal scarcity, smallest-capacity
+     workers first. Capacity is the gate: an experiment with no free fitting worker
+     stays queued; the replication FLOOR governs completion, not admission.
+`pick_for_worker` then serves only the experiment that reserved the polling worker.
+Legacy first-fit-with-affinity remains when no reservation store is wired (tests).
 
 Eligibility:
   - Worker not retired (filtered upstream by CredentialResolver)
@@ -49,6 +66,7 @@ from auspexai_platform.db.models import (
     TrustTier,
     Worker,
     WorkUnit,
+    WorkUnitStatus,
 )
 from auspexai_platform.db.per_job import PerJobDatabaseFactory
 from auspexai_platform.db.repositories import (
@@ -545,9 +563,16 @@ class Scheduler:
         per_job_factory: PerJobDatabaseFactory,
         account_suspended_for_tenant: Callable[[str], bool] | None = None,
         active_workers: Callable[[], list[Worker]] | None = None,
+        reservation_repository=None,
     ):
         self._experiments = experiment_repository
         self._per_job_factory = per_job_factory
+        # Capacity-aware scheduling (reservation model): a worker↔experiment store so an
+        # admitted experiment runs UNINTERRUPTED on a stable worker set (no mid-run model
+        # reloads — which would confound a drift measurement, and no per-unit thrash) and
+        # contenders queue. Reconciled against the live fleet each poll. None ⇒ legacy
+        # first-fit-with-affinity (tests / no reservation store).
+        self._reservations = reservation_repository
         # Constraint-aware ordering: () -> the active fleet, so pick_for_worker offers
         # the SCARCEST-fit work first — a model that fits fewer workers wins the
         # workers that can run it, so a fits-everywhere model yields those scarce
@@ -609,102 +634,257 @@ class Scheduler:
 
         return sorted(experiments, key=lambda e: (_fit_count(e), _affinity(e)))
 
+    def _schedulable_fleet(self) -> list[Worker]:
+        """Active workers currently eligible to HOLD a reservation — heartbeating and
+        not paused / degraded / self-paused. A worker that drops out of this set has its
+        reservation released by `_reconcile` (never left pegged to a maybe-finished
+        run) and its experiment tops up onto a replacement."""
+        if self._active_workers is None:
+            return []
+        return [
+            w
+            for w in self._active_workers()
+            if w.paused_at is None and not worker_is_degraded(w) and not worker_is_self_paused(w)
+        ]
+
+    def _has_outstanding_work(self, experiment_id: str) -> bool:
+        """Any PENDING or IN_PROGRESS unit — the run is still ACTIVE (don't release its
+        reservations even between rounds)."""
+        per_job = self._per_job_factory.get(experiment_id)
+        if per_job is None:
+            return False
+        wr = WorkUnitRepository(per_job)
+        return bool(
+            wr.list_all(status=WorkUnitStatus.PENDING)
+            or wr.list_all(status=WorkUnitStatus.IN_PROGRESS)
+        )
+
+    def _has_offerable_work(self, experiment_id: str) -> bool:
+        """Work a NEW worker could actually take — a PENDING (unassigned) unit, or an
+        IN_PROGRESS unit still under its replication target. An experiment whose units
+        are all AT capacity needs no more workers, so don't reserve an idle one to it
+        (which would leave it idle while a needy run queues)."""
+        per_job = self._per_job_factory.get(experiment_id)
+        if per_job is None:
+            return False
+        wr = WorkUnitRepository(per_job)
+        if wr.list_all(status=WorkUnitStatus.PENDING):
+            return True
+        ar = AssignmentRepository(per_job)
+        return any(
+            ar.count_active_for_unit(u.unit_id) < u.replication_target
+            for u in wr.list_all(status=WorkUnitStatus.IN_PROGRESS)
+        )
+
+    def _worker_usable(self, worker: Worker) -> float:
+        caps = worker.capabilities
+        return float(caps.get("usable_memory_gb") or caps.get("ram_total_gb") or 1e9)
+
+    def _fits(self, worker: Worker, exp) -> bool:
+        return worker_satisfies(
+            worker,
+            exp.required_capabilities or {},
+            requires_real_execution=exp.requires_real_execution,
+            required_containment=exp.required_containment,
+        )
+
+    def _reconcile(self, polling: Worker | None = None) -> None:
+        """Keep the reservation set in sync with the LIVE fleet + experiment state.
+        Runs each poll. Three moves, in order:
+
+          1. RELEASE stale — a reservation whose worker went inactive (pause / retire /
+             no heartbeat) or whose experiment ended (terminal, or no outstanding work).
+             A paused/offline worker is never left pegged to a finished run.
+          2. TOP UP — an admitted experiment now UNDER its replication target (a worker
+             left) reserves a free FITTING replacement, so it CONTINUES rather than
+             hangs. Continuity beats new admission → runs before step 3.
+          3. ADMIT — an approved experiment with NO reservation reserves free fitting
+             workers, in fair (FIFO) order, ONLY IF the replication floor can be met
+             (never partial — a below-floor reservation just stalls). Smallest-capacity
+             workers first, so a scarce model keeps the big/scarce workers it needs.
+
+        No fleet view or reservation store ⇒ no-op (legacy path)."""
+        if self._reservations is None or self._active_workers is None:
+            return
+        active_by_id = {w.worker_id: w for w in self._schedulable_fleet()}
+        # A worker that is POLLING right now is demonstrably live — include it even if
+        # the roster's heartbeat-recency filter hasn't caught its latest beat yet, so it
+        # can be reserved on this very poll (it already passed the pause/degraded checks).
+        if polling is not None:
+            active_by_id[polling.worker_id] = polling
+
+        # 1. release stale
+        ended: set[str] = set()
+        for worker_id, exp_id in self._reservations.all():
+            if worker_id not in active_by_id or exp_id in ended:
+                self._reservations.release_worker(worker_id)
+                continue
+            exp = self._experiments.get_by_id(exp_id)
+            terminal = (
+                exp is None
+                or getattr(exp.status, "value", exp.status) != ExperimentStatus.APPROVED.value
+            )
+            if terminal or not self._has_outstanding_work(exp_id):
+                self._reservations.release_experiment(exp_id)
+                ended.add(exp_id)
+
+        # recompute the free pool + counts after releases
+        counts = self._reservations.counts_by_experiment()
+        reserved_ids = {wid for wid, _ in self._reservations.all()}
+        free = sorted(
+            (w for wid, w in active_by_id.items() if wid not in reserved_ids),
+            key=self._worker_usable,
+        )
+        approved = [
+            e
+            for e in self._experiments.list_all(status=ExperimentStatus.APPROVED)
+            if not (
+                self._account_suspended_for_tenant is not None
+                and self._account_suspended_for_tenant(e.tenant_id)
+            )
+            and self._has_outstanding_work(e.experiment_id)
+        ]
+        # Admit MOST-CONSTRAINED first (fewest fitting workers), FIFO as the tiebreak:
+        # a model that can run on only a few workers must reserve them before a
+        # fits-everywhere model grabs them (else the scarce model is starved — e.g. a
+        # Mac-only model losing the Mac to a model that also fits the Jetsons).
+        fleet_list = list(active_by_id.values())
+        approved.sort(
+            key=lambda e: (
+                sum(1 for w in fleet_list if self._fits(w, e)),
+                getattr(e, "submitted_at", "") or "",
+            )
+        )
+        now = datetime.now(UTC).isoformat()
+
+        def _grant(exp, need: int) -> None:
+            nonlocal free
+            grant = [w for w in free if self._fits(w, exp)][:need]
+            for w in grant:
+                self._reservations.reserve(w.worker_id, exp.experiment_id, now=now)
+            granted = {w.worker_id for w in grant}
+            free = [w for w in free if w.worker_id not in granted]
+
+        # 2. top up admitted runs (continuity before new admissions)
+        for exp in approved:
+            have = counts.get(exp.experiment_id, 0)
+            target = int(getattr(exp, "replication_target", 1) or 1)
+            if have > 0 and target - have > 0 and self._has_offerable_work(exp.experiment_id):
+                _grant(exp, target - have)
+
+        # 3. admit queued runs — reserve whatever fitting workers are free (up to
+        #    target). CAPACITY is the gate, not the floor: the floor governs COMPLETION
+        #    (regime-2 capacity-aware completion), not dispatch, so an admitted run makes
+        #    progress with what it has and tops up later. An experiment with no free
+        #    fitting worker grants 0 → stays queued (the fleet is fully committed); one
+        #    with no OFFERABLE unit (all at capacity) needs no worker.
+        for exp in approved:
+            if counts.get(exp.experiment_id, 0) > 0:
+                continue
+            if not self._has_offerable_work(exp.experiment_id):
+                continue
+            _grant(exp, int(getattr(exp, "replication_target", 1) or 1))
+
     def pick_for_worker(self, worker: Worker) -> SchedulerPick | None:
-        """Return the first eligible (experiment_id, work_unit) pair, or
-        None if no work is available for this worker."""
-        # M4: a paused worker is an operational pause — the scheduler offers it
-        # nothing until unpaused (distinct from quarantine, which 423s at the
-        # assignment route).
+        """The next unit for `worker`, or None. With a reservation store: reconcile the
+        fleet, then serve ONLY the experiment that reserved this worker (exclusive → no
+        mid-run reload); an unreserved worker idles until admitted. Without one: the
+        legacy first-fit-with-affinity walk."""
+        # A paused / thermally-degraded / self-paused worker is offered nothing.
         if worker.paused_at is not None:
             return None
-        # M5 (W-H increment 2): a worker reporting thermal-critical in its last
-        # heartbeat is degraded — its results would diverge from quorum (throttled
-        # host) and it just refused/aborted work locally. Route around it until it
-        # cools and reports OK again. Analogous to the pause/quarantine skips.
         if worker_is_degraded(worker):
             return None
-        # §2.1 #11: a volunteer self-paused worker is routed around too (owner's
-        # hold — resource-owner sovereignty). Distinct from the operator pause.
         if worker_is_self_paused(worker):
             return None
 
+        if self._reservations is not None:
+            self._reconcile(worker)
+            exp_id = self._reservations.experiment_for_worker(worker.worker_id)
+            if exp_id is None:
+                return None  # unreserved — fleet at capacity; idle until admitted
+            experiment = self._experiments.get_by_id(exp_id)
+            if (
+                experiment is None
+                or getattr(experiment.status, "value", experiment.status)
+                != ExperimentStatus.APPROVED.value
+            ):
+                self._reservations.release_worker(worker.worker_id)
+                return None
+            if (
+                self._account_suspended_for_tenant is not None
+                and self._account_suspended_for_tenant(experiment.tenant_id)
+            ):
+                return None
+            return self._pick_unit_from(experiment, worker)
+
+        # Legacy first-fit-with-affinity (no reservation store — tests).
         approved = self._experiments.list_all(status=ExperimentStatus.APPROVED)
         for experiment in self._order_for_worker(approved, worker):
-            # #30 (M1): skip the whole experiment when this worker lacks a model
-            # it requires (the requirement is experiment-level, derived from the
-            # manifest at submit). Empty requirement ⇒ satisfied (pre-M1 behavior).
-            if not worker_satisfies(
-                worker,
-                experiment.required_capabilities,
-                requires_real_execution=experiment.requires_real_execution,
-                required_containment=experiment.required_containment,
-            ):
-                continue
-            # F5: halt dispatch for a suspended account's experiments. Approval
-            # is not a forever-pass — if the accountability root is suspended,
-            # the network stops spending volunteer compute on its work until
-            # unsuspension (no experiment state change; resumes on unsuspend).
             if (
                 self._account_suspended_for_tenant is not None
                 and self._account_suspended_for_tenant(experiment.tenant_id)
             ):
                 continue
-            per_job_db = self._per_job_factory.get(experiment.experiment_id)
-            if per_job_db is None:
+            pick = self._pick_unit_from(experiment, worker)
+            if pick is not None:
+                return pick
+        return None
+
+    def _pick_unit_from(self, experiment, worker: Worker) -> SchedulerPick | None:
+        """The first eligible unit of `experiment` for `worker`, or None — capability +
+        capacity + re-offer eligibility. Reused by the reservation path (the worker's
+        reserved experiment) and the legacy walk."""
+        # #30 (M1): the worker must hold (or auto-acquire) the experiment's models.
+        if not worker_satisfies(
+            worker,
+            experiment.required_capabilities,
+            requires_real_execution=experiment.requires_real_execution,
+            required_containment=experiment.required_containment,
+        ):
+            return None
+        per_job_db = self._per_job_factory.get(experiment.experiment_id)
+        if per_job_db is None:
+            return None
+        work_units = WorkUnitRepository(per_job_db)
+        assignments = AssignmentRepository(per_job_db)
+        if (
+            experiment.max_concurrent_assignments is not None
+            and assignments.count_active_for_experiment() >= experiment.max_concurrent_assignments
+        ):
+            return None
+        candidates: list[WorkUnit] = []
+        candidates.extend(work_units.list_all(status=WorkUnitStatus.PENDING))
+        candidates.extend(work_units.list_all(status=WorkUnitStatus.IN_PROGRESS))
+        # Still pulling a required model? An active row on it is provisioning, not a
+        # lost offer — don't re-deliver (churn) while the multi-GB first-serve finishes.
+        worker_prov = worker_is_provisioning(
+            worker, (experiment.required_capabilities or {}).get("models") or []
+        )
+        for unit in candidates:
+            # M4-tail pin: a pinned unit is offered ONLY to its pinned worker.
+            if unit.pinned_worker_id is not None and unit.pinned_worker_id != worker.worker_id:
                 continue
-            work_units = WorkUnitRepository(per_job_db)
-            assignments = AssignmentRepository(per_job_db)
-
-            if experiment.max_concurrent_assignments is not None:
-                total_active = assignments.count_active_for_experiment()
-                if total_active >= experiment.max_concurrent_assignments:
-                    continue
-
-            from auspexai_platform.db.models import WorkUnitStatus
-
-            candidates: list[WorkUnit] = []
-            candidates.extend(work_units.list_all(status=WorkUnitStatus.PENDING))
-            candidates.extend(work_units.list_all(status=WorkUnitStatus.IN_PROGRESS))
-
-            # Is THIS worker still pulling a model this experiment requires? Then an
-            # existing active row on it is provisioning, not a lost offer — don't
-            # re-deliver (churn) while the multi-GB first-serve completes.
-            worker_prov = worker_is_provisioning(
-                worker, (experiment.required_capabilities or {}).get("models") or []
+            # §2.1 #8 (dispatch-retry): an active/terminal row blocks re-offer; a
+            # retryable refusal under the attempt cap stays eligible.
+            existing = assignments.get_for_unit_and_worker(unit.unit_id, worker.worker_id)
+            if existing is not None and not reoffer_eligible(
+                existing, worker_provisioning=worker_prov
+            ):
+                continue
+            # C16: a stale-ACTIVE re-offer already occupies its replication slot, so the
+            # capacity check applies only to NEW pairings and refused-row re-arms.
+            occupies_slot = existing is not None and existing.refused_at is None
+            if (
+                not occupies_slot
+                and assignments.count_active_for_unit(unit.unit_id) >= unit.replication_target
+            ):
+                continue
+            return SchedulerPick(
+                experiment_id=experiment.experiment_id,
+                tenant_id=experiment.tenant_id,
+                tenant_experiment_label=experiment.tenant_experiment_label,
+                manifest_hash=experiment.manifest_hash,
+                work_unit=unit,
             )
-
-            for unit in candidates:
-                # M4-tail pin / force-assign: a pinned unit is offered ONLY to
-                # its pinned worker (the maintainer override). Other workers skip
-                # it; the pinned worker takes it through the normal eligibility
-                # path below (replication-count, not tier — D9 Phase 4).
-                if unit.pinned_worker_id is not None and unit.pinned_worker_id != worker.worker_id:
-                    continue
-                # §2.1 #8 (dispatch-retry): an existing assignment row only
-                # blocks re-offer when it's active (still working / completed)
-                # or terminally/exhaustedly refused. A retryable refusal under
-                # the attempt cap stays eligible — the route reactivates the row.
-                existing = assignments.get_for_unit_and_worker(unit.unit_id, worker.worker_id)
-                if existing is not None and not reoffer_eligible(
-                    existing, worker_provisioning=worker_prov
-                ):
-                    continue
-                # C16: a stale-ACTIVE row (lost-delivery re-offer) already occupies
-                # its replication slot — re-delivering it attaches no new worker, so
-                # the capacity check applies only to NEW pairings and refused-row
-                # re-arms (a refused row's slot was released to other workers, and
-                # count_active excludes it — the check below still protects it).
-                occupies_slot = existing is not None and existing.refused_at is None
-                if (
-                    not occupies_slot
-                    and assignments.count_active_for_unit(unit.unit_id) >= unit.replication_target
-                ):
-                    continue
-                return SchedulerPick(
-                    experiment_id=experiment.experiment_id,
-                    tenant_id=experiment.tenant_id,
-                    tenant_experiment_label=experiment.tenant_experiment_label,
-                    manifest_hash=experiment.manifest_hash,
-                    work_unit=unit,
-                )
         return None

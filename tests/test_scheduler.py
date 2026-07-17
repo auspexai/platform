@@ -1384,3 +1384,226 @@ def test_worker_satisfies_ram_gate_applies_load_overhead():
     assert worker_satisfies(_w("jetson", 5.44), req) is False
     # The Mac's 22 GB usable clears the overhead-adjusted footprint.
     assert worker_satisfies(_w("mac", 22.0), req) is True
+
+
+# ---- 0062 capacity-aware reservation scheduling ----------------------------
+
+
+def _rw(wid, usable, served=None):
+    """A reservation-test worker with a declared usable-memory budget (for fit)."""
+    caps = {
+        "os": "linux",
+        "execute_tenant_code": "provisioned",
+        "usable_memory_gb": usable,
+        "auto_acquire": True,
+    }
+    if served is not None:
+        caps["served_models"] = served
+    return Worker(
+        worker_id=wid,
+        pubkey_hex="a" * 64,
+        trust_tier=TrustTier.T2_TRUSTED,
+        capabilities=caps,
+        registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+
+
+def _set_repl(db, exp_id, target, floor):
+    db.execute(
+        "UPDATE experiments SET replication_target = ?, replication_floor = ? WHERE experiment_id = ?",
+        (target, floor, exp_id),
+    )
+
+
+def _run_experiment(
+    db,
+    per_job_factory,
+    experiment_repository,
+    manifest_repository,
+    tenant_id,
+    label,
+    model,
+    ram,
+    target,
+    floor,
+    units=1,
+):
+    exp = _make_experiment(
+        manifest_repository=manifest_repository,
+        experiment_repository=experiment_repository,
+        tenant_id=tenant_id,
+        label=label,
+        required_capabilities={"models": [model], "model_ram_gb": {model: ram}},
+    )
+    _set_repl(db, exp.experiment_id, target, floor)
+    d = per_job_factory.get_or_create(exp.experiment_id)
+    WorkUnitRepository(d).submit_batch(
+        [{"unit_id": f"{label}-u{i}", "payload": {}} for i in range(units)],
+        replication_target=target,
+    )
+    return experiment_repository.get_by_id(exp.experiment_id)
+
+
+def test_reservation_admits_one_repl2_run_queues_the_other_runs_disjoint_concurrently(
+    registered_tenant, db, per_job_factory, experiment_repository, manifest_repository
+):
+    from auspexai_platform.db.repositories import WorkerReservationRepository
+
+    _, binding = registered_tenant
+    fleet = [_rw("mac", 22.0), _rw("jet1", 5.44), _rw("jet2", 5.44)]
+    gemma = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "gemma",
+        "gemma",
+        2.0,
+        2,
+        2,
+    )
+    qwen = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "qwen",
+        "qwen",
+        2.0,
+        2,
+        2,
+    )
+    gptoss = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "gptoss",
+        "gptoss",
+        14.5,
+        1,
+        1,
+    )  # Mac-only
+
+    res = WorkerReservationRepository(db)
+    sched = Scheduler(
+        experiment_repository,
+        per_job_factory,
+        active_workers=lambda: fleet,
+        reservation_repository=res,
+    )
+
+    sched.pick_for_worker(_rw("jet1", 5.44))  # first poll reconciles + admits
+    counts = res.counts_by_experiment()
+    # gemma (oldest) reserved BOTH Jetsons (smallest-fit first, leaving the Mac);
+    # gpt-oss reserved the Mac (disjoint) and runs concurrently; qwen QUEUES.
+    assert counts.get(gemma.experiment_id) == 2
+    assert counts.get(gptoss.experiment_id) == 1
+    assert qwen.experiment_id not in counts
+
+    # The Mac serves ONLY gpt-oss (exclusive reservation — no gemma/qwen displacement).
+    pick = sched.pick_for_worker(_rw("mac", 22.0))
+    assert pick is not None and pick.experiment_id == gptoss.experiment_id
+    # A Jetson serves gemma.
+    jp = sched.pick_for_worker(_rw("jet1", 5.44))
+    assert jp is not None and jp.experiment_id == gemma.experiment_id
+
+
+def test_reservation_releases_on_completion_and_admits_the_queued_run(
+    registered_tenant, db, per_job_factory, experiment_repository, manifest_repository
+):
+    from auspexai_platform.db.repositories import WorkerReservationRepository
+
+    _, binding = registered_tenant
+    fleet = [_rw("jet1", 5.44), _rw("jet2", 5.44)]
+    gemma = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "gemma",
+        "gemma",
+        2.0,
+        2,
+        2,
+    )
+    qwen = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "qwen",
+        "qwen",
+        2.0,
+        2,
+        2,
+    )
+    res = WorkerReservationRepository(db)
+    sched = Scheduler(
+        experiment_repository,
+        per_job_factory,
+        active_workers=lambda: fleet,
+        reservation_repository=res,
+    )
+
+    sched.pick_for_worker(_rw("jet1", 5.44))  # admits gemma (repl-2 on both Jetsons); qwen queues
+    assert res.counts_by_experiment().get(gemma.experiment_id) == 2
+    assert qwen.experiment_id not in res.counts_by_experiment()
+
+    # gemma's work finishes → its reservation releases → qwen is admitted on the freed Jetsons.
+    WorkUnitRepository(per_job_factory.get(gemma.experiment_id)).mark_cancelled("gemma-u0")
+    sched.pick_for_worker(_rw("jet1", 5.44))  # reconcile: release gemma, admit qwen
+    counts = res.counts_by_experiment()
+    assert gemma.experiment_id not in counts
+    assert counts.get(qwen.experiment_id) == 2
+
+
+def test_reservation_releases_a_departed_worker_and_tops_up_a_replacement(
+    registered_tenant, db, per_job_factory, experiment_repository, manifest_repository
+):
+    from auspexai_platform.db.repositories import WorkerReservationRepository
+
+    _, binding = registered_tenant
+    gemma = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "gemma",
+        "gemma",
+        2.0,
+        2,
+        2,
+    )
+    res = WorkerReservationRepository(db)
+
+    # gemma admitted on the two Jetsons.
+    full = [_rw("jet1", 5.44), _rw("jet2", 5.44), _rw("spare", 6.0)]
+    Scheduler(
+        experiment_repository,
+        per_job_factory,
+        active_workers=lambda: full,
+        reservation_repository=res,
+    ).pick_for_worker(_rw("jet1", 5.44))
+    held = {w for w, e in res.all() if e == gemma.experiment_id}
+    assert held == {"jet1", "jet2"}  # smallest-fit first; spare left free
+
+    # jet2 goes offline (drops from the schedulable fleet). Reconcile must release its
+    # stale reservation (not leave it pegged) AND top gemma up onto the free spare so
+    # the run continues rather than hangs.
+    churned = [_rw("jet1", 5.44), _rw("spare", 6.0)]  # jet2 gone
+    Scheduler(
+        experiment_repository,
+        per_job_factory,
+        active_workers=lambda: churned,
+        reservation_repository=res,
+    ).pick_for_worker(_rw("jet1", 5.44))
+    held = {w for w, e in res.all() if e == gemma.experiment_id}
+    assert "jet2" not in held
+    assert held == {"jet1", "spare"}  # departed worker released, replacement reserved

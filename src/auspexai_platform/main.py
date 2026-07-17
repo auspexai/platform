@@ -217,15 +217,21 @@ def create_app(
     account_key_registry = AccountKeyRegistry(account_repository)
     credential_resolver = CredentialResolver(tenant_registry, worker_registry, account_key_registry)
 
+    from auspexai_platform.db.repositories import WorkerReservationRepository
+
     scheduler = Scheduler(
         experiment_repository,
         per_job_factory,
         account_suspended_for_tenant=_account_suspended_for_tenant,
-        # Constraint-aware ordering: the schedulable fleet, so a fits-everywhere
-        # model yields scarce workers to models that can only run there.
+        # The schedulable fleet, so admission/reservation and scarcity ordering see
+        # only live, unpaused workers.
         active_workers=lambda: _schedulable_workforce(
             worker_repository.list_all(), now=datetime.now(UTC)
         ),
+        # Capacity-aware reservation scheduling (0062): admitted experiments run
+        # uninterrupted on a reserved worker set; contenders queue; reconciled each
+        # poll against the live fleet (join / pause / retire).
+        reservation_repository=WorkerReservationRepository(svc.db),
     )
     # M8: in-process live-event bus. SSE endpoints subscribe; lifecycle /
     # result-submission routes publish. Process-local (single-process coord).

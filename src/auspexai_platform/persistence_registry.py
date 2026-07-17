@@ -120,6 +120,11 @@ CONTROL_DB_PERSISTENCE: dict[str, Persistence] = {
         "observed serve-OOM ground truth (0061) — 1 upserted row per model_id (PRIMARY KEY), "
         "bounded by #distinct-models the fleet has tried; a small permanent fit-hint record"
     ),
+    "worker_reservations": _reaped(
+        "scheduler `_reconcile` DELETE-on-release (0062) — worker↔experiment reservations; "
+        "released when the worker goes inactive or the experiment ends; PK(worker_id)-bounded, "
+        "transient scheduling state that never accumulates"
+    ),
 }
 
 # ── Per-job DB (jobs/<experiment_id>.db) ─────────────────────────────────────

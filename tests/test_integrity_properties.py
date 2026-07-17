@@ -714,7 +714,10 @@ def test_legacy_submit_with_ambiguous_unit_lands_in_exactly_one_active_experimen
                 },
             )
             assert r.status_code == 201, r.text
-        # the worker acquires BOTH assignments (scheduler offers each once)
+        # Capacity-aware reservation scheduling binds a worker to ONE experiment at a
+        # time (no cross-experiment thrash), so it acquires the shared unit from exactly
+        # one of the two — the single-worker cross-experiment ambiguity can't even arise,
+        # and the legacy submit lands in that one experiment.
         picks = []
         for _ in range(4):
             r = w.signed(
@@ -726,9 +729,9 @@ def test_legacy_submit_with_ambiguous_unit_lands_in_exactly_one_active_experimen
             body = r.json()
             if body.get("work_unit"):
                 picks.append(body)
-            if len(picks) == 2:
+            if len(picks) == 1:
                 break
-        assert len(picks) == 2, f"expected both assignments offered, got {len(picks)}"
+        assert len(picks) == 1, f"reservation binds a worker to one experiment, got {len(picks)}"
         # legacy submit: NO assignment_id on the wire
         r = w.signed(
             "POST",
