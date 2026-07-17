@@ -19,11 +19,14 @@ with no a-priori model knowledge:
      to a maybe-finished run and stranded.
   2. TOP UP — an admitted experiment left under its replication target (a worker left)
      reserves a free replacement, so it CONTINUES on another worker rather than hangs.
-  3. ADMIT — approved experiments with no reservation reserve free FITTING workers,
-     MOST-CONSTRAINED first (a model that fits few workers reserves them before a
-     fits-everywhere one starves it), FIFO within equal scarcity, smallest-capacity
-     workers first. Capacity is the gate: an experiment with no free fitting worker
-     stays queued; the replication FLOOR governs completion, not admission.
+  3. ADMIT — approved experiments with no reservation reserve free FITTING workers.
+     Bin-packing: place the MOST STRUCTURALLY SCARCE experiment first (fewest fitting
+     workers; the reconcile-local form of capacity.eligible_capable_count), FIFO within
+     equal scarcity; and give each run its LEAST-CONTENDED fitting workers (fewest other
+     runs want them), smallest-capacity as the tiebreak — so a versatile worker is only
+     handed out when nothing scarcer needs it. Capacity is the gate: an experiment with
+     no free fitting worker stays queued; the replication FLOOR governs completion (via
+     the C14 regimes in settle_sweep), not admission.
 `pick_for_worker` then serves only the experiment that reserved the polling worker.
 Legacy first-fit-with-affinity remains when no reservation store is wired (tests).
 
@@ -779,10 +782,12 @@ class Scheduler:
             )
             and outstanding(e.experiment_id)
         ]
-        # Admit MOST-CONSTRAINED first (fewest fitting workers), FIFO as the tiebreak:
-        # a model that can run on only a few workers must reserve them before a
-        # fits-everywhere model grabs them (else the scarce model is starved — e.g. a
-        # Mac-only model losing the Mac to a model that also fits the Jetsons).
+        # Bin-packing, EXPERIMENT order: place the MOST STRUCTURALLY SCARCE run first —
+        # fewest fitting workers on the fleet, the reconcile-local form of
+        # capacity.eligible_capable_count — FIFO as the tiebreak. The hardest-to-place run
+        # reserves its workers before a fits-everywhere run can grab them (best-fit-
+        # decreasing; the anti-starvation direction). Floor/capacity is NOT gated here — the
+        # ratified C14 regimes (settle_sweep) own below-floor completion/pause.
         fleet_list = list(active_by_id.values())
         approved.sort(
             key=lambda e: (
@@ -792,9 +797,26 @@ class Scheduler:
         )
         now = datetime.now(UTC).isoformat()
 
+        def _contention(worker: Worker, exclude_id: str) -> int:
+            """Bin-packing signal: how many OTHER approved-with-work experiments could also
+            use `worker`. Granting a run its LEAST-contended fitting workers first keeps a
+            worker several runs need free for the one with the fewest options — the
+            model-agnostic way to conserve scarce/versatile workers (a fits-everywhere box
+            is given away only when nothing scarcer wants it)."""
+            return sum(
+                1 for e in approved if e.experiment_id != exclude_id and self._fits(worker, e)
+            )
+
         def _grant(exp, need: int) -> None:
             nonlocal free
-            grant = [w for w in free if self._fits(w, exp)][:need]
+            # Bin-packing, WORKER choice: least-contended first (conserve workers other runs
+            # need), smallest-capacity as the secondary conserve signal (keep big boxes for
+            # big models). Replaces the old bare smallest-first pick.
+            fitting = sorted(
+                (w for w in free if self._fits(w, exp)),
+                key=lambda w: (_contention(w, exp.experiment_id), self._worker_usable(w)),
+            )
+            grant = fitting[:need]
             for w in grant:
                 self._reservations.reserve(w.worker_id, exp.experiment_id, now=now)
             granted = {w.worker_id for w in grant}

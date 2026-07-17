@@ -1607,3 +1607,70 @@ def test_reservation_releases_a_departed_worker_and_tops_up_a_replacement(
     held = {w for w, e in res.all() if e == gemma.experiment_id}
     assert "jet2" not in held
     assert held == {"jet1", "spare"}  # departed worker released, replacement reserved
+
+
+def test_binpack_conserves_a_contended_worker_by_contention_not_size(
+    registered_tenant, db, per_job_factory, experiment_repository, manifest_repository
+):
+    """Bin-packing worker selection: a run is granted its LEAST-CONTENDED fitting worker,
+    so a worker several runs could use stays free for the one with fewer options — and the
+    signal is CONTENTION, not capacity. All three workers are the SAME size here; they
+    differ only in which models they hold, so a size-based (old smallest-first) pick could
+    not distinguish them. exp1 must take its own exclusive worker and leave the shared one
+    free rather than burning it."""
+    from auspexai_platform.db.repositories import WorkerReservationRepository
+
+    _, binding = registered_tenant
+
+    def _w(wid, models):
+        # equal capacity (20 GB), NO auto_acquire → fit is decided by held models
+        return Worker(
+            worker_id=wid,
+            pubkey_hex="a" * 64,
+            trust_tier=TrustTier.T2_TRUSTED,
+            capabilities={
+                "os": "linux",
+                "execute_tenant_code": "provisioned",
+                "usable_memory_gb": 20.0,
+                "models": models,
+            },
+            registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+
+    fleet = [_w("shared", ["m1", "m2"]), _w("only1", ["m1"]), _w("only2", ["m2"])]
+    exp1 = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "e1",
+        "m1",
+        2.0,
+        1,
+        1,
+    )
+    exp2 = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "e2",
+        "m2",
+        2.0,
+        1,
+        1,
+    )
+    res = WorkerReservationRepository(db)
+    Scheduler(
+        experiment_repository,
+        per_job_factory,
+        active_workers=lambda: fleet,
+        reservation_repository=res,
+    ).pick_for_worker(_w("only1", ["m1"]))
+
+    held = dict(res.all())
+    assert held.get("only1") == exp1.experiment_id  # exp1 took its exclusive worker...
+    assert held.get("only2") == exp2.experiment_id  # ...exp2 took its exclusive worker...
+    assert "shared" not in held  # ...and the CONTENDED worker was conserved (left free)
