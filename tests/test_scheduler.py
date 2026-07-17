@@ -1286,15 +1286,76 @@ def test_order_by_constraint_offers_scarcest_fit_first():
 
     # Registration order small→llama→qwen3 reorders to scarcest-first: the two
     # Mac-only models (fit 1) before the small fits-all one (fit 3). Ties keep
-    # registration order.
-    ordered = [e.experiment_id for e in sched._order_by_constraint([small, llama, qwen3])]
+    # registration order. A fresh poller (nothing loaded) → affinity is neutral, so
+    # this is pure scarcity ordering.
+    poller = _w("poller", 22.0)
+    ordered = [e.experiment_id for e in sched._order_for_worker([small, llama, qwen3], poller)]
     assert ordered == ["exp-llama", "exp-qwen3", "exp-small"]
 
     # No fleet ⇒ registration-order fallback (unchanged behavior).
     plain = Scheduler(None, None)
-    assert [e.experiment_id for e in plain._order_by_constraint([small, llama])] == [
+    assert [e.experiment_id for e in plain._order_for_worker([small, llama], poller)] == [
         "exp-small",
         "exp-llama",
+    ]
+
+
+def test_order_for_worker_prefers_the_already_loaded_model():
+    """Model affinity (concurrent-experiment thrash fix): two experiments whose models
+    fit the SAME workers (equal scarcity) are ordered so the one whose model the worker
+    ALREADY has loaded comes first — a constrained worker batches its loaded model
+    instead of reloading per unit. A fresh worker keeps FIFO; scarcity still wins across
+    different fit-counts (covered by the scarcest-fit test)."""
+    from auspexai_platform.scheduler import Scheduler
+
+    def _w(wid, served=None):
+        caps = {
+            "os": "linux",
+            "execute_tenant_code": "provisioned",
+            "usable_memory_gb": 5.44,
+            "auto_acquire": True,
+        }
+        if served is not None:
+            caps["served_models"] = served
+        return Worker(
+            worker_id=wid,
+            pubkey_hex="a" * 64,
+            trust_tier=TrustTier.T2_TRUSTED,
+            capabilities=caps,
+            registered_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+
+    fleet = [_w("jet1"), _w("jet2")]  # both models fit both Jetsons → equal constraint
+    sched = Scheduler(None, None, active_workers=lambda: fleet)
+
+    class _Exp:
+        def __init__(self, eid, model):
+            self.experiment_id = eid
+            self.required_capabilities = {"models": [model], "model_ram_gb": {model: 2.0}}
+            self.requires_real_execution = True
+            self.required_containment = "permissive"
+
+    gemma = _Exp("exp-gemma", "gemma")  # registered first
+    qwen3 = _Exp("exp-qwen3", "qwen3")
+
+    # A worker already serving qwen3 prefers qwen3 despite gemma's earlier registration.
+    assert [
+        e.experiment_id for e in sched._order_for_worker([gemma, qwen3], _w("j", ["qwen3"]))
+    ] == [
+        "exp-qwen3",
+        "exp-gemma",
+    ]
+    # A worker serving gemma prefers gemma.
+    assert [
+        e.experiment_id for e in sched._order_for_worker([gemma, qwen3], _w("j", ["gemma"]))
+    ] == [
+        "exp-gemma",
+        "exp-qwen3",
+    ]
+    # A fresh worker (nothing loaded) → FIFO, no affinity bias.
+    assert [e.experiment_id for e in sched._order_for_worker([gemma, qwen3], _w("j"))] == [
+        "exp-gemma",
+        "exp-qwen3",
     ]
 
 

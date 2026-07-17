@@ -562,17 +562,37 @@ class Scheduler:
         # researcher-surface 403. None ⇒ no cascade (legacy / tests).
         self._account_suspended_for_tenant = account_suspended_for_tenant
 
-    def _order_by_constraint(self, experiments: list) -> list:
-        """Order approved experiments MOST-CONSTRAINED-FIRST: the one whose model
-        fits the FEWEST active workers is offered first, so a polling worker takes
-        the scarcest-fit work it's eligible for. A fits-everywhere model then yields
-        its scarce-worker slots to a model that can only run there — no starvation,
-        and a worker still takes broad work when nothing constrained is pending (it
-        is never idle-reserved). Stable: equal-constraint experiments keep
-        registration (FIFO) order. Registration-order fallback when the fleet is
-        unknown or there's nothing to reorder."""
-        if self._active_workers is None or len(experiments) < 2:
+    def _order_for_worker(self, experiments: list, worker: Worker) -> list:
+        """Order approved experiments for THIS worker's next pick, by two keys:
+
+        1. **Scarcest-fit first** (anti-starvation): the model that fits the FEWEST
+           active workers is offered first, so a fits-everywhere model yields its
+           scarce-worker slots to one that can ONLY run there. (Unchanged.)
+        2. **Model affinity** (concurrent-experiment thrash fix): WITHIN equal
+           scarcity, prefer an experiment whose model this worker ALREADY has loaded
+           (`served_models`). A constrained worker (one model in memory at a time)
+           then batches a model's units before switching, so an expensive model
+           RELOAD is amortized over a run of units instead of paid PER UNIT when two
+           experiments target the same worker with different models. Without this the
+           scheduler interleaves them and the worker reloads every unit — the fleet
+           spends its time swapping weights, not generating. No researcher-side
+           serialization, and no starvation: a model's ready units are finite per
+           round, so a worker rotates to the other model once its loaded model runs
+           dry (the fleet ends up doing model-A's round, then model-B's round, …).
+
+        Registration (FIFO) order breaks remaining ties. Affinity is worker-local so
+        it applies even without a fleet view; scarcity needs the active fleet."""
+        if len(experiments) < 2:
             return experiments
+
+        served = set(worker.capabilities.get("served_models") or [])
+
+        def _affinity(exp) -> int:  # 0 = model already loaded HERE (prefer), else 1
+            required = set((exp.required_capabilities or {}).get("models") or [])
+            return 0 if (required & served) else 1
+
+        if self._active_workers is None:
+            return sorted(experiments, key=_affinity)  # affinity only (stable → FIFO tie)
         fleet = self._active_workers()
 
         def _fit_count(exp) -> int:
@@ -587,7 +607,7 @@ class Scheduler:
                 )
             )
 
-        return sorted(experiments, key=_fit_count)
+        return sorted(experiments, key=lambda e: (_fit_count(e), _affinity(e)))
 
     def pick_for_worker(self, worker: Worker) -> SchedulerPick | None:
         """Return the first eligible (experiment_id, work_unit) pair, or
@@ -609,7 +629,7 @@ class Scheduler:
             return None
 
         approved = self._experiments.list_all(status=ExperimentStatus.APPROVED)
-        for experiment in self._order_by_constraint(approved):
+        for experiment in self._order_for_worker(approved, worker):
             # #30 (M1): skip the whole experiment when this worker lacks a model
             # it requires (the requirement is experiment-level, derived from the
             # manifest at submit). Empty requirement ⇒ satisfied (pre-M1 behavior).
