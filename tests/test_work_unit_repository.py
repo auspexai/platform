@@ -45,6 +45,30 @@ def test_submit_batch_empty_returns_empty(work_unit_repository: WorkUnitReposito
     assert work_unit_repository.submit_batch([]) == []
 
 
+# ---- has_status (scheduler existence check) -------------------------------
+
+
+def test_has_status_existence_tracks_transitions(
+    work_unit_repository: WorkUnitRepository,
+) -> None:
+    """The scheduler's per-poll reconcile leans on `has_status` instead of
+    `list_all(status=...)`; it must answer existence exactly, without needing any
+    rows materialized, across status transitions."""
+    assert work_unit_repository.has_status(WorkUnitStatus.PENDING) is False
+    work_unit_repository.submit_batch([{"unit_id": "u1", "payload": {}}])
+    assert work_unit_repository.has_status(WorkUnitStatus.PENDING) is True
+    assert work_unit_repository.has_status(WorkUnitStatus.IN_PROGRESS) is False
+    # PENDING → IN_PROGRESS: pending existence flips off, in-progress flips on.
+    work_unit_repository.mark_in_progress("u1")
+    assert work_unit_repository.has_status(WorkUnitStatus.PENDING) is False
+    assert work_unit_repository.has_status(WorkUnitStatus.IN_PROGRESS) is True
+    # cancelled → neither active status remains (a run with no outstanding work).
+    work_unit_repository.mark_cancelled("u1")
+    assert work_unit_repository.has_status(WorkUnitStatus.PENDING) is False
+    assert work_unit_repository.has_status(WorkUnitStatus.IN_PROGRESS) is False
+    assert work_unit_repository.has_status(WorkUnitStatus.CANCELLED) is True
+
+
 def test_submit_batch_duplicate_in_one_call_rolls_back(
     work_unit_repository: WorkUnitRepository,
 ) -> None:

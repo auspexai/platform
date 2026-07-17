@@ -211,6 +211,16 @@ class WorkUnitRepository:
             )
         return [self._row_to_unit(r) for r in rows]
 
+    def has_status(self, status: WorkUnitStatus) -> bool:
+        """True iff ANY unit is in `status` — an existence check that stops at the
+        first matching row (via `work_units_status_idx`) and never materializes a
+        WorkUnit. The scheduler runs this per experiment on EVERY worker poll
+        (`_has_outstanding_work` / `_has_offerable_work`); `list_all(status=...)`
+        there would fetch + build every row of a big experiment just to test
+        non-emptiness."""
+        rows = self.db.execute("SELECT 1 FROM work_units WHERE status = ? LIMIT 1", (status.value,))
+        return bool(rows)
+
     def latest_completion_at(self) -> str | None:
         """ISO timestamp of the most recent unit completion, or None. Cheap
         cadence signal: distinguishes a round-based driver BETWEEN rounds

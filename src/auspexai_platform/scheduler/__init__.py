@@ -52,6 +52,7 @@ thin slice that makes BYOM routing real.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -586,6 +587,16 @@ class Scheduler:
         # suspended account's work) — the dispatch-side complement to the
         # researcher-surface 403. None ⇒ no cascade (legacy / tests).
         self._account_suspended_for_tenant = account_suspended_for_tenant
+        # Reconcile is a critical section: it reads the reservation set and then
+        # WRITES it (release / reserve). Two overlapping reconciles could both see a
+        # worker free and reserve it to different experiments (last-write-wins → one
+        # experiment silently loses a worker; churn until the next reconcile heals it).
+        # Today the assignment route is `async def`, so `pick_for_worker` runs inline
+        # on the single event-loop thread and reconciles never actually overlap — this
+        # lock makes that invariant explicit and holds it if the coordinator ever grows
+        # a sync/threadpool handler or a background reconcile. Uncontended in the
+        # single-threaded case (and in tests), so it is free insurance.
+        self._reconcile_lock = threading.Lock()
 
     def _order_for_worker(self, experiments: list, worker: Worker) -> list:
         """Order approved experiments for THIS worker's next pick, by two keys:
@@ -649,26 +660,27 @@ class Scheduler:
 
     def _has_outstanding_work(self, experiment_id: str) -> bool:
         """Any PENDING or IN_PROGRESS unit — the run is still ACTIVE (don't release its
-        reservations even between rounds)."""
+        reservations even between rounds). Existence-only (`has_status`, index-backed,
+        short-circuited) — never materializes a big experiment's unit rows just to test
+        non-emptiness, since this runs per experiment on every poll."""
         per_job = self._per_job_factory.get(experiment_id)
         if per_job is None:
             return False
         wr = WorkUnitRepository(per_job)
-        return bool(
-            wr.list_all(status=WorkUnitStatus.PENDING)
-            or wr.list_all(status=WorkUnitStatus.IN_PROGRESS)
-        )
+        return wr.has_status(WorkUnitStatus.PENDING) or wr.has_status(WorkUnitStatus.IN_PROGRESS)
 
     def _has_offerable_work(self, experiment_id: str) -> bool:
         """Work a NEW worker could actually take — a PENDING (unassigned) unit, or an
         IN_PROGRESS unit still under its replication target. An experiment whose units
         are all AT capacity needs no more workers, so don't reserve an idle one to it
-        (which would leave it idle while a needy run queues)."""
+        (which would leave it idle while a needy run queues). The common PENDING case is
+        an index-backed existence check; only the no-pending case walks the (few)
+        in-progress units, short-circuiting on the first under-target one."""
         per_job = self._per_job_factory.get(experiment_id)
         if per_job is None:
             return False
         wr = WorkUnitRepository(per_job)
-        if wr.list_all(status=WorkUnitStatus.PENDING):
+        if wr.has_status(WorkUnitStatus.PENDING):
             return True
         ar = AssignmentRepository(per_job)
         return any(
@@ -703,9 +715,32 @@ class Scheduler:
              (never partial — a below-floor reservation just stalls). Smallest-capacity
              workers first, so a scarce model keeps the big/scarce workers it needs.
 
-        No fleet view or reservation store ⇒ no-op (legacy path)."""
+        No fleet view or reservation store ⇒ no-op (legacy path). Runs under
+        `_reconcile_lock` so its release→reserve writes are atomic against a
+        concurrent poll."""
         if self._reservations is None or self._active_workers is None:
             return
+        with self._reconcile_lock:
+            self._reconcile_locked(polling)
+
+    def _reconcile_locked(self, polling: Worker | None = None) -> None:
+        # Per-pass memo: an experiment's work-state cannot change within one (locked)
+        # reconcile, yet the release loop, the approved filter, and the top-up/admit
+        # loops all consult it — so each experiment's outstanding/offerable check hits
+        # the per-job DB at most once per poll instead of three-plus times.
+        _outstanding: dict[str, bool] = {}
+        _offerable: dict[str, bool] = {}
+
+        def outstanding(eid: str) -> bool:
+            if eid not in _outstanding:
+                _outstanding[eid] = self._has_outstanding_work(eid)
+            return _outstanding[eid]
+
+        def offerable(eid: str) -> bool:
+            if eid not in _offerable:
+                _offerable[eid] = self._has_offerable_work(eid)
+            return _offerable[eid]
+
         active_by_id = {w.worker_id: w for w in self._schedulable_fleet()}
         # A worker that is POLLING right now is demonstrably live — include it even if
         # the roster's heartbeat-recency filter hasn't caught its latest beat yet, so it
@@ -724,7 +759,7 @@ class Scheduler:
                 exp is None
                 or getattr(exp.status, "value", exp.status) != ExperimentStatus.APPROVED.value
             )
-            if terminal or not self._has_outstanding_work(exp_id):
+            if terminal or not outstanding(exp_id):
                 self._reservations.release_experiment(exp_id)
                 ended.add(exp_id)
 
@@ -742,7 +777,7 @@ class Scheduler:
                 self._account_suspended_for_tenant is not None
                 and self._account_suspended_for_tenant(e.tenant_id)
             )
-            and self._has_outstanding_work(e.experiment_id)
+            and outstanding(e.experiment_id)
         ]
         # Admit MOST-CONSTRAINED first (fewest fitting workers), FIFO as the tiebreak:
         # a model that can run on only a few workers must reserve them before a
@@ -769,7 +804,7 @@ class Scheduler:
         for exp in approved:
             have = counts.get(exp.experiment_id, 0)
             target = int(getattr(exp, "replication_target", 1) or 1)
-            if have > 0 and target - have > 0 and self._has_offerable_work(exp.experiment_id):
+            if have > 0 and target - have > 0 and offerable(exp.experiment_id):
                 _grant(exp, target - have)
 
         # 3. admit queued runs — reserve whatever fitting workers are free (up to
@@ -781,7 +816,7 @@ class Scheduler:
         for exp in approved:
             if counts.get(exp.experiment_id, 0) > 0:
                 continue
-            if not self._has_offerable_work(exp.experiment_id):
+            if not offerable(exp.experiment_id):
                 continue
             _grant(exp, int(getattr(exp, "replication_target", 1) or 1))
 
