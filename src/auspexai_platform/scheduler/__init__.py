@@ -575,9 +575,15 @@ class Scheduler:
         account_suspended_for_tenant: Callable[[str], bool] | None = None,
         active_workers: Callable[[], list[Worker]] | None = None,
         reservation_repository=None,
+        oom_thresholds: Callable[[], dict[str, float]] | None = None,
     ):
         self._experiments = experiment_repository
         self._per_job_factory = per_job_factory
+        # Observed-OOM ground truth: () -> {model_id: largest usable-GB seen to OOM}. Routing
+        # excludes a worker at/below a model's OOM threshold (the same override the catalog
+        # applies), so an OOM-prone model is never offered to a too-small worker. None ⇒ no
+        # override (legacy / tests).
+        self._oom_thresholds = oom_thresholds
         # Capacity-aware scheduling (reservation model): a worker↔experiment store so an
         # admitted experiment runs UNINTERRUPTED on a stable worker set (no mid-run model
         # reloads — which would confound a drift measurement, and no per-unit thrash) and
@@ -733,14 +739,44 @@ class Scheduler:
                 changed = True
         return {**caps, "model_ram_gb": ram} if changed else caps
 
-    def _fits(self, worker: Worker, exp, fleet_fp: dict[str, float] | None = None) -> bool:
+    def _oom(self) -> dict[str, float]:
+        """Observed-OOM ground truth {model_id: largest usable-GB seen to OOM}. A worker with
+        usable <= this can't SERVE the model, whatever the estimate said — the same override
+        the availability catalog applies (`ModelServeFailureRepository.oom_thresholds`). Empty
+        when not wired (legacy / tests)."""
+        return self._oom_thresholds() if self._oom_thresholds is not None else {}
+
+    def _fits(
+        self,
+        worker: Worker,
+        exp,
+        fleet_fp: dict[str, float] | None = None,
+        oom: dict[str, float] | None = None,
+    ) -> bool:
         caps = self._fit_caps(exp, fleet_fp) if fleet_fp else (exp.required_capabilities or {})
-        return worker_satisfies(
+        if not worker_satisfies(
             worker,
             caps,
             requires_real_execution=exp.requires_real_execution,
             required_containment=exp.required_containment,
-        )
+        ):
+            return False
+        # Observed-OOM ground truth — the OTHER half of the availability verdict: a model that
+        # demonstrably OOM'd on a worker with usable <= X can't serve ANY worker at/below X,
+        # whatever the a-priori footprint said. `wram <= thr` matches the catalog's `r > thr`
+        # (a worker no bigger than one that already OOM'd can't fit it). Without this, routing
+        # keeps offering an OOM-prone model to a too-small worker (qwen3-1.7b on a 4.4 GB
+        # Jetson → serve-refuse loop + starving the run that WAS there).
+        if oom:
+            wram = worker.capabilities.get("usable_memory_gb")
+            if not isinstance(wram, (int, float)):
+                wram = worker.capabilities.get("ram_total_gb")
+            if isinstance(wram, (int, float)):
+                for mid in caps.get("models") or []:
+                    thr = oom.get(mid)
+                    if thr is not None and wram <= thr:
+                        return False
+        return True
 
     def _reconcile(self, polling: Worker | None = None) -> None:
         """Keep the reservation set in sync with the LIVE fleet + experiment state.
@@ -789,10 +825,13 @@ class Scheduler:
         # can be reserved on this very poll (it already passed the pause/degraded checks).
         if polling is not None:
             active_by_id[polling.worker_id] = polling
-        # Fleet-authoritative model footprints — so every fit/scarcity/reclaim decision
-        # below sizes a model from what the fleet actually holds, not the (possibly-missed)
-        # submit-time number. Computed once per reconcile; passed to every self._fits.
+        # Fleet-authoritative model footprints + observed-OOM ground truth — so every
+        # fit/scarcity/reclaim decision below sizes a model from what the fleet actually holds
+        # AND excludes a worker a model has demonstrably OOM'd on, not the (possibly-missed,
+        # possibly-optimistic) submit-time number. Computed once per reconcile; passed to every
+        # self._fits.
         fleet_fp = self._fleet_model_footprints()
+        oom = self._oom()
 
         # 1. release stale
         ended: set[str] = set()
@@ -808,6 +847,13 @@ class Scheduler:
             if terminal or not outstanding(exp_id):
                 self._reservations.release_experiment(exp_id)
                 ended.add(exp_id)
+                continue
+            # The worker can no longer SERVE this experiment — e.g. an observed OOM (or a
+            # newly-known fleet footprint) just made the model too-big for it. A held-but-
+            # unservable reservation would idle the worker (`_pick_unit_from` returns None)
+            # AND keep it from a run it CAN serve. Release it so it re-enters the free pool.
+            if not self._fits(active_by_id[worker_id], exp, fleet_fp, oom):
+                self._reservations.release_worker(worker_id)
 
         # recompute the free pool + counts after releases
         counts = self._reservations.counts_by_experiment()
@@ -834,7 +880,7 @@ class Scheduler:
         fleet_list = list(active_by_id.values())
         approved.sort(
             key=lambda e: (
-                sum(1 for w in fleet_list if self._fits(w, e, fleet_fp)),
+                sum(1 for w in fleet_list if self._fits(w, e, fleet_fp, oom)),
                 getattr(e, "submitted_at", "") or "",
             )
         )
@@ -849,7 +895,7 @@ class Scheduler:
             return sum(
                 1
                 for e in approved
-                if e.experiment_id != exclude_id and self._fits(worker, e, fleet_fp)
+                if e.experiment_id != exclude_id and self._fits(worker, e, fleet_fp, oom)
             )
 
         def _grant(exp, need: int) -> None:
@@ -858,7 +904,7 @@ class Scheduler:
             # need), smallest-capacity as the secondary conserve signal (keep big boxes for
             # big models). Replaces the old bare smallest-first pick.
             fitting = sorted(
-                (w for w in free if self._fits(w, exp, fleet_fp)),
+                (w for w in free if self._fits(w, exp, fleet_fp, oom)),
                 key=lambda w: (_contention(w, exp.experiment_id), self._worker_usable(w)),
             )
             grant = fitting[:need]
@@ -905,7 +951,7 @@ class Scheduler:
         #    reservation is re-pointed. Reclaim to FLOOR (the minimum to make progress); the
         #    rest toward target is left to opportunistic top-up.
         def _structural(e) -> int:
-            return sum(1 for w in fleet_list if self._fits(w, e, fleet_fp))
+            return sum(1 for w in fleet_list if self._fits(w, e, fleet_fp, oom))
 
         for exp in approved:
             floor_exp = int(getattr(exp, "replication_floor", 1) or 1)
@@ -913,7 +959,7 @@ class Scheduler:
                 continue  # not starved below floor
             if not offerable(exp.experiment_id):
                 continue
-            exp_fit = [w for w in fleet_list if self._fits(w, exp, fleet_fp)]
+            exp_fit = [w for w in fleet_list if self._fits(w, exp, fleet_fp, oom)]
             if not exp_fit:
                 continue  # structurally unrunnable — regime-3's job, not reclaim's
             exp_scarcity = len(exp_fit)
@@ -935,7 +981,7 @@ class Scheduler:
                 holder_without_w = sum(
                     1
                     for w2 in fleet_list
-                    if w2.worker_id != w.worker_id and self._fits(w2, holder, fleet_fp)
+                    if w2.worker_id != w.worker_id and self._fits(w2, holder, fleet_fp, oom)
                 )
                 if holder_without_w < holder_floor:
                     continue
@@ -998,7 +1044,7 @@ class Scheduler:
         # #30 (M1): the worker must hold (or auto-acquire) the experiment's models — sized
         # against the fleet-authoritative footprint (same as routing), so a worker too small
         # to SERVE the model is never actually assigned it even if it holds the file on disk.
-        if not self._fits(worker, experiment, self._fleet_model_footprints()):
+        if not self._fits(worker, experiment, self._fleet_model_footprints(), self._oom()):
             return None
         per_job_db = self._per_job_factory.get(experiment.experiment_id)
         if per_job_db is None:

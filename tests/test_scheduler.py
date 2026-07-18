@@ -1829,3 +1829,67 @@ def test_fleet_footprint_sizes_a_submit_unsized_model_and_excludes_small_workers
     assert sched._fits(jet, exp, fp) is False
     # Without it (the old fall-open the router used to have), the Jetson would false-fit:
     assert sched._fits(jet, exp) is True
+
+
+def test_observed_oom_excludes_a_worker_the_model_demonstrably_oomd_on(
+    registered_tenant, db, per_job_factory, experiment_repository, manifest_repository
+):
+    """Observed-OOM ground truth in routing (matches the availability catalog): a model that
+    demonstrably OOM'd on a worker with usable <= X is excluded from every worker at/below X,
+    even though its ESTIMATE says it fits. This is what stops routing from re-offering
+    qwen3-1.7b to a 4.4 GB Jetson (serve-refuse loop + starving the run that was there)."""
+    _, binding = registered_tenant
+    # Small model whose ESTIMATE fits a 4.4 GB Jetson (3.25 GB) but which observably OOM'd
+    # there — ground truth beats the estimate.
+    exp = _make_experiment(
+        manifest_repository=manifest_repository,
+        experiment_repository=experiment_repository,
+        tenant_id=binding.tenant_id,
+        label="oomy",
+        required_capabilities={"models": ["oomy"], "model_ram_gb": {"oomy": 3.25}},
+    )
+    jet = _rw("jet", 4.44)
+    mac = _rw("mac", 21.0)
+    oom = {"oomy": 4.44}  # largest usable-GB observed to OOM (the mayhem case)
+
+    # Estimate alone (no oom): the Jetson fits (3.25 * overhead < 4.44).
+    s = Scheduler(experiment_repository, per_job_factory, active_workers=lambda: [jet, mac])
+    assert s._fits(jet, exp, None, None) is True  # estimate-only: false-fits
+    # With observed-OOM: the Jetson (usable <= 4.44) is excluded; the Mac (21 > 4.44) still fits.
+    assert s._fits(jet, exp, None, oom) is False
+    assert s._fits(mac, exp, None, oom) is True
+
+
+def test_reconcile_releases_a_reservation_the_worker_can_no_longer_serve(
+    registered_tenant, db, per_job_factory, experiment_repository, manifest_repository
+):
+    """Release-stale also drops a held reservation whose worker can no longer SERVE the model
+    (an observed OOM just made it too-big). Otherwise the worker would idle pegged to
+    unservable work (`_pick_unit_from` → None) AND stay unavailable to a run it CAN serve —
+    the live gemma-stall: the Jetsons stuck reserved to an OOMing qwen."""
+    from auspexai_platform.db.repositories import WorkerReservationRepository
+
+    _, binding = registered_tenant
+    qwen = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "qwen",
+        "qwen",
+        3.25,
+        2,
+        2,  # estimate fits a 4.44 GB Jetson...
+    )
+    res = WorkerReservationRepository(db)
+    res.reserve("jet", qwen.experiment_id, now="2026-07-18T00:00:00Z")  # ...and it's reserved there
+    Scheduler(
+        experiment_repository,
+        per_job_factory,
+        active_workers=lambda: [_rw("jet", 4.44)],
+        reservation_repository=res,
+        oom_thresholds=lambda: {"qwen": 4.44},  # ...but qwen OOM'd at 4.44
+    ).pick_for_worker(_rw("jet", 4.44))
+
+    assert qwen.experiment_id not in dict(res.all()).values()  # released — jet can't serve qwen

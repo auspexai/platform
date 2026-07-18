@@ -218,6 +218,9 @@ def create_app(
     credential_resolver = CredentialResolver(tenant_registry, worker_registry, account_key_registry)
 
     from auspexai_platform.db.repositories import WorkerReservationRepository
+    from auspexai_platform.db.repositories.model_serve_failures import (
+        ModelServeFailureRepository,
+    )
 
     scheduler = Scheduler(
         experiment_repository,
@@ -232,6 +235,10 @@ def create_app(
         # uninterrupted on a reserved worker set; contenders queue; reconciled each
         # poll against the live fleet (join / pause / retire).
         reservation_repository=WorkerReservationRepository(svc.db),
+        # Observed-OOM ground truth: routing excludes a worker at/below a model's
+        # demonstrated OOM threshold — the same override the availability catalog applies,
+        # so routing never keeps offering an OOM-prone model to a too-small worker.
+        oom_thresholds=lambda: ModelServeFailureRepository(svc.db).oom_thresholds(),
     )
     # M8: in-process live-event bus. SSE endpoints subscribe; lifecycle /
     # result-submission routes publish. Process-local (single-process coord).
