@@ -1893,3 +1893,40 @@ def test_reconcile_releases_a_reservation_the_worker_can_no_longer_serve(
     ).pick_for_worker(_rw("jet", 4.44))
 
     assert qwen.experiment_id not in dict(res.all()).values()  # released — jet can't serve qwen
+
+
+def test_oom_aware_placement_prefers_the_reliable_worker(
+    registered_tenant, db, per_job_factory, experiment_repository, manifest_repository
+):
+    """Soft OOM-aware placement: a model that recently OOM'd on the 4.44 GB Jetsons (but isn't
+    benched — below the runway) is placed on the reliable Mac plus ONE Jetson, not on both
+    flaky Jetsons — so the idle big box is used and the run's OOM exposure is halved. The
+    Jetsons still FIT (recent_oom_sizes is a preference, not the hard oom_thresholds gate)."""
+    from auspexai_platform.db.repositories import WorkerReservationRepository
+
+    _, binding = registered_tenant
+    fleet = [_rw("mac", 21.0), _rw("jet1", 4.44), _rw("jet2", 4.44)]
+    qwen = _run_experiment(
+        db,
+        per_job_factory,
+        experiment_repository,
+        manifest_repository,
+        binding.tenant_id,
+        "qwen",
+        "qwen",
+        2.0,
+        2,
+        2,  # repl-2, fits all three
+    )
+    res = WorkerReservationRepository(db)
+    Scheduler(
+        experiment_repository,
+        per_job_factory,
+        active_workers=lambda: fleet,
+        reservation_repository=res,
+        recent_oom_sizes=lambda: {"qwen": 4.44},  # recently OOM'd on 4.44 GB boxes
+    ).pick_for_worker(_rw("mac", 21.0))
+
+    held = {w for w, e in res.all() if e == qwen.experiment_id}
+    assert "mac" in held  # the reliable big box is USED, not left idle
+    assert len(held) == 2 and held < {"mac", "jet1", "jet2"}  # Mac + exactly one Jetson

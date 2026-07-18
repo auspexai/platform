@@ -124,3 +124,23 @@ class ModelServeFailureRepository:
                 continue  # fit-but-flaky → don't bench it
             out[r["model_id"]] = float(r["max_ooomd_usable_gb"])
         return out
+
+    def recent_oom_sizes(self, *, now: datetime | None = None) -> dict[str, float]:
+        """{model_id: largest usable-GB RECENTLY observed to OOM} — a SOFT placement signal,
+        distinct from the hard `oom_thresholds`. A worker at/below this size has OOM'd this
+        model lately and is a LESS-RELIABLE place to run it, even when it's below the
+        exclusion runway (not benched). The scheduler uses it to PREFER a worker the model
+        doesn't OOM on when one is free — so a flaky-on-small model is placed on the big box
+        that idles rather than maximising its OOM exposure. Staleness-gated (a forgiven, stale
+        OOM stops biasing placement) but NOT rate/runway-gated (any recent OOM is a hint)."""
+        now = now or datetime.now(UTC)
+        rows = self.db.execute(
+            "SELECT model_id, max_ooomd_usable_gb, last_observed_at FROM model_serve_failures"
+        )
+        out: dict[str, float] = {}
+        for r in rows:
+            last = _parse_iso(r["last_observed_at"])
+            if last is None or (now - last) > OOM_EXCLUSION_COOLDOWN:
+                continue
+            out[r["model_id"]] = float(r["max_ooomd_usable_gb"])
+        return out

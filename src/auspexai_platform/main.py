@@ -239,6 +239,9 @@ def create_app(
         # demonstrated OOM threshold — the same override the availability catalog applies,
         # so routing never keeps offering an OOM-prone model to a too-small worker.
         oom_thresholds=lambda: ModelServeFailureRepository(svc.db).oom_thresholds(),
+        # Soft placement preference: prefer a worker a model doesn't recently OOM on when one
+        # is free, so a flaky-on-small model lands on the idle big box, not its worst workers.
+        recent_oom_sizes=lambda: ModelServeFailureRepository(svc.db).recent_oom_sizes(),
     )
     # M8: in-process live-event bus. SSE endpoints subscribe; lifecycle /
     # result-submission routes publish. Process-local (single-process coord).

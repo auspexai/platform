@@ -644,6 +644,7 @@ class Scheduler:
         active_workers: Callable[[], list[Worker]] | None = None,
         reservation_repository=None,
         oom_thresholds: Callable[[], dict[str, float]] | None = None,
+        recent_oom_sizes: Callable[[], dict[str, float]] | None = None,
     ):
         self._experiments = experiment_repository
         self._per_job_factory = per_job_factory
@@ -652,6 +653,11 @@ class Scheduler:
         # applies), so an OOM-prone model is never offered to a too-small worker. None ⇒ no
         # override (legacy / tests).
         self._oom_thresholds = oom_thresholds
+        # SOFT placement signal: () -> {model_id: largest usable-GB RECENTLY OOM'd at},
+        # ungated by rate/runway. Placement PREFERS a worker the model doesn't OOM on when one
+        # is free, so a flaky-on-small model lands on the big box that would otherwise idle
+        # instead of maximising its OOM exposure. None ⇒ no preference (legacy / tests).
+        self._recent_oom_sizes = recent_oom_sizes
         # Capacity-aware scheduling (reservation model): a worker↔experiment store so an
         # admitted experiment runs UNINTERRUPTED on a stable worker set (no mid-run model
         # reloads — which would confound a drift measurement, and no per-unit thrash) and
@@ -797,6 +803,12 @@ class Scheduler:
         when not wired (legacy / tests)."""
         return self._oom_thresholds() if self._oom_thresholds is not None else {}
 
+    def _ooomd(self) -> dict[str, float]:
+        """Soft placement signal {model_id: largest usable-GB recently OOM'd at}. A worker at
+        or below this is a less-reliable place to run the model (deprioritised, not excluded).
+        Empty when not wired (legacy / tests)."""
+        return self._recent_oom_sizes() if self._recent_oom_sizes is not None else {}
+
     def _fits(
         self,
         worker: Worker,
@@ -870,6 +882,7 @@ class Scheduler:
         # self._fits.
         fleet_fp = self._fleet_model_footprints()
         oom = self._oom()
+        ooomd = self._ooomd()  # soft: worker sizes each model recently OOM'd at (placement pref)
 
         # 1. release stale
         ended: set[str] = set()
@@ -936,14 +949,34 @@ class Scheduler:
                 if e.experiment_id != exclude_id and self._fits(worker, e, fleet_fp, oom)
             )
 
+        exp_models = {}  # exp_id -> set(required models), memoized for _oom_risk
+
+        def _oom_risk(worker: Worker, exp) -> int:
+            """1 if a required model recently OOM'd on a worker THIS SIZE OR SMALLER — a
+            less-reliable place to run it (deprioritised, not excluded), so a flaky-on-small
+            model prefers a box it doesn't OOM on. 0 when there's no such history."""
+            if not ooomd:
+                return 0
+            models = exp_models.get(exp.experiment_id)
+            if models is None:
+                models = set((exp.required_capabilities or {}).get("models") or [])
+                exp_models[exp.experiment_id] = models
+            wram = self._worker_usable(worker)
+            return 1 if any(wram <= ooomd.get(m, -1.0) for m in models) else 0
+
         def _grant(exp, need: int) -> None:
             nonlocal free
             # Bin-packing, WORKER choice: least-contended first (conserve workers other runs
-            # need), smallest-capacity as the secondary conserve signal (keep big boxes for
-            # big models). Replaces the old bare smallest-first pick.
+            # need); then RELIABLE first (a worker the model doesn't OOM on, over one it does —
+            # so a flaky-on-small model lands on the idle big box, not its worst workers);
+            # smallest-capacity as the final conserve tiebreak (keep big boxes for big models).
             fitting = sorted(
                 (w for w in free if self._fits(w, exp, fleet_fp, oom)),
-                key=lambda w: (_contention(w, exp.experiment_id), self._worker_usable(w)),
+                key=lambda w: (
+                    _contention(w, exp.experiment_id),
+                    _oom_risk(w, exp),
+                    self._worker_usable(w),
+                ),
             )
             grant = fitting[:need]
             for w in grant:
