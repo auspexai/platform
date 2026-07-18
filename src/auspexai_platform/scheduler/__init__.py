@@ -702,10 +702,42 @@ class Scheduler:
         caps = worker.capabilities
         return float(caps.get("usable_memory_gb") or caps.get("ram_total_gb") or 1e9)
 
-    def _fits(self, worker: Worker, exp) -> bool:
+    def _fleet_model_footprints(self) -> dict[str, float]:
+        """Fleet-authoritative SERVE footprint (GB) per model — the shared size half of the
+        runnability verdict (`serve_memory.fleet_reported_footprints`), from the on-disk
+        sizes the fleet's workers report. Routing consults this so its fit matches the
+        availability catalog's: an experiment whose submit-time HF sizing MISSED (a filename
+        case, an HF hiccup, a BYOM model) is still sized from the fleet, instead of the
+        scheduler falling OPEN (auto_acquire → 'fits') and false-fitting a 20B onto a 4 GB
+        worker. Empty when no fleet view is wired (legacy path)."""
+        if self._active_workers is None:
+            return {}
+        from auspexai_platform.serve_memory import fleet_reported_footprints
+
+        return fleet_reported_footprints(w.capabilities for w in self._active_workers())
+
+    def _fit_caps(self, exp, fleet_fp: dict[str, float]) -> dict[str, Any]:
+        """`exp.required_capabilities` with `model_ram_gb` backfilled from the
+        fleet-authoritative footprints (the larger of submit-time and fleet-known is kept).
+        So a submit-time sizing miss can't leave a required model unsized → no fall-open."""
+        caps = exp.required_capabilities or {}
+        required = caps.get("models") or []
+        if not required or not fleet_fp:
+            return caps
+        ram = dict(caps.get("model_ram_gb") or {})
+        changed = False
+        for mid in required:
+            fp = fleet_fp.get(mid)
+            if fp is not None and fp > ram.get(mid, 0.0):
+                ram[mid] = fp
+                changed = True
+        return {**caps, "model_ram_gb": ram} if changed else caps
+
+    def _fits(self, worker: Worker, exp, fleet_fp: dict[str, float] | None = None) -> bool:
+        caps = self._fit_caps(exp, fleet_fp) if fleet_fp else (exp.required_capabilities or {})
         return worker_satisfies(
             worker,
-            exp.required_capabilities or {},
+            caps,
             requires_real_execution=exp.requires_real_execution,
             required_containment=exp.required_containment,
         )
@@ -757,6 +789,10 @@ class Scheduler:
         # can be reserved on this very poll (it already passed the pause/degraded checks).
         if polling is not None:
             active_by_id[polling.worker_id] = polling
+        # Fleet-authoritative model footprints — so every fit/scarcity/reclaim decision
+        # below sizes a model from what the fleet actually holds, not the (possibly-missed)
+        # submit-time number. Computed once per reconcile; passed to every self._fits.
+        fleet_fp = self._fleet_model_footprints()
 
         # 1. release stale
         ended: set[str] = set()
@@ -798,7 +834,7 @@ class Scheduler:
         fleet_list = list(active_by_id.values())
         approved.sort(
             key=lambda e: (
-                sum(1 for w in fleet_list if self._fits(w, e)),
+                sum(1 for w in fleet_list if self._fits(w, e, fleet_fp)),
                 getattr(e, "submitted_at", "") or "",
             )
         )
@@ -811,7 +847,9 @@ class Scheduler:
             model-agnostic way to conserve scarce/versatile workers (a fits-everywhere box
             is given away only when nothing scarcer wants it)."""
             return sum(
-                1 for e in approved if e.experiment_id != exclude_id and self._fits(worker, e)
+                1
+                for e in approved
+                if e.experiment_id != exclude_id and self._fits(worker, e, fleet_fp)
             )
 
         def _grant(exp, need: int) -> None:
@@ -820,7 +858,7 @@ class Scheduler:
             # need), smallest-capacity as the secondary conserve signal (keep big boxes for
             # big models). Replaces the old bare smallest-first pick.
             fitting = sorted(
-                (w for w in free if self._fits(w, exp)),
+                (w for w in free if self._fits(w, exp, fleet_fp)),
                 key=lambda w: (_contention(w, exp.experiment_id), self._worker_usable(w)),
             )
             grant = fitting[:need]
@@ -867,7 +905,7 @@ class Scheduler:
         #    reservation is re-pointed. Reclaim to FLOOR (the minimum to make progress); the
         #    rest toward target is left to opportunistic top-up.
         def _structural(e) -> int:
-            return sum(1 for w in fleet_list if self._fits(w, e))
+            return sum(1 for w in fleet_list if self._fits(w, e, fleet_fp))
 
         for exp in approved:
             floor_exp = int(getattr(exp, "replication_floor", 1) or 1)
@@ -875,7 +913,7 @@ class Scheduler:
                 continue  # not starved below floor
             if not offerable(exp.experiment_id):
                 continue
-            exp_fit = [w for w in fleet_list if self._fits(w, exp)]
+            exp_fit = [w for w in fleet_list if self._fits(w, exp, fleet_fp)]
             if not exp_fit:
                 continue  # structurally unrunnable — regime-3's job, not reclaim's
             exp_scarcity = len(exp_fit)
@@ -895,7 +933,9 @@ class Scheduler:
                 # (a) holder must remain structurally viable WITHOUT w (>= its own floor).
                 holder_floor = int(getattr(holder, "replication_floor", 1) or 1)
                 holder_without_w = sum(
-                    1 for w2 in fleet_list if w2.worker_id != w.worker_id and self._fits(w2, holder)
+                    1
+                    for w2 in fleet_list
+                    if w2.worker_id != w.worker_id and self._fits(w2, holder, fleet_fp)
                 )
                 if holder_without_w < holder_floor:
                     continue
@@ -955,13 +995,10 @@ class Scheduler:
         """The first eligible unit of `experiment` for `worker`, or None — capability +
         capacity + re-offer eligibility. Reused by the reservation path (the worker's
         reserved experiment) and the legacy walk."""
-        # #30 (M1): the worker must hold (or auto-acquire) the experiment's models.
-        if not worker_satisfies(
-            worker,
-            experiment.required_capabilities,
-            requires_real_execution=experiment.requires_real_execution,
-            required_containment=experiment.required_containment,
-        ):
+        # #30 (M1): the worker must hold (or auto-acquire) the experiment's models — sized
+        # against the fleet-authoritative footprint (same as routing), so a worker too small
+        # to SERVE the model is never actually assigned it even if it holds the file on disk.
+        if not self._fits(worker, experiment, self._fleet_model_footprints()):
             return None
         per_job_db = self._per_job_factory.get(experiment.experiment_id)
         if per_job_db is None:

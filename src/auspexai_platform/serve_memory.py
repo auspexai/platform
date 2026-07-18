@@ -78,6 +78,35 @@ def estimate_serve_gb(
     return round(weights_gb + kv + SERVE_OVERHEAD_GB, 2)
 
 
+def fleet_reported_footprints(worker_capabilities) -> dict[str, float]:
+    """The best-known SERVE footprint (GB) per model_id, aggregated from what the fleet's
+    workers report holding on disk (`capabilities["model_sizes"]` = {model_id: bytes}).
+
+    THE shared "size half" of the runnability verdict — consumed by BOTH the availability
+    catalog (`api/catalog`) and the router (`scheduler`), so the two can never disagree
+    about whether a model fits a worker. Sized by the same conservative KV-aware estimate
+    (`estimate_serve_gb`; weights + KV proxy + overhead — never flat file x 1.2), and taken
+    FLEET-WIDE (max across reporters) so a model's real size is known even when submit-time
+    HF sizing missed it — and known to EVERY worker's fit, so a 20B a small worker merely
+    downloaded (but can't serve) still reads as too-big for it. Disk presence is not
+    runnability; RAM-fit against this footprint is.
+
+    `worker_capabilities` is an iterable of capability dicts (the catalog already holds
+    these; the scheduler passes `[w.capabilities for w in fleet]`)."""
+    out: dict[str, float] = {}
+    for caps in worker_capabilities or []:
+        sizes = (caps or {}).get("model_sizes")
+        if not isinstance(sizes, dict):
+            continue
+        for mid, b in sizes.items():
+            if isinstance(mid, str) and isinstance(b, (int, float)) and b > 0:
+                fp = estimate_serve_gb(
+                    weights_gb=b / 1e9, n_layers=None, n_kv_heads=None, head_dim=None
+                )
+                out[mid] = max(out.get(mid, 0.0), fp)
+    return out
+
+
 def head_dim_from_config(cfg: dict) -> int | None:
     """A model's attention head dimension from its HF config.json: the explicit
     `head_dim`, else `hidden_size / num_attention_heads`."""

@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from auspexai_platform.auth.credential import Credential
 from auspexai_platform.db.repositories import WorkerRepository
 from auspexai_platform.hf_catalog import catalog_fetched_at, read_catalog
-from auspexai_platform.serve_memory import estimate_serve_gb
+from auspexai_platform.serve_memory import fleet_reported_footprints
 from auspexai_platform.supported_models import supported_by_id
 from auspexai_platform.worker_status import heartbeat_cutoff
 
@@ -186,25 +186,11 @@ def build_router(
         # manually-staged BYOM model). The coordinator's HF sizing is the primary
         # source; this is the supplement, so a present model is still sized even
         # when it's outside the provisionable menu.
-        reported_gb: dict[str, float] = {}
-        for c in caps:
-            sizes = c.get("model_sizes")
-            if isinstance(sizes, dict):
-                for mid_s, b in sizes.items():
-                    if isinstance(mid_s, str) and isinstance(b, (int, float)) and b > 0:
-                        # A present-but-unmenued model (e.g. mistral-7b on a worker's
-                        # disk) is sized by the SAME conservative serve estimate as the
-                        # catalog — weights + KV proxy + overhead — never the old flat
-                        # file x 1.2 that let a 7B read "fits" on a 5.44 GB Jetson.
-                        reported_gb[mid_s] = max(
-                            reported_gb.get(mid_s, 0.0),
-                            estimate_serve_gb(
-                                weights_gb=b / 1e9,
-                                n_layers=None,
-                                n_kv_heads=None,
-                                head_dim=None,
-                            ),
-                        )
+        # A present-but-unmenued model (e.g. mistral-7b on a worker's disk) is sized by the
+        # SAME conservative serve estimate the router uses — weights + KV proxy + overhead,
+        # never the old flat file x 1.2 — via the shared `fleet_reported_footprints`, so the
+        # availability verdict here and routing's fit can never disagree about size.
+        reported_gb = fleet_reported_footprints(caps)
 
         # UNION: everything on the fleet + the whole provisionable set (deduped).
         entries: list[SupportedEntry] = []

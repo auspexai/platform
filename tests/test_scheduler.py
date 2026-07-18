@@ -1793,3 +1793,39 @@ def test_reclaim_refuses_when_it_would_strand_the_holder_below_floor(
     held = dict(res.all())
     assert held.get("mac") == qwen.experiment_id  # NOT reclaimed — would strand qwen
     assert gptoss.experiment_id not in held.values()  # gpt-oss waits (genuine contention)
+
+
+def test_fleet_footprint_sizes_a_submit_unsized_model_and_excludes_small_workers(
+    registered_tenant, db, per_job_factory, experiment_repository, manifest_repository
+):
+    """Routing fit == availability verdict via the shared fleet-authoritative footprint.
+
+    An experiment whose submit-time `model_ram_gb` is MISSING (an HF sizing miss — a
+    filename case, a hiccup, a BYOM model) is still sized from what the fleet reports on
+    disk. So a big model reads as too-big for a small worker even though it declares
+    `auto_acquire` (or merely downloaded the file) — the router no longer falls OPEN on an
+    unsized model and false-fits a 20B onto a 4 GB box, which is what masked gpt-oss's
+    scarcity and blocked the reclaim on the live fleet."""
+    _, binding = registered_tenant
+    exp = _make_experiment(
+        manifest_repository=manifest_repository,
+        experiment_repository=experiment_repository,
+        tenant_id=binding.tenant_id,
+        label="big",
+        required_capabilities={"models": ["bigmodel"]},  # NO model_ram_gb — the sizing miss
+    )
+    mac = _rw("mac", 22.0)
+    mac.capabilities["model_sizes"] = {"bigmodel": 12_000_000_000}  # 12 GB file on disk
+    jet = _rw("jet", 4.4)  # auto_acquire=True by default in _rw
+    jet.capabilities["model_sizes"] = {"bigmodel": 12_000_000_000}  # downloaded but can't serve
+    sched = Scheduler(experiment_repository, per_job_factory, active_workers=lambda: [mac, jet])
+
+    fp = sched._fleet_model_footprints()
+    assert fp.get("bigmodel", 0) > 13  # ~13.8 GB serve estimate from the 12 GB weights
+
+    # With the fleet footprint: only the Mac fits; the 4.4 GB Jetson is excluded despite
+    # auto_acquire AND despite holding the file — disk presence is not runnability.
+    assert sched._fits(mac, exp, fp) is True
+    assert sched._fits(jet, exp, fp) is False
+    # Without it (the old fall-open the router used to have), the Jetson would false-fit:
+    assert sched._fits(jet, exp) is True
