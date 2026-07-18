@@ -555,6 +555,74 @@ def worker_satisfies(
     return required_models <= have_models
 
 
+def _caps_with_footprints(
+    required_capabilities: dict[str, Any], footprints: dict[str, float]
+) -> dict[str, Any]:
+    """`required_capabilities` with `model_ram_gb` backfilled from the fleet-authoritative
+    `footprints` (the larger of submit-time and fleet-known is kept). So a submit-time HF
+    sizing miss can't leave a required model unsized → no fall-open."""
+    required = required_capabilities.get("models") or []
+    if not required or not footprints:
+        return required_capabilities
+    ram = dict(required_capabilities.get("model_ram_gb") or {})
+    changed = False
+    for mid in required:
+        fp = footprints.get(mid)
+        if fp is not None and fp > ram.get(mid, 0.0):
+            ram[mid] = fp
+            changed = True
+    return {**required_capabilities, "model_ram_gb": ram} if changed else required_capabilities
+
+
+def serve_fits(
+    worker: Worker,
+    required_capabilities: dict[str, Any],
+    *,
+    requires_real_execution: bool = False,
+    required_containment: str = CONTAINMENT_PERMISSIVE,
+    footprints: dict[str, float] | None = None,
+    oom: dict[str, float] | None = None,
+) -> bool:
+    """THE single runnability verdict — "can this worker SERVE these required capabilities" —
+    shared by routing (`Scheduler._fits`) and the C14 regime capacity model
+    (`capacity._eligible`), so the two can never disagree about what fits where. Three inputs,
+    matching the availability catalog's fit verdict:
+
+      1. `worker_satisfies` — models held/acquirable, features, containment, provisioned-mode,
+         and the submit-time RAM gate;
+      2. `footprints` — fleet-authoritative on-disk sizes backfilled into `model_ram_gb`, so a
+         submit-time sizing MISS can't leave a model unsized and fall open (`auto_acquire →
+         fits`); and
+      3. `oom` — observed-OOM ground truth: a worker with usable <= a model's largest
+         OOM'd-usable can't serve it, whatever the estimate said (`<= thr` matches the
+         catalog's `r > thr`).
+
+    `footprints`/`oom` default to None (legacy / tests) → the plain `worker_satisfies`
+    verdict, so nothing that doesn't wire them changes behavior."""
+    caps = (
+        _caps_with_footprints(required_capabilities or {}, footprints)
+        if footprints
+        else (required_capabilities or {})
+    )
+    if not worker_satisfies(
+        worker,
+        caps,
+        requires_real_execution=requires_real_execution,
+        required_containment=required_containment,
+    ):
+        return False
+    if oom:
+        wram = worker.capabilities.get("usable_memory_gb")
+        if not isinstance(wram, (int, float)):
+            wram = worker.capabilities.get("ram_total_gb")
+        if isinstance(wram, (int, float)):
+            for mid in caps.get("models") or []:
+                thr = oom.get(mid)
+                if thr is not None and wram <= thr:
+                    return False
+    return True
+
+
 @dataclass(frozen=True)
 class SchedulerPick:
     """Result of `Scheduler.pick_for_worker`. The route layer turns this
@@ -722,23 +790,6 @@ class Scheduler:
 
         return fleet_reported_footprints(w.capabilities for w in self._active_workers())
 
-    def _fit_caps(self, exp, fleet_fp: dict[str, float]) -> dict[str, Any]:
-        """`exp.required_capabilities` with `model_ram_gb` backfilled from the
-        fleet-authoritative footprints (the larger of submit-time and fleet-known is kept).
-        So a submit-time sizing miss can't leave a required model unsized → no fall-open."""
-        caps = exp.required_capabilities or {}
-        required = caps.get("models") or []
-        if not required or not fleet_fp:
-            return caps
-        ram = dict(caps.get("model_ram_gb") or {})
-        changed = False
-        for mid in required:
-            fp = fleet_fp.get(mid)
-            if fp is not None and fp > ram.get(mid, 0.0):
-                ram[mid] = fp
-                changed = True
-        return {**caps, "model_ram_gb": ram} if changed else caps
-
     def _oom(self) -> dict[str, float]:
         """Observed-OOM ground truth {model_id: largest usable-GB seen to OOM}. A worker with
         usable <= this can't SERVE the model, whatever the estimate said — the same override
@@ -753,30 +804,17 @@ class Scheduler:
         fleet_fp: dict[str, float] | None = None,
         oom: dict[str, float] | None = None,
     ) -> bool:
-        caps = self._fit_caps(exp, fleet_fp) if fleet_fp else (exp.required_capabilities or {})
-        if not worker_satisfies(
+        # Routing's fit is the SHARED `serve_fits` verdict (footprint-backfill + worker_satisfies
+        # + observed-OOM), the same one the C14 regime capacity model uses via capacity._eligible
+        # — so routing and regime can never disagree about what fits where.
+        return serve_fits(
             worker,
-            caps,
+            exp.required_capabilities or {},
             requires_real_execution=exp.requires_real_execution,
             required_containment=exp.required_containment,
-        ):
-            return False
-        # Observed-OOM ground truth — the OTHER half of the availability verdict: a model that
-        # demonstrably OOM'd on a worker with usable <= X can't serve ANY worker at/below X,
-        # whatever the a-priori footprint said. `wram <= thr` matches the catalog's `r > thr`
-        # (a worker no bigger than one that already OOM'd can't fit it). Without this, routing
-        # keeps offering an OOM-prone model to a too-small worker (qwen3-1.7b on a 4.4 GB
-        # Jetson → serve-refuse loop + starving the run that WAS there).
-        if oom:
-            wram = worker.capabilities.get("usable_memory_gb")
-            if not isinstance(wram, (int, float)):
-                wram = worker.capabilities.get("ram_total_gb")
-            if isinstance(wram, (int, float)):
-                for mid in caps.get("models") or []:
-                    thr = oom.get(mid)
-                    if thr is not None and wram <= thr:
-                        return False
-        return True
+            footprints=fleet_fp,
+            oom=oom,
+        )
 
     def _reconcile(self, polling: Worker | None = None) -> None:
         """Keep the reservation set in sync with the LIVE fleet + experiment state.
