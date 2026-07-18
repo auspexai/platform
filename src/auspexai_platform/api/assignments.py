@@ -907,6 +907,30 @@ def build_router(
             ran_under=body.ran_under,
         )
         assignments_repo.attach_result(assignment.assignment_id, result.result_id)
+        # Serve-SUCCESS signal (rate-aware OOM ground truth, migration 0063): the worker just
+        # DELIVERED a result, so it served the model at its usable size. Record it so a past
+        # serve-OOM record for a worker this size is tempered — a fit-but-flaky model (serves
+        # most of the time, OOMs only under memory pressure) is then not benched forever by one
+        # OOM. Mirrors the OOM-record path in /refuse; best-effort, never disturbs acceptance.
+        try:
+            _sc_caps = getattr(worker_row, "capabilities", None) or {}
+            _sc_usable = _sc_caps.get("usable_memory_gb") or _sc_caps.get("ram_total_gb")
+            _sc_exp = experiment_repository.get_by_id(experiment_id)
+            _sc_models = (
+                (getattr(_sc_exp, "required_capabilities", None) or {}).get("models") or []
+                if _sc_exp
+                else []
+            )
+            if _sc_models and isinstance(_sc_usable, (int, float)):
+                from auspexai_platform.db.repositories.model_serve_failures import (
+                    ModelServeFailureRepository,
+                )
+
+                ModelServeFailureRepository(worker_repository.db).record_serve_success(
+                    _sc_models[0], float(_sc_usable), now=datetime.now(UTC).isoformat()
+                )
+        except Exception:
+            logger.debug("serve-success record failed (ignored)", exc_info=True)
         # D20: park the raw in the ephemeral transit buffer keyed by the now-minted
         # result_id — never persisted, R3-collectable during the run. AUD-26: also
         # park the detached signature + worker pubkey so the R3 driver can verify the

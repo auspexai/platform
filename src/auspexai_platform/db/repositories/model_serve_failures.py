@@ -9,7 +9,31 @@ a-priori estimate. Ground truth beats a guess."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from auspexai_platform.db.database import Database
+
+# An OOM excludes a worker size only while it's RECENT — the fleet must have OOM'd the
+# model within this window. A stale record (no reproduced OOM since) lifts, so the model
+# is retried: a transient/one-off OOM can't bench a worker forever, and it breaks the
+# chicken-and-egg (an excluded model can't serve to earn the successes that would clear it).
+OOM_EXCLUSION_COOLDOWN = timedelta(hours=6)
+
+# Exclude only when OOMs DOMINATE. A worker that OOMs less than this fraction of its
+# (oom + success) attempts is fit-but-flaky, not too-small — don't bench it. 0.5 = "OOMs at
+# least as often as it succeeds." (A recent OOM with no recorded successes reads as 1.0 →
+# excluded until it goes stale and earns a retry.)
+OOM_RATE_CUTOFF = 0.5
+
+
+def _parse_iso(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
 
 
 class ModelServeFailureRepository:
@@ -33,8 +57,40 @@ class ModelServeFailureRepository:
             (model_id, float(worker_usable_gb), now),
         )
 
-    def oom_thresholds(self) -> dict[str, float]:
-        """{model_id: largest usable-GB observed to OOM}. A worker with usable <=
-        this value cannot serve the model (observed, not estimated)."""
-        rows = self.db.execute("SELECT model_id, max_ooomd_usable_gb FROM model_serve_failures")
-        return {r["model_id"]: float(r["max_ooomd_usable_gb"]) for r in rows}
+    def record_serve_success(self, model_id: str, worker_usable_gb: float, *, now: str) -> None:
+        """A worker with `worker_usable_gb` usable memory SUCCESSFULLY served `model_id`
+        (it delivered a result). This TEMPERS an existing serve-OOM exclusion for the
+        too-small class: only a worker at or below the OOM'd size counts (a big box serving
+        the model says nothing about whether a small one can). No-op when there is no OOM
+        record to temper — we don't track successes for un-excluded models."""
+        self.db.execute(
+            """
+            UPDATE model_serve_failures
+            SET success_count = success_count + 1, last_success_at = ?
+            WHERE model_id = ? AND ? <= max_ooomd_usable_gb
+            """,
+            (now, model_id, float(worker_usable_gb)),
+        )
+
+    def oom_thresholds(self, *, now: datetime | None = None) -> dict[str, float]:
+        """{model_id: largest usable-GB observed to OOM} — but ONLY for models whose OOM is
+        both RECENT (within `OOM_EXCLUSION_COOLDOWN`) and DOMINANT (oom rate >=
+        `OOM_RATE_CUTOFF`). A worker with usable <= a returned value cannot serve the model.
+        Stale or flaky-but-mostly-succeeding records are omitted, so a borderline model isn't
+        permanently benched by a transient OOM (rate-aware + success-tempered, migration 0063)."""
+        now = now or datetime.now(UTC)
+        rows = self.db.execute(
+            "SELECT model_id, max_ooomd_usable_gb, observation_count, "
+            "success_count, last_observed_at FROM model_serve_failures"
+        )
+        out: dict[str, float] = {}
+        for r in rows:
+            last = _parse_iso(r["last_observed_at"])
+            if last is None or (now - last) > OOM_EXCLUSION_COOLDOWN:
+                continue  # stale → retry it
+            ooms = int(r["observation_count"] or 0)
+            total = ooms + int(r["success_count"] or 0)
+            if total > 0 and ooms / total < OOM_RATE_CUTOFF:
+                continue  # fit-but-flaky → don't bench it
+            out[r["model_id"]] = float(r["max_ooomd_usable_gb"])
+        return out
