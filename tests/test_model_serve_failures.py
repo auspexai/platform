@@ -32,10 +32,15 @@ def test_records_and_keeps_largest_ooomd_capacity(db: Database) -> None:
     assert thr == {"phi-3.5-mini-instruct-q4": 6.0}  # the LARGEST box that OOM'd wins
 
 
+def _oom_n(repo: ModelServeFailureRepository, model: str, usable: float, n: int, now: str) -> None:
+    for _ in range(n):
+        repo.record_oom(model, usable, now=now)
+
+
 def test_distinct_models_tracked_independently(db: Database) -> None:
     repo = ModelServeFailureRepository(db)
-    repo.record_oom("phi-3.5-mini-instruct-q4", 5.44, now="2026-07-16T00:00:00+00:00")
-    repo.record_oom("qwen3-4b-instruct-2507-q4", 5.44, now="2026-07-16T00:00:00+00:00")
+    _oom_n(repo, "phi-3.5-mini-instruct-q4", 5.44, 3, "2026-07-16T00:00:00+00:00")
+    _oom_n(repo, "qwen3-4b-instruct-2507-q4", 5.44, 3, "2026-07-16T00:00:00+00:00")
     thr = repo.oom_thresholds(now=_RECENT)
     assert thr["phi-3.5-mini-instruct-q4"] == 5.44
     assert thr["qwen3-4b-instruct-2507-q4"] == 5.44
@@ -45,11 +50,22 @@ def test_threshold_semantics_a_worker_no_bigger_cannot_serve(db: Database) -> No
     # The catalog uses `worker_capacity > threshold` to allow the model. A worker at
     # exactly the OOM'd size is excluded; a bigger one (the Mac) is not.
     repo = ModelServeFailureRepository(db)
-    repo.record_oom("phi-3.5-mini-instruct-q4", 5.44, now="2026-07-16T00:00:00+00:00")
+    _oom_n(repo, "phi-3.5-mini-instruct-q4", 5.44, 3, "2026-07-16T00:00:00+00:00")
     thr = repo.oom_thresholds(now=_RECENT)["phi-3.5-mini-instruct-q4"]
     assert not (5.44 > thr)  # the Jetson that OOM'd: excluded
     assert not (5.0 > thr)  # a smaller box: excluded
     assert 22.0 > thr  # the Mac: still allowed
+
+
+# ---- min-observations runway (migration 0063) ----
+
+
+def test_a_couple_of_ooms_do_not_bench_below_the_runway(db: Database) -> None:
+    repo = ModelServeFailureRepository(db)
+    _oom_n(repo, "m", 4.44, 2, "2026-07-16T00:00:00+00:00")  # 2 < OOM_MIN_OBSERVATIONS
+    assert repo.oom_thresholds(now=_RECENT) == {}  # runway — retried, not benched
+    repo.record_oom("m", 4.44, now="2026-07-16T00:01:00+00:00")  # the 3rd crosses the floor
+    assert repo.oom_thresholds(now=_RECENT) == {"m": 4.44}
 
 
 # ---- staleness (migration 0063) ----
@@ -57,7 +73,7 @@ def test_threshold_semantics_a_worker_no_bigger_cannot_serve(db: Database) -> No
 
 def test_stale_oom_no_longer_excludes(db: Database) -> None:
     repo = ModelServeFailureRepository(db)
-    repo.record_oom("m", 4.44, now="2026-07-16T00:00:00+00:00")
+    _oom_n(repo, "m", 4.44, 3, "2026-07-16T00:00:00+00:00")
     # < cooldown after → still excludes.
     assert repo.oom_thresholds(now=datetime.fromisoformat("2026-07-16T05:00:00+00:00")) == {
         "m": 4.44
@@ -80,6 +96,24 @@ def test_success_tempers_a_flaky_model(db: Database) -> None:
     assert repo.oom_thresholds(now=_RECENT) == {}
 
 
+def test_stale_burst_resets_the_rate_window(db: Database) -> None:
+    repo = ModelServeFailureRepository(db)
+    # A big burst of OOMs under old conditions (12 failures) that then went quiet...
+    for _ in range(12):
+        repo.record_oom("m", 4.44, now="2026-07-16T00:00:00+00:00")
+    # ...a FRESH burst > cooldown later forgives the 12 stale failures — the count restarts,
+    # so 3 fresh OOMs, not 15, decide the rate (no permanent headwind).
+    _oom_n(repo, "m", 4.44, 3, "2026-07-16T08:00:00+00:00")
+    assert repo.oom_thresholds(now=datetime.fromisoformat("2026-07-16T08:05:00+00:00")) == {
+        "m": 4.44
+    }  # 3 fresh ooms, 0 success → excluded
+    # Four same-class successes now flip it (3 oom : 4 success → 0.43 < cutoff) — which would
+    # have needed 13+ successes to overcome the un-forgiven 12.
+    for _ in range(4):
+        repo.record_serve_success("m", 4.44, now="2026-07-16T08:06:00+00:00")
+    assert repo.oom_thresholds(now=datetime.fromisoformat("2026-07-16T08:07:00+00:00")) == {}
+
+
 def test_dominant_ooms_still_exclude(db: Database) -> None:
     repo = ModelServeFailureRepository(db)
     # Genuinely too-big: OOMs every time, no successes → rate 1.0 → excluded.
@@ -90,12 +124,13 @@ def test_dominant_ooms_still_exclude(db: Database) -> None:
 
 def test_success_only_counts_the_too_small_class(db: Database) -> None:
     repo = ModelServeFailureRepository(db)
-    repo.record_oom("m", 4.44, now="2026-07-16T00:00:00+00:00")
+    _oom_n(repo, "m", 4.44, 3, "2026-07-16T00:00:00+00:00")
     # A BIG worker (Mac) serving the model says nothing about a small one → does NOT temper.
     repo.record_serve_success("m", 21.0, now="2026-07-16T00:10:00+00:00")
-    assert repo.oom_thresholds(now=_RECENT) == {"m": 4.44}  # still excluded
-    # A same-class (4.0 <= 4.44) success DOES temper (now 1 oom : 1 success → rate 0.5 == cutoff,
-    # still excluded); add a couple more to cross below the cutoff.
-    for _ in range(2):
+    assert repo.oom_thresholds(now=_RECENT) == {
+        "m": 4.44
+    }  # still excluded (3 oom, 0 counted success)
+    # Same-class (4.0 <= 4.44) successes DO temper: 3 oom : 4 success → 0.43 < cutoff.
+    for _ in range(4):
         repo.record_serve_success("m", 4.0, now="2026-07-16T00:11:00+00:00")
-    assert repo.oom_thresholds(now=_RECENT) == {}  # 1 oom : 3 successes → 0.25 < cutoff
+    assert repo.oom_thresholds(now=_RECENT) == {}

@@ -21,9 +21,14 @@ OOM_EXCLUSION_COOLDOWN = timedelta(hours=6)
 
 # Exclude only when OOMs DOMINATE. A worker that OOMs less than this fraction of its
 # (oom + success) attempts is fit-but-flaky, not too-small — don't bench it. 0.5 = "OOMs at
-# least as often as it succeeds." (A recent OOM with no recorded successes reads as 1.0 →
-# excluded until it goes stale and earns a retry.)
+# least as often as it succeeds."
 OOM_RATE_CUTOFF = 0.5
+
+# ...and only once there are enough failures to conclude "too small", not on a one-off. A
+# flaky model needs RUNWAY: benching it on the first OOM would release the worker before it
+# can serve and earn the successes that keep it eligible (a chicken-and-egg). Below this
+# floor the model is retried; a genuinely-too-small model reaches it in a few OOMs.
+OOM_MIN_OBSERVATIONS = 3
 
 
 def _parse_iso(ts: str | None) -> datetime | None:
@@ -43,7 +48,30 @@ class ModelServeFailureRepository:
     def record_oom(self, model_id: str, worker_usable_gb: float, *, now: str) -> None:
         """A worker with `worker_usable_gb` usable memory OOM'd serving `model_id`.
         Upsert, keeping the LARGEST usable-GB seen (a bigger box that also OOM'd
-        tightens the bound) and bumping the observation count."""
+        tightens the bound) and bumping the observation count.
+
+        RESET-ON-STALE-BURST: if the previous OOM was longer ago than the cooldown, this is a
+        NEW burst under possibly-changed conditions — restart the (oom, success) rate window
+        fresh (count = 1, successes = 0) instead of carrying the old history. Without this, a
+        model that was flaky under a transient condition (e.g. memory pressure since cleared)
+        stays rate-penalised forever by failures that no longer reflect reality."""
+        now_dt = _parse_iso(now)
+        existing = self.db.execute(
+            "SELECT last_observed_at FROM model_serve_failures WHERE model_id = ?", (model_id,)
+        )
+        if existing:
+            prev = _parse_iso(existing[0]["last_observed_at"])
+            if prev is not None and now_dt is not None and (now_dt - prev) > OOM_EXCLUSION_COOLDOWN:
+                self.db.execute(
+                    """
+                    UPDATE model_serve_failures
+                    SET max_ooomd_usable_gb = MAX(max_ooomd_usable_gb, ?),
+                        last_observed_at = ?, observation_count = 1, success_count = 0
+                    WHERE model_id = ?
+                    """,
+                    (float(worker_usable_gb), now, model_id),
+                )
+                return
         self.db.execute(
             """
             INSERT INTO model_serve_failures
@@ -89,6 +117,8 @@ class ModelServeFailureRepository:
             if last is None or (now - last) > OOM_EXCLUSION_COOLDOWN:
                 continue  # stale → retry it
             ooms = int(r["observation_count"] or 0)
+            if ooms < OOM_MIN_OBSERVATIONS:
+                continue  # too few failures to conclude too-small → give it runway
             total = ooms + int(r["success_count"] or 0)
             if total > 0 and ooms / total < OOM_RATE_CUTOFF:
                 continue  # fit-but-flaky → don't bench it

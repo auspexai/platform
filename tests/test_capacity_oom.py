@@ -41,7 +41,11 @@ def _caps(usable: float) -> dict:
 def test_eligible_capable_count_drops_below_floor_on_observed_oom(db: Database) -> None:
     wr = WorkerRepository(db)
     now = datetime.now(UTC)
-    fleet = [("wkr-jet1", "a" * 64, 4.44), ("wkr-jet2", "b" * 64, 4.44), ("wkr-mac", "c" * 64, 21.0)]
+    fleet = [
+        ("wkr-jet1", "a" * 64, 4.44),
+        ("wkr-jet2", "b" * 64, 4.44),
+        ("wkr-mac", "c" * 64, 21.0),
+    ]
     for wid, pub, usable in fleet:
         wr.enroll(worker_id=wid, pubkey_hex=pub, capabilities=_caps(usable))
         wr.record_heartbeat(wid, capabilities=_caps(usable))  # recent hb → schedulable
@@ -53,5 +57,7 @@ def test_eligible_capable_count_drops_below_floor_on_observed_oom(db: Database) 
     # The model demonstrably OOM'd on a 4.44 GB box → the two Jetsons no longer count; only
     # the Mac (21 > 4.44) does. A repl-2 run now has structural capacity 1 < floor 2, so the
     # settle-sweep's regime-3 sees it as structurally uncompletable and pauses it.
-    ModelServeFailureRepository(db).record_oom("m", 4.44, now=now.isoformat())
+    repo = ModelServeFailureRepository(db)
+    for _ in range(3):  # >= OOM_MIN_OBSERVATIONS runway floor
+        repo.record_oom("m", 4.44, now=now.isoformat())
     assert eligible_capable_count(exp, worker_repository=wr, now=now) == 1
