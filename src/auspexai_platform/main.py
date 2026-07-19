@@ -242,6 +242,10 @@ def create_app(
         # Soft placement preference: prefer a worker a model doesn't recently OOM on when one
         # is free, so a flaky-on-small model lands on the idle big box, not its worst workers.
         recent_oom_sizes=lambda: ModelServeFailureRepository(svc.db).recent_oom_sizes(),
+        # Per-worker serve-recovery: a remediated worker may retry a model despite the
+        # model-level OOM exclusion (surgical recovery; one node's fix never re-offers it to
+        # other un-remediated nodes).
+        recovery_shadows=lambda: ModelServeFailureRepository(svc.db).recovery_shadows(),
     )
     # M8: in-process live-event bus. SSE endpoints subscribe; lifecycle /
     # result-submission routes publish. Process-local (single-process coord).
@@ -368,7 +372,9 @@ def create_app(
         tags=["publications"],
     )
     app.include_router(
-        health.build_router(credential_dep, worker_repository),
+        health.build_router(
+            credential_dep, worker_repository, hf_catalog_path=config.hf_catalog_path
+        ),
         prefix="/api/v0",
         tags=["system"],
     )

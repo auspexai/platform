@@ -582,6 +582,7 @@ def serve_fits(
     required_containment: str = CONTAINMENT_PERMISSIVE,
     footprints: dict[str, float] | None = None,
     oom: dict[str, float] | None = None,
+    recovered: set[tuple[str, str]] | None = None,
 ) -> bool:
     """THE single runnability verdict — "can this worker SERVE these required capabilities" —
     shared by routing (`Scheduler._fits`) and the C14 regime capacity model
@@ -597,8 +598,13 @@ def serve_fits(
          OOM'd-usable can't serve it, whatever the estimate said (`<= thr` matches the
          catalog's `r > thr`).
 
-    `footprints`/`oom` default to None (legacy / tests) → the plain `worker_satisfies`
-    verdict, so nothing that doesn't wire them changes behavior."""
+    `recovered` — {(worker_id, model_id)} pairs a REMEDIATED worker may retry despite (3):
+    its operator freed memory / restarted the backend after the OOM, so this one worker
+    shadows the model-level exclusion (a one-shot probe; a re-OOM lifts it). Surgical, so a
+    node's fix never re-offers the model to other, un-remediated nodes.
+
+    `footprints`/`oom`/`recovered` default to None (legacy / tests) → the plain
+    `worker_satisfies` verdict, so nothing that doesn't wire them changes behavior."""
     caps = (
         _caps_with_footprints(required_capabilities or {}, footprints)
         if footprints
@@ -619,6 +625,9 @@ def serve_fits(
             for mid in caps.get("models") or []:
                 thr = oom.get(mid)
                 if thr is not None and wram <= thr:
+                    # A remediated worker shadows the model-level exclusion for itself.
+                    if recovered and (worker.worker_id, mid) in recovered:
+                        continue
                     return False
     return True
 
@@ -645,6 +654,7 @@ class Scheduler:
         reservation_repository=None,
         oom_thresholds: Callable[[], dict[str, float]] | None = None,
         recent_oom_sizes: Callable[[], dict[str, float]] | None = None,
+        recovery_shadows: Callable[[], set[tuple[str, str]]] | None = None,
     ):
         self._experiments = experiment_repository
         self._per_job_factory = per_job_factory
@@ -658,6 +668,9 @@ class Scheduler:
         # is free, so a flaky-on-small model lands on the big box that would otherwise idle
         # instead of maximising its OOM exposure. None ⇒ no preference (legacy / tests).
         self._recent_oom_sizes = recent_oom_sizes
+        # Per-worker serve-recovery: () -> {(worker_id, model_id)} a remediated worker may
+        # retry despite the model-level OOM exclusion (surgical recovery). None ⇒ none.
+        self._recovery_shadows = recovery_shadows
         # Capacity-aware scheduling (reservation model): a worker↔experiment store so an
         # admitted experiment runs UNINTERRUPTED on a stable worker set (no mid-run model
         # reloads — which would confound a drift measurement, and no per-unit thrash) and
@@ -809,16 +822,23 @@ class Scheduler:
         Empty when not wired (legacy / tests)."""
         return self._recent_oom_sizes() if self._recent_oom_sizes is not None else {}
 
+    def _recovered(self) -> set[tuple[str, str]]:
+        """Per-worker serve-recovery shadows {(worker_id, model_id)} — a remediated worker may
+        retry despite the model-level OOM exclusion. Empty when not wired (legacy / tests).
+        Tiny tables (only remediated workers), so `_fits` fetches it lazily per call."""
+        return self._recovery_shadows() if self._recovery_shadows is not None else set()
+
     def _fits(
         self,
         worker: Worker,
         exp,
         fleet_fp: dict[str, float] | None = None,
         oom: dict[str, float] | None = None,
+        recovered: set[tuple[str, str]] | None = None,
     ) -> bool:
         # Routing's fit is the SHARED `serve_fits` verdict (footprint-backfill + worker_satisfies
-        # + observed-OOM), the same one the C14 regime capacity model uses via capacity._eligible
-        # — so routing and regime can never disagree about what fits where.
+        # + observed-OOM + per-worker recovery), the same one the C14 regime capacity model uses
+        # via capacity._eligible — so routing and regime can never disagree about what fits where.
         return serve_fits(
             worker,
             exp.required_capabilities or {},
@@ -826,6 +846,7 @@ class Scheduler:
             required_containment=exp.required_containment,
             footprints=fleet_fp,
             oom=oom,
+            recovered=recovered if recovered is not None else self._recovered(),
         )
 
     def _reconcile(self, polling: Worker | None = None) -> None:
@@ -1107,6 +1128,88 @@ class Scheduler:
             if pick is not None:
                 return pick
         return None
+
+    def idle_reason_for_worker(self, worker: Worker) -> dict[str, Any] | None:
+        """WHY `worker` has no assignment right now — for the volunteer's dashboard, so a
+        healthy-but-idle node reads as "understood", not "broken/stuck". Read-only +
+        best-effort: returns None (stay silent) on any error, and None for the paused/
+        degraded states the endpoint already surfaces via 423. Codes: no_pending_work ·
+        between_rounds · reserved_elsewhere · model_benched · insufficient_ram."""
+        try:
+            if (
+                worker.paused_at is not None
+                or worker_is_degraded(worker)
+                or worker_is_self_paused(worker)
+            ):
+                return None  # already surfaced by the endpoint's own 423 paths
+            approved = self._experiments.list_all(status=ExperimentStatus.APPROVED)
+            pending = [e for e in approved if self._has_offerable_work(e.experiment_id)]
+            if not pending:
+                return {
+                    "code": "no_pending_work",
+                    "message": "No work is waiting on the network right now — nothing to do.",
+                }
+            if (
+                self._reservations is not None
+                and self._reservations.experiment_for_worker(worker.worker_id) is not None
+            ):
+                return {
+                    "code": "between_rounds",
+                    "message": "Assigned to an experiment; waiting for its next round of work.",
+                }
+            fp, oom, recovered = (
+                self._fleet_model_footprints(),
+                self._oom(),
+                self._recovered(),
+            )
+            if any(self._fits(worker, e, fp, oom, recovered) for e in pending):
+                return {
+                    "code": "reserved_elsewhere",
+                    "message": (
+                        "Work you can run is reserved to other workers right now; "
+                        "you'll be assigned as capacity frees up."
+                    ),
+                }
+            # Nothing fits this worker — surface the most useful SPECIFIC reason.
+            wram = self._worker_usable(worker)
+            benched: str | None = None
+            too_big: tuple[str, float] | None = None
+            for e in pending:
+                caps = e.required_capabilities or {}
+                declared = caps.get("model_ram_gb") or {}
+                for mid in caps.get("models") or []:
+                    thr = oom.get(mid)
+                    if thr is not None and wram <= thr and (worker.worker_id, mid) not in recovered:
+                        benched = mid
+                    needed = fp.get(mid) or declared.get(mid)
+                    if needed and wram < float(needed):
+                        too_big = (mid, float(needed))
+            if benched is not None:
+                return {
+                    "code": "model_benched",
+                    "model_id": benched,
+                    "message": (
+                        f"'{benched}' is paused on this node after repeated out-of-memory — it "
+                        "will retry automatically. Freeing memory (sudo sync && drop_caches) or a "
+                        "serve-stack restart lets it retry right away."
+                    ),
+                }
+            if too_big is not None:
+                mid, needed = too_big
+                return {
+                    "code": "insufficient_ram",
+                    "model_id": mid,
+                    "message": (
+                        f"The waiting work needs about {needed:.1f} GB to serve '{mid}'; this "
+                        f"worker has ~{wram:.1f} GB, so it runs on larger workers."
+                    ),
+                }
+            return {
+                "code": "reserved_elsewhere",
+                "message": "No waiting work fits this worker right now.",
+            }
+        except Exception:
+            return None
 
     def _pick_unit_from(self, experiment, worker: Worker) -> SchedulerPick | None:
         """The first eligible unit of `experiment` for `worker`, or None — capability +

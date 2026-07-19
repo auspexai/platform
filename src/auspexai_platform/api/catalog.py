@@ -25,7 +25,7 @@ from pydantic import BaseModel
 
 from auspexai_platform.auth.credential import Credential
 from auspexai_platform.db.repositories import WorkerRepository
-from auspexai_platform.hf_catalog import catalog_fetched_at, read_catalog
+from auspexai_platform.hf_catalog import catalog_fetched_at, catalog_is_stale, read_catalog
 from auspexai_platform.serve_memory import fleet_reported_footprints
 from auspexai_platform.supported_models import supported_by_id
 from auspexai_platform.worker_status import heartbeat_cutoff
@@ -67,6 +67,7 @@ class SupportedResponse(BaseModel):
     fleet_can_auto_acquire: bool  # ≥1 active worker pulls models on demand
     catalog_source: str  # 'hf' (fresh poll) | 'curated' (static seed fallback)
     catalog_fetched_at: str | None  # when the HF poll last refreshed the cache
+    catalog_stale: bool  # menu is curated-fallback or older than CATALOG_STALE_AFTER
 
 
 def build_router(
@@ -224,6 +225,11 @@ def build_router(
                 # A worker fits the model iff its memory covers the footprint AND the
                 # model wasn't observed to OOM on a box that size (#1). `> oom_thr`,
                 # not `>=`: a worker no bigger than one that already OOM'd can't fit it.
+                # This report applies the OOM exclusion UNIFORMLY by RAM size — per-worker
+                # serve-recovery (a remediated node retrying despite the exclusion) is a
+                # routing/capacity concern (serve_fits `recovered`), not surfaced here; so a
+                # just-recovered worker may be undercounted for the brief probe window until
+                # it serves once and tempers the shared exclusion. Informational, not a gate.
                 oom_thr = oom_thresholds.get(mid)
 
                 def _worker_can_serve(r: float, _thr=oom_thr, _fp=footprint) -> bool:
@@ -278,6 +284,7 @@ def build_router(
             fleet_can_auto_acquire=auto_acquire_fleet,
             catalog_source=catalog_source,
             catalog_fetched_at=fetched_at,
+            catalog_stale=catalog_is_stale(catalog_source, fetched_at),
         )
 
     return router

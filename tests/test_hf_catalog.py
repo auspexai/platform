@@ -7,6 +7,7 @@ from pathlib import Path
 
 from auspexai_platform.hf_catalog import (
     catalog_fetched_at,
+    catalog_is_stale,
     fetch_catalog,
     read_catalog,
     write_catalog,
@@ -122,3 +123,23 @@ def test_no_arch_uses_conservative_serve_estimate() -> None:
     assert m.serve_ram_gb is not None
     assert m.serve_ram_gb > m.approx_ram_gb  # conservative > file x 1.2
     assert m.serve_ram_gb > 5.44  # too_big on a Jetson
+
+
+def test_catalog_is_stale():
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    fresh = (now - timedelta(hours=5)).isoformat()
+    old = (now - timedelta(hours=60)).isoformat()
+
+    # a fresh HF poll is NOT stale
+    assert catalog_is_stale("hf", fresh, now=now) is False
+    # an HF cache older than 48h IS stale (timer likely stopped)
+    assert catalog_is_stale("hf", old, now=now) is True
+    # the curated static fallback is ALWAYS stale (the poll never ran)
+    assert catalog_is_stale("curated", None, now=now) is True
+    # an unparseable / missing stamp is treated as stale, never fresh
+    assert catalog_is_stale("hf", None, now=now) is True
+    assert catalog_is_stale("hf", "not-a-date", now=now) is True
+    # a naive timestamp is coerced to UTC, not crashed
+    assert catalog_is_stale("hf", "2026-07-19T07:00:00", now=now) is False

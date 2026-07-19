@@ -128,6 +128,9 @@ class AssignmentResponse(BaseModel):
     assigned_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
     experiment_id: Annotated[str | None, ExposureTag.PUBLIC] = None  # coordinator id
     work_unit: Annotated[WorkUnitEnvelopeOut | None, ExposureTag.PUBLIC] = None
+    # WHY the worker got no work (only when work_unit is None) — so a healthy-but-idle
+    # node's operator sees "understood" not "stuck". {code, message, model_id?}.
+    idle_reason: Annotated[dict | None, ExposureTag.PUBLIC] = None
 
 
 class ResultSubmissionRequest(BaseModel):
@@ -189,6 +192,21 @@ class RefuseResponse(BaseModel):
     unit_id: Annotated[str | None, ExposureTag.PUBLIC] = None
     refused_at: Annotated[datetime | None, ExposureTag.PUBLIC] = None
     refused_kind: Annotated[str | None, ExposureTag.PUBLIC] = None
+
+
+class ServeRecoveredRequest(BaseModel):
+    """POST /workers/{id}/serve-recovered body — the worker reports its operator REMEDIATED a
+    serve condition (freed memory / restarted the backend) after `model_id` OOM'd on it, so
+    this one worker may retry the model despite the model-level exclusion (surgical recovery,
+    diversity_seed_stream / volunteer-legibility work)."""
+
+    model_id: str
+
+
+class ServeRecoveredResponse(BaseModel):
+    worker_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    model_id: Annotated[str | None, ExposureTag.PUBLIC] = None
+    recorded: Annotated[bool | None, ExposureTag.PUBLIC] = None
 
 
 class PrestageItem(BaseModel):
@@ -382,7 +400,10 @@ def build_router(
 
         pick = scheduler.pick_for_worker(worker)
         if pick is None:
-            return AssignmentResponse(work_unit=None)
+            _idle = getattr(scheduler, "idle_reason_for_worker", None)
+            return AssignmentResponse(
+                work_unit=None, idle_reason=_idle(worker) if _idle is not None else None
+            )
 
         per_job_db = per_job_factory.get_or_create(pick.experiment_id)
         assignments_repo = AssignmentRepository(per_job_db)
@@ -1136,6 +1157,43 @@ def build_router(
             refused_at=updated.refused_at,
             refused_kind=updated.refused_kind,
         )
+
+    @router.post(
+        "/workers/{worker_id}/serve-recovered",
+        response_model=ServeRecoveredResponse,
+        response_model_exclude_none=True,
+    )
+    async def serve_recovered(
+        worker_id: str,
+        body: ServeRecoveredRequest,
+        credential: Credential = Depends(credential_dep),  # noqa: B008
+    ) -> ServeRecoveredResponse:
+        """The worker's operator REMEDIATED a serve condition (freed memory / restarted the
+        backend) after `model_id` OOM'd on it — recorded so THIS worker may retry the model
+        despite the model-level OOM exclusion, before the 6h cooldown lifts (surgical recovery:
+        one node's fix never re-offers the model to other, un-remediated nodes). A re-OOM writes
+        a newer last_observed_at and the shadow lifts; a serve success tempers the shared record.
+        Idempotent; best-effort audit."""
+        _require_self_worker(credential, worker_id)
+        from auspexai_platform.db.repositories.model_serve_failures import (
+            ModelServeFailureRepository,
+        )
+
+        ModelServeFailureRepository(worker_repository.db).note_worker_recovered(
+            worker_id, body.model_id, now=datetime.now(UTC).isoformat()
+        )
+        try:
+            audit_repository.append(
+                actor_class=CredentialClass.WORKER,
+                actor_identifier=credential.pubkey_hex,
+                action="worker.serve_recovered",
+                resource_type="worker",
+                resource_id=worker_id,
+                payload={"model_id": body.model_id},
+            )
+        except Exception:
+            logger.debug("serve-recovered audit failed (ignored)", exc_info=True)
+        return ServeRecoveredResponse(worker_id=worker_id, model_id=body.model_id, recorded=True)
 
     # ---- GET prestage directives (M3b eager conductor) ----------------
 

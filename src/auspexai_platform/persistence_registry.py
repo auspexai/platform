@@ -125,6 +125,12 @@ CONTROL_DB_PERSISTENCE: dict[str, Persistence] = {
         "released when the worker goes inactive or the experiment ends; PK(worker_id)-bounded, "
         "transient scheduling state that never accumulates"
     ),
+    "worker_serve_recovery": _grows(
+        "per-worker serve-recovery signals (0064) — 1 upserted row per (worker_id, model_id) "
+        "that OOM'd-then-remediated (PK-deduped); bounded by distinct OOM-recovery events (rare), "
+        "the per-worker companion to the permanent model_serve_failures fit-hint; an aged row is "
+        "inert (recovery_shadows staleness-gates use), same bounded-permanence as its parent"
+    ),
 }
 
 # ── Per-job DB (jobs/<experiment_id>.db) ─────────────────────────────────────

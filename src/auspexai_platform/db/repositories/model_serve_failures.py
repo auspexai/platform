@@ -125,6 +125,39 @@ class ModelServeFailureRepository:
             out[r["model_id"]] = float(r["max_ooomd_usable_gb"])
         return out
 
+    def note_worker_recovered(self, worker_id: str, model_id: str, *, now: str) -> None:
+        """A specific worker's operator REMEDIATED its serve condition (freed memory /
+        restarted the backend) after `model_id` OOM'd on it. Lets THIS worker retry the
+        model despite the model-level exclusion — surgical recovery, so one node's fix never
+        re-offers the model to other, un-remediated nodes. Upsert the latest recovery time."""
+        self.db.execute(
+            "INSERT INTO worker_serve_recovery (worker_id, model_id, recovered_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(worker_id, model_id) DO UPDATE SET "
+            "recovered_at = excluded.recovered_at",
+            (worker_id, model_id, now),
+        )
+
+    def recovery_shadows(self, *, now: datetime | None = None) -> set[tuple[str, str]]:
+        """{(worker_id, model_id)} pairs where the worker signalled serve-recovery AFTER the
+        model's most recent OOM — so serve_fits lets it retry despite the model-level
+        exclusion (a one-shot probe: a serve success tempers the shared record; a re-OOM
+        writes a newer last_observed_at and the shadow lifts). Only while the OOM is still
+        recent (past the cooldown the model isn't excluded at all → the shadow is moot)."""
+        now = now or datetime.now(UTC)
+        rows = self.db.execute(
+            "SELECT r.worker_id, r.model_id, r.recovered_at, f.last_observed_at "
+            "FROM worker_serve_recovery r JOIN model_serve_failures f ON r.model_id = f.model_id"
+        )
+        out: set[tuple[str, str]] = set()
+        for r in rows:
+            rec = _parse_iso(r["recovered_at"])
+            last = _parse_iso(r["last_observed_at"])
+            if rec is None or last is None:
+                continue
+            if rec > last and (now - last) <= OOM_EXCLUSION_COOLDOWN:
+                out.add((r["worker_id"], r["model_id"]))
+        return out
+
     def recent_oom_sizes(self, *, now: datetime | None = None) -> dict[str, float]:
         """{model_id: largest usable-GB RECENTLY observed to OOM} — a SOFT placement signal,
         distinct from the hard `oom_thresholds`. A worker at/below this size has OOM'd this

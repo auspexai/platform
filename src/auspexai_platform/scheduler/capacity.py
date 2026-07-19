@@ -71,15 +71,16 @@ def _schedulable_workforce(
 
 def _serve_context(
     schedulable: list[Worker], worker_repository: WorkerRepository
-) -> tuple[dict[str, float], dict[str, float]]:
-    """(footprints, oom) — the fleet-authoritative on-disk sizes + observed-OOM ground truth
-    that the ROUTER applies. Passing them into `_eligible` makes the regime capacity model use
-    the SAME `serve_fits` verdict as routing, so regime-3 pause/resume can't disagree with what
-    the scheduler will actually offer (e.g. a model that OOMs a worker is not counted toward
-    that experiment's structural capacity)."""
+) -> tuple[dict[str, float], dict[str, float], set[tuple[str, str]]]:
+    """(footprints, oom, recovered) — the fleet-authoritative on-disk sizes + observed-OOM
+    ground truth + per-worker serve-recovery shadows that the ROUTER applies. Passing them into
+    `_eligible` makes the regime capacity model use the SAME `serve_fits` verdict as routing, so
+    regime-3 pause/resume can't disagree with what the scheduler will actually offer (a model
+    that OOMs a worker isn't counted toward structural capacity — UNLESS that worker remediated
+    and is re-eligible via `recovered`)."""
+    repo = ModelServeFailureRepository(worker_repository.db)
     footprints = fleet_reported_footprints(w.capabilities for w in schedulable)
-    oom = ModelServeFailureRepository(worker_repository.db).oom_thresholds()
-    return footprints, oom
+    return footprints, repo.oom_thresholds(), repo.recovery_shadows()
 
 
 def _eligible(
@@ -91,12 +92,14 @@ def _eligible(
     required_containment: str = "permissive",
     footprints: dict[str, float] | None = None,
     oom: dict[str, float] | None = None,
+    recovered: set[tuple[str, str]] | None = None,
 ) -> list[Worker]:
     # D9 Phase 4: worker trust-tier no longer gates eligibility — a capable,
     # schedulable worker is eligible regardless of tier. `repl` is retained in
     # the signature for callers but no longer filters the worker pool. Fit is the
-    # SHARED `serve_fits` verdict (footprint-backfill + worker_satisfies + observed-OOM),
-    # the same one routing uses — so structural capacity == routable capacity.
+    # SHARED `serve_fits` verdict (footprint-backfill + worker_satisfies + observed-OOM
+    # + per-worker recovery), the same one routing uses — so structural capacity ==
+    # routable capacity.
     return [
         w
         for w in workforce
@@ -107,6 +110,7 @@ def _eligible(
             required_containment=required_containment,
             footprints=footprints,
             oom=oom,
+            recovered=recovered,
         )
     ]
 
@@ -133,7 +137,7 @@ def experiments_collapsed_by_removing(
     if len(after) == len(before):
         return []
 
-    fp, oom = _serve_context(before, worker_repository)
+    fp, oom, recovered = _serve_context(before, worker_repository)
     collapsed: list[BlockedExperiment] = []
     for exp in experiment_repository.list_all(status=ExperimentStatus.APPROVED):
         pj = per_job_factory.get(exp.experiment_id)
@@ -153,6 +157,7 @@ def experiments_collapsed_by_removing(
             required_containment=rc,
             footprints=fp,
             oom=oom,
+            recovered=recovered,
         ) and not _eligible(
             after,
             required,
@@ -161,6 +166,7 @@ def experiments_collapsed_by_removing(
             required_containment=rc,
             footprints=fp,
             oom=oom,
+            recovered=recovered,
         ):
             collapsed.append(
                 BlockedExperiment(
@@ -189,7 +195,7 @@ def unit_fleet_exhausted(
     isn't schedulable); a transiently-offline worker is covered by the sweep's quiescence window.
     Vacuously True when no eligible worker exists at all (nothing can contribute)."""
     schedulable = _schedulable_workforce(worker_repository.list_all(), now=now)
-    fp, oom = _serve_context(schedulable, worker_repository)
+    fp, oom, recovered = _serve_context(schedulable, worker_repository)
     eligible = _eligible(
         schedulable,
         experiment.required_capabilities or {},
@@ -198,6 +204,7 @@ def unit_fleet_exhausted(
         required_containment=experiment.required_containment,
         footprints=fp,
         oom=oom,
+        recovered=recovered,
     )
     done = {
         a.worker_id
@@ -221,7 +228,7 @@ def unit_max_achievable_replication(
     fleet (→ pause); when it recovers to >= floor the experiment can resume. Same eligibility
     basis as `unit_fleet_exhausted` so the pause and resume sides never disagree."""
     schedulable = _schedulable_workforce(worker_repository.list_all(), now=now)
-    fp, oom = _serve_context(schedulable, worker_repository)
+    fp, oom, recovered = _serve_context(schedulable, worker_repository)
     eligible = _eligible(
         schedulable,
         experiment.required_capabilities or {},
@@ -230,6 +237,7 @@ def unit_max_achievable_replication(
         required_containment=experiment.required_containment,
         footprints=fp,
         oom=oom,
+        recovered=recovered,
     )
     done = {
         a.worker_id
@@ -253,7 +261,7 @@ def eligible_capable_count(
     so the pause will never auto-resume — as opposed to a transient dip a logged-out
     worker returning would fix. Same eligibility basis as `unit_fleet_exhausted`."""
     schedulable = _schedulable_workforce(worker_repository.list_all(), now=now)
-    fp, oom = _serve_context(schedulable, worker_repository)
+    fp, oom, recovered = _serve_context(schedulable, worker_repository)
     eligible = _eligible(
         schedulable,
         experiment.required_capabilities or {},
@@ -265,5 +273,6 @@ def eligible_capable_count(
         required_containment=experiment.required_containment,
         footprints=fp,
         oom=oom,
+        recovered=recovered,
     )
     return len(eligible)

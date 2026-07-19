@@ -26,6 +26,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -312,6 +313,31 @@ def catalog_fetched_at(path: Path) -> str | None:
         return json.loads(path.read_text(encoding="utf-8")).get("fetched_at")
     except (FileNotFoundError, ValueError, OSError):
         return None
+
+
+# The provisionable HF menu is refreshed by a DAILY systemd timer. If the last good fetch
+# is older than this, the timer likely stopped (the enable≠start trap) or HF has been
+# unreachable — the menu is aging silently. Two missed cycles = the alert line, so a
+# single skipped run doesn't cry wolf.
+CATALOG_STALE_AFTER = timedelta(hours=48)
+
+
+def catalog_is_stale(source: str, fetched_at: str | None, *, now: datetime | None = None) -> bool:
+    """True when the provisionable menu is NOT fresh — either the static curated fallback is
+    in use (the HF poll never ran / HF unreachable → source != 'hf'), or the HF cache is older
+    than CATALOG_STALE_AFTER. Lets a maintainer CATCH a silently-stopped refresh instead of
+    only self-reporting `catalog_fetched_at`. The live 'what's-served-now' half of the catalog
+    response is unaffected — this flags only the offerable-but-unserved menu."""
+    if source != "hf" or not fetched_at:
+        return True
+    now = now or datetime.now(UTC)
+    try:
+        ts = datetime.fromisoformat(fetched_at)
+    except ValueError:
+        return True
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return (now - ts) > CATALOG_STALE_AFTER
 
 
 def read_catalog(path: Path) -> list[CatalogModel]:

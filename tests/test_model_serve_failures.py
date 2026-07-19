@@ -134,3 +134,46 @@ def test_success_only_counts_the_too_small_class(db: Database) -> None:
     for _ in range(4):
         repo.record_serve_success("m", 4.0, now="2026-07-16T00:11:00+00:00")
     assert repo.oom_thresholds(now=_RECENT) == {}
+
+
+# ── per-worker serve-recovery (migration 0064): surgical recovery ─────────────
+
+
+def test_recovery_shadows_only_when_recovered_after_the_oom(db: Database) -> None:
+    repo = ModelServeFailureRepository(db)
+    _oom_n(repo, "smollm2-1.7b-instruct-q4", 4.44, 3, "2026-07-16T00:00:00+00:00")
+    # a worker remediated AFTER the OOM shadows the model-level exclusion for ITSELF
+    repo.note_worker_recovered("wkr-A", "smollm2-1.7b-instruct-q4", now="2026-07-16T00:05:00+00:00")
+    # a worker whose recovery PREDATES the OOM does not (its fix was before the failure)
+    repo.note_worker_recovered("wkr-B", "smollm2-1.7b-instruct-q4", now="2026-07-15T23:00:00+00:00")
+    shadows = repo.recovery_shadows(now=_RECENT)
+    assert ("wkr-A", "smollm2-1.7b-instruct-q4") in shadows
+    assert ("wkr-B", "smollm2-1.7b-instruct-q4") not in shadows
+
+
+def test_recovery_shadow_is_moot_once_the_oom_is_stale(db: Database) -> None:
+    repo = ModelServeFailureRepository(db)
+    _oom_n(repo, "smollm2-1.7b-instruct-q4", 4.44, 3, "2026-07-16T00:00:00+00:00")
+    repo.note_worker_recovered("wkr-A", "smollm2-1.7b-instruct-q4", now="2026-07-16T00:05:00+00:00")
+    # far past the 6h cooldown → the model isn't excluded at all, so the shadow is moot
+    stale = datetime.fromisoformat("2026-07-17T00:00:00+00:00")
+    assert repo.recovery_shadows(now=stale) == set()
+
+
+def test_note_worker_recovered_is_idempotent(db: Database) -> None:
+    repo = ModelServeFailureRepository(db)
+    _oom_n(repo, "m-model-q4", 4.44, 3, "2026-07-16T00:00:00+00:00")
+    repo.note_worker_recovered("wkr-A", "m-model-q4", now="2026-07-16T00:05:00+00:00")
+    repo.note_worker_recovered("wkr-A", "m-model-q4", now="2026-07-16T00:06:00+00:00")  # upsert
+    assert repo.recovery_shadows(now=_RECENT) == {("wkr-A", "m-model-q4")}
+
+
+def test_re_oom_after_recovery_lifts_the_shadow(db: Database) -> None:
+    # A remediated worker retries and OOMs AGAIN → a newer last_observed_at → its earlier
+    # recovery no longer shadows the exclusion (it's back to benched, correctly).
+    repo = ModelServeFailureRepository(db)
+    _oom_n(repo, "smollm2-1.7b-instruct-q4", 4.44, 3, "2026-07-16T00:00:00+00:00")
+    repo.note_worker_recovered("wkr-A", "smollm2-1.7b-instruct-q4", now="2026-07-16T00:05:00+00:00")
+    assert ("wkr-A", "smollm2-1.7b-instruct-q4") in repo.recovery_shadows(now=_RECENT)
+    repo.record_oom("smollm2-1.7b-instruct-q4", 4.44, now="2026-07-16T00:10:00+00:00")  # re-OOM
+    assert repo.recovery_shadows(now=_RECENT) == set()  # recovery predates the new OOM

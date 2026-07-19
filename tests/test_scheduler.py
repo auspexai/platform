@@ -1930,3 +1930,101 @@ def test_oom_aware_placement_prefers_the_reliable_worker(
     held = {w for w, e in res.all() if e == qwen.experiment_id}
     assert "mac" in held  # the reliable big box is USED, not left idle
     assert len(held) == 2 and held < {"mac", "jet1", "jet2"}  # Mac + exactly one Jetson
+
+
+def test_serve_fits_recovery_shadows_the_oom_exclusion():
+    # #2 (single-worker recovery): a worker at/below a model's OOM'd size is excluded,
+    # UNLESS it remediated — then it alone may retry, without re-offering to peers.
+    from auspexai_platform.scheduler import serve_fits
+
+    w = _worker_ram("w-jet", ["m-q4"], 4.44)
+    req = {"models": ["m-q4"]}
+    oom = {"m-q4": 4.44}
+    assert serve_fits(w, req, oom=oom) is False  # benched by the model-level exclusion
+    assert serve_fits(w, req, oom=oom, recovered={("w-jet", "m-q4")}) is True  # its own recovery
+    # a recovery for a DIFFERENT worker never helps this one (surgical, not fleet-wide)
+    assert serve_fits(w, req, oom=oom, recovered={("w-other", "m-q4")}) is False
+
+
+def test_idle_reason_model_benched_is_the_mayhem1_case():
+    # #1: a healthy worker gets no work because its model is OOM-benched here → say so,
+    # so the volunteer reads "understood, retrying" instead of "stuck/broken".
+    from types import SimpleNamespace
+
+    from auspexai_platform.db.models import ExperimentStatus
+    from auspexai_platform.scheduler import Scheduler
+
+    class _ExpRepo:
+        def list_all(self, status=None):
+            return [
+                SimpleNamespace(
+                    experiment_id="exp-1",
+                    tenant_id="t",
+                    required_capabilities={"models": ["smollm2-q4"]},
+                    requires_real_execution=True,
+                    required_containment="permissive",
+                    status=ExperimentStatus.APPROVED,
+                )
+            ]
+
+    sched = Scheduler(
+        _ExpRepo(),
+        None,
+        active_workers=lambda: [],
+        oom_thresholds=lambda: {"smollm2-q4": 4.44},
+        recovery_shadows=lambda: set(),
+    )
+    sched._has_offerable_work = lambda eid: True  # the experiment has pending work
+    reason = sched.idle_reason_for_worker(_worker_ram("mayhem1", ["smollm2-q4"], 4.44))
+    assert reason["code"] == "model_benched"
+    assert reason["model_id"] == "smollm2-q4"
+
+
+def test_idle_reason_no_pending_work():
+    from types import SimpleNamespace
+
+    from auspexai_platform.db.models import ExperimentStatus
+    from auspexai_platform.scheduler import Scheduler
+
+    class _ExpRepo:
+        def list_all(self, status=None):
+            return [SimpleNamespace(experiment_id="exp-1", status=ExperimentStatus.APPROVED)]
+
+    sched = Scheduler(_ExpRepo(), None, active_workers=lambda: [])
+    sched._has_offerable_work = lambda eid: False  # nothing pending
+    reason = sched.idle_reason_for_worker(_worker_ram("w", ["m"], 8.0))
+    assert reason["code"] == "no_pending_work"
+
+
+def test_idle_reason_recovered_worker_is_not_told_benched():
+    # A remediated worker (recovery shadow) is no longer "benched" — it fits again, so the
+    # reason flips off model_benched (coherent with #2).
+    from types import SimpleNamespace
+
+    from auspexai_platform.db.models import ExperimentStatus
+    from auspexai_platform.scheduler import Scheduler
+
+    class _ExpRepo:
+        def list_all(self, status=None):
+            return [
+                SimpleNamespace(
+                    experiment_id="exp-1",
+                    tenant_id="t",
+                    required_capabilities={"models": ["smollm2-q4"]},
+                    requires_real_execution=True,
+                    required_containment="permissive",
+                    status=ExperimentStatus.APPROVED,
+                )
+            ]
+
+    sched = Scheduler(
+        _ExpRepo(),
+        None,
+        active_workers=lambda: [],
+        oom_thresholds=lambda: {"smollm2-q4": 4.44},
+        recovery_shadows=lambda: {("mayhem1", "smollm2-q4")},  # this worker remediated
+    )
+    sched._has_offerable_work = lambda eid: True
+    reason = sched.idle_reason_for_worker(_worker_ram("mayhem1", ["smollm2-q4"], 4.44))
+    # it now FITS (recovery shadow) → not benched; falls to reserved_elsewhere
+    assert reason["code"] == "reserved_elsewhere"
