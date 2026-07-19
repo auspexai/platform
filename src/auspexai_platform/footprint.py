@@ -139,7 +139,18 @@ def generation_footprint(manifest: dict[str, Any] | None) -> dict[str, Any]:
     out: dict[str, Any] = {"mode": "seeded_sampling" if is_sampling else "greedy"}
     params = {
         k: det[k]
-        for k in ("temperature", "seed", "top_p", "top_k", "min_p", "serving_version_pin")
+        for k in (
+            "temperature",
+            "seed",
+            # seed_policy: "per_round" = a declared seed-STREAM (seed = base + round), so a
+            # reader can tell a DIVERSITY run (measures output spread) from a reproduction
+            # run at a glance (diversity_seed_stream_design.md §4, firewall #2).
+            "seed_policy",
+            "top_p",
+            "top_k",
+            "min_p",
+            "serving_version_pin",
+        )
         if det.get(k) is not None
     }
     if params:
