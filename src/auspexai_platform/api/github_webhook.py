@@ -65,15 +65,21 @@ MAX_HEADLINE_LENGTH = 500
 # `Fulfils: swr-a, swr-b` lines in the release description (maintainer
 # plumbing — parsed out, stripped from the volunteer-facing notes).
 #
-# Horizontal whitespace is `[ \t]`, NOT `\s` (CodeQL py/polynomial-redos).
-# Under re.MULTILINE `$` already matches before a newline, and `\s` also
-# matches that newline — the overlap makes `\s*(.+?)\s*$` backtrack
-# quadratically on a long run of whitespace. `[ \t]` cannot match the line
-# terminator, so the ambiguity disappears. Reaching this parser requires the
-# webhook HMAC secret (see `_signature_ok`, checked before any parsing), so
-# this was never remotely triggerable; it is fixed because it is a real
-# quadratic and the correct expression is also the simpler one.
-_FULFILS_LINE = re.compile(r"^[ \t]*fulfils:[ \t]*(.+?)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+# CodeQL py/polynomial-redos. The original `^\s*fulfils:\s*(.+?)\s*$` had TWO
+# overlapping-quantifier problems, and fixing only the obvious one leaves the
+# quadratic in place:
+#   1. `\s` also matches the line terminator, which under re.MULTILINE overlaps
+#      with `$`. Horizontal whitespace is `[ \t]`, which cannot.
+#   2. `(.+?)[ \t]*$` — `.` matches space and tab too, so the lazy group and the
+#      trailing class still overlap and still backtrack quadratically.
+# So there is no trailing whitespace class at all: capture greedily to end of
+# line and let `_REQUEST_ID` do the work. It ignores surrounding whitespace, so
+# trimming in the pattern bought nothing in the first place.
+#
+# Reaching this parser requires the webhook HMAC secret (`_signature_ok` runs
+# before any parsing), so this was never remotely triggerable — it is fixed
+# because it is a real quadratic, and the correct expression is also simpler.
+_FULFILS_LINE = re.compile(r"^[ \t]*fulfils:(.*)$", re.IGNORECASE | re.MULTILINE)
 _REQUEST_ID = re.compile(r"swr-[A-Za-z0-9_-]+")
 
 # Bound on the release body we will parse at all. `MAX_NOTES_LENGTH` truncates

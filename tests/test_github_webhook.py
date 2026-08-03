@@ -261,12 +261,16 @@ class TestFulfilsParsingIsBounded:
     quadratic and the fix is also the more correct expression.
     """
 
-    def test_horizontal_whitespace_only_no_newline_ambiguity(self):
+    def test_no_overlapping_quantifiers(self):
         from auspexai_platform.api.github_webhook import _FULFILS_LINE
 
-        # `\s` would match the line terminator and overlap with MULTILINE `$`,
-        # which is what made the pattern backtrack quadratically.
-        assert "\\s" not in _FULFILS_LINE.pattern
+        pattern = _FULFILS_LINE.pattern
+        # `\s` would match the line terminator and overlap with MULTILINE `$`.
+        assert "\\s" not in pattern
+        # And a TRAILING whitespace class would overlap with the capture group,
+        # because `.` matches space and tab — fixing only the `\s` half leaves
+        # the quadratic in place. Capture to end of line instead.
+        assert pattern.endswith("(.*)$")
 
     def test_still_parses_the_real_shapes(self):
         from auspexai_platform.api.github_webhook import _parse_fulfils
