@@ -197,6 +197,7 @@ def build_coordinator_services(
         # the recomputable integrity_basis half comes from entries/diverged_units).
         from auspexai_platform.footprint import (
             assemble_governance_footprint,
+            collect_generation_chains,
             collect_ran_under_containment,
             compute_independence,
             generation_footprint,
@@ -259,7 +260,12 @@ def build_coordinator_services(
             replication_target=experiment.replication_target,
             replication_floor=experiment.replication_floor,
             generation=generation_footprint(
-                stored_manifest.manifest_json if stored_manifest is not None else None
+                stored_manifest.manifest_json if stored_manifest is not None else None,
+                # v0.7: what the workers ACTUALLY ran, kept distinct from what the
+                # manifest declared. Pre-v3 workers contribute nothing and the
+                # footprint says `unrecorded` rather than passing the declaration
+                # off as the actual.
+                observed_chains=collect_generation_chains(per_job_db),
             ),
         )
 

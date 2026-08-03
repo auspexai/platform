@@ -44,11 +44,15 @@ def canonical_result_bytes(
     schema_version: int | None = 0,
     served_weights: dict[str, str] | None = None,
     ran_under: str | None = None,
+    generation_options: list[dict[str, Any]] | None = None,
 ) -> bytes:
     """The canonical bytes the worker signed. `schema_version` 0/None reproduces
     the legacy five-field encoding byte-for-byte; >= 1 adds the signed
     `schema_version` + `served_weights` (digests normalized to lower hex); >= 2
-    adds `ran_under` (the sandbox policy, lower-cased). Versions are cumulative.
+    adds `ran_under` (the sandbox policy, lower-cased); >= 3 adds
+    `generation_options` — the distinct sampler chains the worker daemon actually
+    emitted to the backend for this unit, first-seen order. Versions are
+    cumulative.
 
     WIRE CONTRACT: this is a byte-for-byte mirror of the worker's
     `auspexai_worker.signing.result.canonical_result_bytes`. Any change here MUST
@@ -67,6 +71,8 @@ def canonical_result_bytes(
         body["served_weights"] = {str(k): str(v).lower() for k, v in (served_weights or {}).items()}
     if schema_version and schema_version >= 2:
         body["ran_under"] = str(ran_under or "").lower()
+    if schema_version and schema_version >= 3:
+        body["generation_options"] = [dict(o) for o in (generation_options or [])]
     return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -81,6 +87,7 @@ def verify_result_signature(
     schema_version: int | None = 0,
     served_weights: dict[str, str] | None = None,
     ran_under: str | None = None,
+    generation_options: list[dict[str, Any]] | None = None,
 ) -> bool:
     """True iff `signature_b64` is a valid Ed25519 signature by `worker_pubkey`
     over the canonical body for the declared `schema_version`. Malformed pubkey
@@ -99,6 +106,7 @@ def verify_result_signature(
         schema_version=schema_version,
         served_weights=served_weights,
         ran_under=ran_under,
+        generation_options=generation_options,
     )
     try:
         pubkey.verify(signature, sig_input)

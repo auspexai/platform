@@ -26,8 +26,9 @@ def sign_result_body(
     schema_version: int | None = 0,
     served_weights: dict[str, str] | None = None,
     ran_under: str | None = None,
+    generation_options: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Base64 Ed25519 signature over the canonical result body (v0, v1, or v2)."""
+    """Base64 Ed25519 signature over the canonical result body (v0 through v3)."""
     sig = privkey.sign(
         canonical_result_bytes(
             unit_id=unit_id,
@@ -36,6 +37,7 @@ def sign_result_body(
             exit_code=exit_code,
             payload=payload,
             schema_version=schema_version,
+            generation_options=generation_options,
             served_weights=served_weights,
             ran_under=ran_under,
         )

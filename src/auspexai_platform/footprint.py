@@ -122,14 +122,36 @@ def replication_footprint(
     }
 
 
-def generation_footprint(manifest: dict[str, Any] | None) -> dict[str, Any]:
-    """Firewall #2 / v0.2 M1 Inc 3: the generation policy the SIGNED MANIFEST
-    declared — `greedy` vs `seeded_sampling` plus the declared params — so a
-    researcher can interpret agreement/divergence in kind (sampled replicas
-    legitimately differ; greedy replicas should not). Coordinator-asserted from
-    the stored manifest; the worker enforces the same declaration per-request,
-    so declared == actual for any result that ingressed. Always present, stable
-    shape: mode + (params only when a block was declared)."""
+def generation_footprint(
+    manifest: dict[str, Any] | None,
+    *,
+    observed_chains: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Firewall #2 / v0.2 M1 Inc 3 / v0.7: the generation policy for this run.
+
+    Reports TWO things, deliberately kept apart:
+
+    - `declared` — what the signed manifest asked for (`mode` + params).
+    - `effective` — the sampler chain(s) the workers actually emitted, taken
+      from the worker-SIGNED v3 results. `effective_source` says which.
+
+    They are separate because conflating them is the defect this version exists
+    to fix. The pre-v0.7 footprint reported only the declaration, described it as
+    the actual ("declared == actual for any result that ingressed"), and stated
+    that "greedy replicas should not differ". Both claims were wrong in the same
+    way: the worker sent only temperature/seed/num_predict, so the serving
+    provider's defaults governed the rest of the chain — on Ollama 0.30-0.32,
+    `top_k 40` / `top_p 0.9` / `repeat_penalty 1.1` over a 64-token window. A
+    `greedy` footprint therefore named a decoding mode the backend did not
+    perform, and greedy replicas demonstrably DID differ across machines.
+
+    `mode` is retained at the top level for reader compatibility but is now
+    explicitly a property of the DECLARATION, not a claim about what ran.
+
+    `observed_chains` is the distinct chains gathered from this run's results
+    (`environment.generation_options`). Absent/empty ⇒ every contributing worker
+    predates v3, and `effective_source` says `unrecorded` rather than silently
+    presenting the declaration as though it were observed."""
     det = (manifest or {}).get("inference_determinism")
     det = det if isinstance(det, dict) else {}
     try:
@@ -150,12 +172,59 @@ def generation_footprint(manifest: dict[str, Any] | None) -> dict[str, Any]:
             "top_k",
             "min_p",
             "serving_version_pin",
+            # v0.7 penalty knobs — the two whose PROVIDER defaults (1.1 / 64)
+            # governed every pre-v0.7 run while being declarable nowhere.
+            "repeat_penalty",
+            "repeat_last_n",
         )
         if det.get(k) is not None
     }
     if params:
         out["params"] = params
+    # v0.7: what actually ran, kept distinct from what was asked for.
+    chains = [dict(c) for c in (observed_chains or [])]
+    if chains:
+        out["effective_source"] = "worker_signed"
+        out["effective_chains"] = chains
+        # The common case is one chain for the whole run; surface that plainly
+        # so a reader does not have to notice a single-element list.
+        if len(chains) == 1:
+            out["effective"] = chains[0]
+    else:
+        # Say so rather than letting `declared` stand in for `actual`.
+        out["effective_source"] = "unrecorded"
     return out
+
+
+def collect_generation_chains(per_job_db) -> list[dict[str, Any]]:
+    """v0.7: the DISTINCT sampler chains this run's results were generated with,
+    read from each result's `environment.generation_options` (worker-signed, v3).
+
+    Deduplicated across results and stable-ordered, so the footprint states the
+    generation parameters once for a homogeneous run and enumerates them when
+    workers genuinely differed — which is itself a finding worth surfacing, since
+    a run whose replicas ran different chains is not the comparison the manifest
+    described. Pre-v3 workers contribute nothing; an all-pre-v3 run yields `[]`
+    and the footprint reports `effective_source: unrecorded`."""
+    rows = per_job_db.execute("SELECT environment_json FROM results")
+    chains: list[dict[str, Any]] = []
+    for r in rows:
+        raw = r["environment_json"]
+        if not raw:
+            continue
+        try:
+            env = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(env, dict):
+            continue
+        for chain in env.get("generation_options") or []:
+            if isinstance(chain, dict) and chain not in chains:
+                chains.append(chain)
+    # Canonical order so the footprint is stable across rebuilds regardless of
+    # the order results happened to arrive in.
+    chains.sort(key=lambda c: json.dumps(c, sort_keys=True))
+    return chains
 
 
 def compute_independence(per_job_db, worker_account_resolver) -> dict[str, Any]:

@@ -169,9 +169,11 @@ class TestIndependence:
 def test_generation_footprint_modes():
     from auspexai_platform.footprint import generation_footprint
 
-    # No manifest / no block ⇒ the greedy default, stable shape.
-    assert generation_footprint(None) == {"mode": "greedy"}
-    assert generation_footprint({}) == {"mode": "greedy"}
+    # No manifest / no block ⇒ the greedy default, stable shape. v0.7 adds
+    # `effective_source`: with no worker-signed chains it is `unrecorded`, so the
+    # footprint never presents the DECLARATION as though it were what ran.
+    assert generation_footprint(None) == {"mode": "greedy", "effective_source": "unrecorded"}
+    assert generation_footprint({}) == {"mode": "greedy", "effective_source": "unrecorded"}
     # Greedy with declared params keeps the params visible.
     fp = generation_footprint(
         {"inference_determinism": {"temperature": 0, "seed": 7, "serving_version_pin": "o/1"}}
@@ -209,6 +211,7 @@ def test_assemble_footprint_carries_generation_block():
     assert fp["generation"] == {
         "mode": "seeded_sampling",
         "params": {"temperature": 0.8, "seed": 42},
+        "effective_source": "unrecorded",
     }
     # Legacy callers (no generation kwarg) keep the pre-M1 shape.
     legacy = assemble_governance_footprint(
@@ -224,3 +227,97 @@ def test_assemble_footprint_carries_generation_block():
         diverged_units=[],
     )
     assert "generation" not in legacy
+
+
+# ── v0.7: declared vs effective ──────────────────────────────────────────────
+
+
+def test_generation_footprint_separates_declared_from_effective():
+    """The defect v0.7 closes: the footprint used to report the DECLARATION and
+    describe it as the actual. `mode`/`params` stay the declaration; `effective`
+    is what the workers signed."""
+    from auspexai_platform.footprint import generation_footprint
+
+    declared = {"inference_determinism": {"temperature": 0, "seed": 7}}
+    chain = {"temperature": 0, "top_k": 1, "repeat_penalty": 1.0, "seed": 7}
+    fp = generation_footprint(declared, observed_chains=[chain])
+    assert fp["mode"] == "greedy"
+    assert fp["params"] == {"temperature": 0, "seed": 7}
+    assert fp["effective_source"] == "worker_signed"
+    assert fp["effective"] == chain
+    assert fp["effective_chains"] == [chain]
+
+
+def test_generation_footprint_says_unrecorded_for_a_pre_v3_fleet():
+    from auspexai_platform.footprint import generation_footprint
+
+    fp = generation_footprint({"inference_determinism": {"temperature": 0}}, observed_chains=[])
+    assert fp["effective_source"] == "unrecorded"
+    assert "effective" not in fp
+    assert "effective_chains" not in fp
+
+
+def test_generation_footprint_enumerates_heterogeneous_chains():
+    """A run whose replicas ran DIFFERENT chains is not the comparison the
+    manifest described, so the footprint must not collapse them to one."""
+    from auspexai_platform.footprint import generation_footprint
+
+    chains = [{"top_k": 1, "seed": 0}, {"top_k": 1, "seed": 7}]
+    fp = generation_footprint(None, observed_chains=chains)
+    assert fp["effective_chains"] == chains
+    assert "effective" not in fp, "no single effective chain when workers differed"
+
+
+def test_generation_footprint_carries_the_penalty_knobs():
+    from auspexai_platform.footprint import generation_footprint
+
+    fp = generation_footprint(
+        {"inference_determinism": {"temperature": 0, "repeat_penalty": 1.1, "repeat_last_n": 64}}
+    )
+    assert fp["params"]["repeat_penalty"] == 1.1
+    assert fp["params"]["repeat_last_n"] == 64
+
+
+class TestCollectGenerationChains:
+    def test_collects_and_dedupes_across_results(self, approved_experiment, per_job_factory):
+        from auspexai_platform.footprint import collect_generation_chains
+
+        _, _, experiment, _ = approved_experiment
+        db = per_job_factory.get_or_create(experiment.experiment_id)
+        now = datetime.now(UTC)
+        db.execute(
+            "INSERT OR IGNORE INTO work_units "
+            "(unit_id, payload_json, status, replication_target, completions_so_far, created_at) "
+            "VALUES ('u1', '{}', 'completed', 2, 2, ?)",
+            (now.isoformat(),),
+        )
+        repo = ResultRepository(db)
+        chain = {"temperature": 0, "top_k": 1}
+        for rid, wid, env in (
+            ("r1", "w1", {"generation_options": [chain]}),
+            ("r2", "w2", {"generation_options": [chain]}),  # identical → deduped
+            ("r3", "w3", {"generation_options": [{"temperature": 0, "top_k": 40}]}),
+            ("r4", "w4", None),  # pre-v3 worker contributes nothing
+        ):
+            repo.insert(
+                result_id=rid,
+                unit_id="u1",
+                worker_id=wid,
+                worker_pubkey_hex="aa" * 32,
+                exit_code=0,
+                payload={"v": 1},
+                worker_signature="c2ln",
+                completed_at=now,
+                environment=env,
+            )
+        chains = collect_generation_chains(db)
+        assert len(chains) == 2
+        assert chain in chains
+        assert {"temperature": 0, "top_k": 40} in chains
+
+    def test_empty_when_no_worker_reported_a_chain(self, approved_experiment, per_job_factory):
+        from auspexai_platform.footprint import collect_generation_chains
+
+        _, _, experiment, _ = approved_experiment
+        db = per_job_factory.get_or_create(experiment.experiment_id)
+        assert collect_generation_chains(db) == []

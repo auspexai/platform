@@ -158,6 +158,11 @@ class ResultSubmissionRequest(BaseModel):
     # the worker actually ran under. Absent ⇒ pre-v2 (un-rolled worker); the
     # containment guard then falls back to the worker's reported capability.
     ran_under: str | None = Field(default=None, max_length=64)
+    # v0.7: a v3 result additionally signs `generation_options` — the distinct
+    # sampler chains the worker daemon actually emitted to the backend for this
+    # unit. Absent ⇒ pre-v3 (un-rolled worker), and the footprint then reports
+    # only the manifest's DECLARATION for that result, flagged as such.
+    generation_options: list[dict[str, Any]] | None = Field(default=None)
     # AUD-26: D20 raw model text travels OUTSIDE the signed `payload` — new workers
     # send it here with its own detached `raw_signature` (over sha256(raw) bound to
     # unit+worker). The coordinator verifies the detached sig, then parks raw in the
@@ -591,6 +596,7 @@ def build_router(
             schema_version=body.schema_version,
             served_weights=body.served_weights,
             ran_under=body.ran_under,
+            generation_options=body.generation_options,
         ):
             assignments_repo.mark_refused(
                 assignment_id=assignment.assignment_id,
@@ -722,6 +728,19 @@ def build_router(
                 "served_model_digests": snapshot_digests,  # M3 reproducibility leg
             }
             environment = {k: v for k, v in snapshot.items() if v is not None} or None
+
+        # v0.7: the sampler chain(s) that ACTUALLY generated this result, taken
+        # from the worker-SIGNED v3 body (not the heartbeat, not the manifest).
+        # This is the reproducibility triple's missing leg: before v3 the
+        # environment recorded which software and weights ran, but nothing
+        # recorded the generation parameters, so the serving provider's own
+        # defaults governed unrecorded. Attached outside the worker_row branch —
+        # it is signature-bound and does not depend on a heartbeat being present.
+        if body.generation_options is not None:
+            environment = {
+                **(environment or {}),
+                "generation_options": [dict(o) for o in body.generation_options],
+            }
 
         # M3 / #13b (v0_2): when a manifest model pins `expected_gguf_sha256`, the
         # worker's served digest MUST match — else the declared model did not
