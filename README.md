@@ -4,7 +4,7 @@ The coordinator daemon and platform infrastructure for [AuspexAI](https://github
 
 ## Status
 
-**LIVE — open beta.** The coordinator daemon runs at [coord.auspexai.network](https://coord.auspexai.network) (v0.1.170). M1–M8 shipped and well beyond — signed receipts + per-account trust-tier promotion, DOI minting, HF model catalog, benchmark board, Rekor anchoring, and settle/reap timers. CI green on Python 3.11 + 3.12. What's live:
+**LIVE — open beta.** The coordinator daemon runs at [coord.auspexai.network](https://coord.auspexai.network) (v0.1.191). M1–M8 shipped and well beyond — signed receipts + per-account trust-tier promotion, DOI minting, HF model catalog (with a staleness guard on `/health`), benchmark board, Rekor anchoring, and settle/reap timers. More recent work: capacity-aware **reservation scheduling** (uninterrupted runs on a stable worker set), the **self-baseline drift benchmark** with an **output-diversity metric** (`dispersion_eu`) + per-round seed-streams, observed-OOM-aware routing with **per-worker serve-recovery** (a remediated node retries a benched model surgically), and a worker **idle-reason** surface. CI green on Python 3.11 + 3.12. What's live:
 
 - **System + auth:** `GET /api/v0/health` + `GET /api/v0/health/public`, `GET /api/v0/auth/whoami`
 - **Tenants:** `POST/GET /api/v0/tenants`, `GET /api/v0/tenants/{id}`
