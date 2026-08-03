@@ -64,12 +64,28 @@ MAX_HEADLINE_LENGTH = 500
 
 # `Fulfils: swr-a, swr-b` lines in the release description (maintainer
 # plumbing — parsed out, stripped from the volunteer-facing notes).
-_FULFILS_LINE = re.compile(r"^\s*fulfils:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+#
+# Horizontal whitespace is `[ \t]`, NOT `\s` (CodeQL py/polynomial-redos).
+# Under re.MULTILINE `$` already matches before a newline, and `\s` also
+# matches that newline — the overlap makes `\s*(.+?)\s*$` backtrack
+# quadratically on a long run of whitespace. `[ \t]` cannot match the line
+# terminator, so the ambiguity disappears. Reaching this parser requires the
+# webhook HMAC secret (see `_signature_ok`, checked before any parsing), so
+# this was never remotely triggerable; it is fixed because it is a real
+# quadratic and the correct expression is also the simpler one.
+_FULFILS_LINE = re.compile(r"^[ \t]*fulfils:[ \t]*(.+?)[ \t]*$", re.IGNORECASE | re.MULTILINE)
 _REQUEST_ID = re.compile(r"swr-[A-Za-z0-9_-]+")
+
+# Bound on the release body we will parse at all. `MAX_NOTES_LENGTH` truncates
+# only the notes we STORE, and it is applied after parsing — so without this the
+# regexes saw an unbounded body. Generous multiple: real release notes are far
+# smaller, and the `Fulfils:` lines sit at the top.
+MAX_PARSED_BODY_LENGTH = MAX_NOTES_LENGTH * 4
 
 
 def _parse_fulfils(body_text: str) -> tuple[list[str], str]:
     """Extract fulfilled request ids; return (ids, notes-without-those-lines)."""
+    body_text = body_text[:MAX_PARSED_BODY_LENGTH]
     ids: list[str] = []
     for m in _FULFILS_LINE.finditer(body_text):
         ids.extend(_REQUEST_ID.findall(m.group(1)))

@@ -251,3 +251,55 @@ class TestUnconfigured:
         local = TestClient(app)
         r = local.post(PATH, content=b"{}", headers={"X-GitHub-Event": "release"})
         assert r.status_code == 503
+
+
+class TestFulfilsParsingIsBounded:
+    """CodeQL py/polynomial-redos on `_FULFILS_LINE`.
+
+    Only reachable with the webhook HMAC secret (`_signature_ok` runs before any
+    parsing), so this was never remotely triggerable — but it was a genuine
+    quadratic and the fix is also the more correct expression.
+    """
+
+    def test_horizontal_whitespace_only_no_newline_ambiguity(self):
+        from auspexai_platform.api.github_webhook import _FULFILS_LINE
+
+        # `\s` would match the line terminator and overlap with MULTILINE `$`,
+        # which is what made the pattern backtrack quadratically.
+        assert "\\s" not in _FULFILS_LINE.pattern
+
+    def test_still_parses_the_real_shapes(self):
+        from auspexai_platform.api.github_webhook import _parse_fulfils
+
+        ids, notes = _parse_fulfils("Some notes.\n  Fulfils: swr-abc, swr-def  \nMore notes.\n")
+        assert ids == ["swr-abc", "swr-def"]
+        assert "Fulfils" not in notes
+        assert "Some notes." in notes and "More notes." in notes
+
+    def test_case_insensitive_and_no_match_is_inert(self):
+        from auspexai_platform.api.github_webhook import _parse_fulfils
+
+        assert _parse_fulfils("FULFILS: swr-x\n")[0] == ["swr-x"]
+        assert _parse_fulfils("no marker here\n") == ([], "no marker here")
+
+    def test_body_is_truncated_before_parsing(self):
+        from auspexai_platform.api.github_webhook import (
+            MAX_PARSED_BODY_LENGTH,
+            _parse_fulfils,
+        )
+
+        # MAX_NOTES_LENGTH bounds only what is STORED, and it is applied after
+        # parsing — so the parser needs its own bound.
+        _ids, notes = _parse_fulfils("x" * (MAX_PARSED_BODY_LENGTH * 3))
+        assert len(notes) <= MAX_PARSED_BODY_LENGTH
+
+    def test_pathological_input_completes_promptly(self):
+        import time
+
+        from auspexai_platform.api.github_webhook import _parse_fulfils
+
+        # The old pattern's worst case: a `Fulfils:` line trailed by a long run
+        # of horizontal whitespace with no terminator to anchor on.
+        started = time.monotonic()
+        _parse_fulfils("Fulfils: swr-a" + " " * 60_000)
+        assert time.monotonic() - started < 2.0

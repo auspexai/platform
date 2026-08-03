@@ -46,12 +46,12 @@ dev = [
     # broken-pipe/http.disconnect over the in-memory transport) — see
     # sse_event_bus_design.md. The timeout converts that wedge into a failure.
     "pytest-timeout>=2.3",
-    "ruff==0.15.20",  # pinned exactly: unbounded ruff drifts CI red as new rules ship
+    "ruff==0.16.0",  # pinned exactly: unbounded ruff drifts CI red as new rules ship
     # Test env pinned to current fastapi/starlette. starlette 1.x's TestClient
     # emits a DeprecationWarning that filterwarnings=error would escalate to a
     # collection error — handled by a targeted ignore in [tool.pytest.ini_options]
     # below rather than holding the dependency back.
-    "fastapi==0.139.0",
+    "fastapi==0.139.2",
     "starlette<1.4",
 ]
 
