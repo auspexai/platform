@@ -711,6 +711,12 @@ def build_router(
                     "schema_version": r.schema_version,
                     "served_weights": r.served_weights,
                     "ran_under": r.ran_under,
+                    # v0.7: a v3 result signs the sampler chain it actually ran.
+                    # WITHOUT this the bundle declares schema_version 3 but omits
+                    # the field the canonical body needs, so every worker
+                    # signature fails to verify. Sourced from the environment,
+                    # where ingest persisted the worker-SIGNED value.
+                    "generation_options": (r.environment or {}).get("generation_options"),
                     "receipt_id": rid,
                     "completed_at": r.completed_at.isoformat(),
                 }
@@ -773,6 +779,8 @@ def build_router(
                         "schema_version": r.schema_version,
                         "served_weights": r.served_weights,
                         "ran_under": r.ran_under,
+                        # v0.7 — see the note on the consensus export above.
+                        "generation_options": (r.environment or {}).get("generation_options"),
                         "receipt_id": rid,
                         "completed_at": r.completed_at.isoformat(),
                     }

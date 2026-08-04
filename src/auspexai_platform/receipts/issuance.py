@@ -123,6 +123,13 @@ def _result_hash(result: Result) -> str:
             # Receipts issued in the bug window (A2#32 → today) keep their
             # blanked-variant anchors (immutable COSE); the SDK accepts both.
             ran_under=result.ran_under,
+            # v0.7: same defect shape as the ran_under omission noted above,
+            # caught the same way — by a real recompute failing. A v3 result
+            # signs its sampler chain, so an anchor that omits it is not "the
+            # exact bytes the worker signed". Receipts issued in THIS bug window
+            # (v3 go-live → today) keep their chain-less anchors, since COSE is
+            # immutable; the SDK accepts both variants.
+            generation_options=(result.environment or {}).get("generation_options"),
         )
     ).hexdigest()
 
