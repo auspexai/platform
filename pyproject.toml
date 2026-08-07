@@ -51,7 +51,7 @@ dev = [
     # emits a DeprecationWarning that filterwarnings=error would escalate to a
     # collection error — handled by a targeted ignore in [tool.pytest.ini_options]
     # below rather than holding the dependency back.
-    "fastapi==0.139.2",
+    "fastapi==0.141.1",
     "starlette<1.4",
 ]
 
